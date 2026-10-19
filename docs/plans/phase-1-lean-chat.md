@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** draft v2, 2026-10-18. It is revised after the adversarial reviews (coherence, security, deploy, caching/harness), with Chris's decisions applied. Not approved, not executed.
+**Status:** draft v2, 2026-10-18. It is revised after the adversarial reviews (coherence, security, deploy, caching/harness), with Chris's decisions applied. Revised in the final review round (2026-10-19): login takes two connectors, Google and Microsoft, each pinned per address (Task 8). Not approved, not executed.
 
 **Goal:** Chris chats with Luma from his Android phone and laptop. He gets streaming answers with web search, a memory profile he can edit, image/camera/PDF attachments, a history list and edit/regenerate branches. It is served by Luma Core (Go), the conductor (TypeScript, Claude Agent SDK) and a PWA (assistant-ui), and ships as one Helm chart with images pinned by digest.
 
@@ -392,6 +392,9 @@ tiers:
 ```yaml
 people: {<id>: {display_name, tier: admin|family, household: bool, emails: {google: [..], microsoft: [..]}}}
 ```
+- The keys under `emails` are **Dex connector ids**. The site's Dex has `google` and `microsoft`; e2e uses `mock`.
+- A person may list addresses under several connectors. Phase 1's site registry pins Chris under both `google` and `microsoft` *(Chris, 2026-10-19)*.
+- An address matches **only** through the connector it is listed under.
 
 ### C6. Process environment (required unless a default is given; an empty required secret is a startup error)
 
@@ -999,6 +1002,9 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
 - **OIDC:**
   - Scopes are `openid email profile federated:id`; no `offline_access` in phase 1.
   - `client_secret_basic`. `email_verified: true` is required, and the connector comes from `federated_claims.connector_id`.
+  - **Connectors:** Core hard-codes no connector id. Any id the registry names is accepted, and production names `google` and `microsoft` (C5).
+  - `Lookup(connectorID, email)` matches only addresses listed under that same `connectorID`. A token without `federated_claims.connector_id` → `not_invited`.
+  - `web_sessions.connector_id` records the connector each session came through.
 - **`return_to`:** must match the C1 regex; anything else becomes `/`.
 
 - [ ] **Step 1: Write failing tests:**
@@ -1006,13 +1012,19 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
   - `TestCallbackStateMismatch400`, `TestNonceMismatchRejected`.
   - `TestLoginCookieIsEncrypted`: the cookie bytes don't contain the verifier, and a tampered cookie → 400.
   - `TestCallbackRotatesSessionID`: a pre-set `__Host-luma` value is not the one issued, and its row is deleted.
-  - `TestNotInvited403` (C3 copy), `TestConnectorPinned`.
+  - `TestNotInvited403` (C3 copy).
+  - `TestLoginViaEachRegisteredConnector`. The registry has one person `p1` with `emails: {google: [a@example.com], microsoft: [b@example.net]}`. oidctest issues `connector_id: google` with `a@example.com`, then `connector_id: microsoft` with `b@example.net`. Both callbacks give a session for `p1`, and the two `web_sessions` rows have `connector_id` `google` and `microsoft`.
+  - `TestConnectorPinned`. With the same registry, each of these → 403 `not_invited`, with no session row:
+    - `a@example.com` via `microsoft`;
+    - `b@example.net` via `google`;
+    - `a@example.com` via an unlisted `github`;
+    - `a@example.com` with no `federated_claims`.
   - `TestCookieAttributes`.
   - `TestReturnToAllowlist`: `//evil`, `https://evil`, `/\evil.com`, `/%5Cevil.com`, `/%2F%2Fevil`, `/c/../x` and `/c/ses_bad` each → `/`; `/c/ses_01J…` (valid) and `/profile` are kept.
   - `TestIdleExpiry`, `TestLogoutDeletesRowAndFiresOnSessionEnded`.
   - `TestUnsafeMethodNeedsAllowedOrigin` (POST, PUT, PATCH and DELETE, without or with a foreign Origin → 403).
   - `TestJSONContentTypeRequired` (`text/plain` POST → 415).
-  - `TestRegistryEmailCaseInsensitive`.
+  - `TestRegistryEmailCaseInsensitive`: `A@Example.com` via `google` matches `a@example.com` listed under `google`. Case-folding never crosses connectors.
   - `TestRegistryReloadRemovesAccess`: rewrite the file without the person → the next request is 401 and `OnSessionEnded` fires.
 - [ ] **Step 2: Run** `go test ./core/internal/auth/`. Expected: FAIL.
 - [ ] **Step 3: Implement** with `go-oidc/v3`, `x/oauth2`, `x/crypto/chacha20poly1305` and `x/crypto/hkdf`.
