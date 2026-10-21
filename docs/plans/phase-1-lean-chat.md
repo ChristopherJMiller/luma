@@ -212,6 +212,13 @@ From the pre-flight consistency scan (48 findings), all adopted. Each is written
 - **S22** (F37): the retention copy drops "encrypted". Touches 24.
 - **S23** (F38): six more spec deviations in CLAUDE.md. Touches 0 (done in the Task 0 follow-up commit).
 
+**Deploy-seam rulings (2026-10-21),** from the deploy plan's pre-flight scan (luma-homeops `docs/superpowers/plans/2026-10-18-luma-phase1-deploy.md`, its D-numbers):
+- **D7:** the deploy plan's Task 3 starts from tag `stage-1a`. Touches cross-plan ordering, the Stage 1A gate.
+- **D8:** an L1 FAIL changes the TTL here (`agents/models.yaml` + chart files) and drops nightly `ttl.one_hour`; never a site edit. Touches 26b Step 0.
+- **D10:** C8 states the reconcile container's `command`/`args` split, so the deploy plan can run `--day` one-offs. Touches C8, 26b.
+- **D18:** one Service `luma-egress-web` carries ports 4750 and 9810. Touches 26b.
+- **D19:** HSTS follows `LUMA_PUBLIC_URL`, not `r.TLS` (Traefik terminates TLS). Touches 15.
+
 ## Repository layout (decided)
 
 ```
@@ -517,7 +524,7 @@ The registries are created **before their first users** (S3): every Core descrip
 | `evals.{enabled,nightlySchedule,weeklySchedule,existingConfigMap}` | `false`, —, —, `""` | the **conductor image**, `command: ["/nodejs/bin/node"]`, `args: ["/app/dist/evals/main.js","run","--suite","<s>"]`. The deploy plan replaces `args` wholesale for one-off suites. Golden tasks come from the ConfigMap (empty → `files/evals`), **mounted at `/etc/luma/evals`** (`--evals-dir`'s default; S6). Env `LUMA_IMAGE` = the conductor image reference. |
 | `evals.resources`, `usageReconcile.resources` | req 100m/768Mi lim 1536Mi; req 10m/32Mi lim 128Mi | — (the deploy plan counts them in its capacity check) |
 | `evals.gateJob.render` | `false` | `true` (only with `helm template --show-only`) renders Job `luma-evals-gate`: the evals container plus a **native-sidecar gateway carrying only the `ci` route** |
-| `usageReconcile.{enabled,schedule,timeZone,workspaces}` | `false`, `"30 7 * * *"`, `Etc/UTC`, `[luma-interactive, luma-ci]` | CronJob `luma-usage-reconcile`, core image, `luma-core usage-reconcile` |
+| `usageReconcile.{enabled,schedule,timeZone,workspaces}` | `false`, `"30 7 * * *"`, `Etc/UTC`, `[luma-interactive, luma-ci]` | CronJob `luma-usage-reconcile`, core image, **`command: ["/luma-core"]`, `args: ["usage-reconcile"]`** (default day: yesterday UTC). The deploy plan replaces `args` wholesale for a one-off day: `["usage-reconcile","--day","YYYY-MM-DD"]` (D10). |
 | `usageReconcile.adminKeySecretName` | `luma-anthropic-admin` | key `ANTHROPIC_ADMIN_KEY` → file `/run/secrets/anthropic-admin/key`, **mounted by this CronJob only** |
 | `priorityClass` | `{create: true, name: luma-batch, value: -5}` | evals and reconcile pods only (P25) |
 | `serviceMonitor` | `{enabled: false, labels: {}}` | — |
@@ -576,7 +583,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
 | 1E Ship | 25 images, 26a chart (core side), 26b chart (edge side), 28a e2e core flows, 28b e2e security, 29 publish | `ci-ok` green with e2e; `v0.1.0-rc.1` published |
 
 **Cross-plan ordering:**
-- The deploy plan's Tasks 1–3 may start once **Task 3** is done, because its live spike runs Spike G's gateway config.
+- The deploy plan's Task 3 starts from the **`stage-1a` tag** (Stage 1A gate; D7), because its live spike runs Spike G's gateway config as Task 4 Step 5 may amend it. Its Tasks 1–2 don't wait.
 - Its Tasks 6–7 need **Task 29**'s rc.
 - Live spike results (L1–L5) feed back into this plan **before Task 26b**. L1 may change `models.yaml`; L3 is informational, because Spike G alone decides the route type. Task 26b's Step 0 is the gate: no §L, or an unapplied branch, means stop and ask Chris (S9).
 
@@ -938,8 +945,8 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
 
 - [ ] `nix develop -c make gateway-spike sdk-spike test` is green, and `ci-ok` on main is green with `check`, `gateway-spike` and `sdk-spike`.
 - [ ] `docs/spikes/phase-1.md` §G and §S record every case and branch, and §S records the C2/C4/C7 amendment, or that there was none.
-- [ ] Tag the commit `stage-1a`. From here, any change under `protocol/`, `core/internal/protocol/` or `packages/protocol/` must also edit C1–C10 in this file, in the same commit.
-- [ ] Tell Chris that the deploy plan's Tasks 1–3 can start, and that its Task 3 must **fill the canonical config's `__UPSTREAM_*__` tokens** (`api.anthropic.com`, `443`, `true`) instead of removing a fake `hostOverride` (S8).
+- [ ] Tag the commit `stage-1a`. The tag is the deploy plan's P5: its Task 3 reads the gateway config and §G at this tag (D7). From here, any change under `protocol/`, `core/internal/protocol/` or `packages/protocol/` must also edit C1–C10 in this file, in the same commit.
+- [ ] Tell Chris that the deploy plan's Task 3 can start from `stage-1a`, and that it must **fill the canonical config's `__UPSTREAM_*__` tokens** (`api.anthropic.com`, `443`, `true`) instead of removing a fake `hostOverride` (S8).
 
 ---
 
@@ -1566,7 +1573,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
 - **Security headers** on every public response:
   - `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' wss://<public host>; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; manifest-src 'self'; worker-src 'self'`
   - `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Permissions-Policy: camera=(), microphone=(), geolocation=()`
-  - `Strict-Transport-Security: max-age=31536000` when https
+  - `Strict-Transport-Security: max-age=31536000` when **`LUMA_PUBLIC_URL` is https** (the S17 cookie rule; D19). Never keyed on `r.TLS`: Traefik terminates TLS, so Core sees plain http.
   - `Cache-Control: no-store` on `/v1` and `/auth`
 - **Static:**
   - `/assets/*` → `public, max-age=31536000, immutable`; `/sw.js` and `/index.html` → `no-cache`.
@@ -1574,7 +1581,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
 - **Janitor** (every 10 min): incognito sessions idle > 24 h (tree delete plus `PurgeTree(root, ref)`), unbound attachments > 24 h, expired web sessions.
 
 - [ ] **Step 1: Write failing tests:**
-  - **Headers and static:** `TestCSPExact`; `TestSPAFallbackNotForAPI` (`/v1/nope` → 404 JSON); `TestAssetsImmutableSWNoCache`.
+  - **Headers and static:** `TestCSPExact`; `TestHSTSFollowsPublicURL` (D19: an https `LUMA_PUBLIC_URL` with a plain-http request → the header is present; an http `LUMA_PUBLIC_URL` → absent); `TestSPAFallbackNotForAPI` (`/v1/nope` → 404 JSON); `TestAssetsImmutableSWNoCache`.
   - **Janitor:** `TestJanitorDeletesIdleIncognitoOnly`.
   - **Config:**
     - `TestConfigRequiresSecrets`: an empty `LUMA_OIDC_CLIENT_SECRET` → error naming it.
@@ -2303,7 +2310,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
 
 - [ ] **Step 0: Live-spike gate (S9).** `docs/spikes/phase-1.md` §L must exist, record L1–L5, and have its branches applied in this repo:
   - `fakeanthropic.BindingErrorText` is the live text, which still contains `protocol/fixtures/binding-error.txt` (if not, the fixture is changed to a substring the live text has, with Tasks 2 and 19a still green);
-  - the `models.yaml` TTL from L1, in `agents/` and `charts/luma/files/`;
+  - **the L1 TTL lands here, never as a site edit in the deploy repo (D8):** on L1 FAIL, `cache_ttl: 5m` for every tier in `agents/models.yaml` and `charts/luma/files/models.yaml` (`check-chart-sync` keeps them equal), and Task 27's nightly `ttl.one_hour` case is dropped in the same commit, so the nightly suite can pass under 5m. On L1 PASS both stay `1h`;
   - Task 27's `count_tokens` pre-pass, as L-results require.
 
   If §L is missing or any branch is unapplied, **stop and ask Chris**.
@@ -2312,10 +2319,10 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
   | Component | Objects | Notes |
   |---|---|---|
   | gateway | Deployment (`replicas`), PDB (`minAvailable: 1`), Service `luma-gateway` (8080, plus metrics 15020) | ConfigMap rendered from the Spike G config with a **routes list** parameter. Env `GATEWAY_TOKEN_INTERACTIVE` and `GATEWAY_TOKEN_CI`. Both key files at `/run/secrets/anthropic/`. Readiness `:15021`, admin on `127.0.0.1:15000`. `checksum/config`; anti-affinity preferred across nodes. |
-  | egress `web` | Deployment `luma-egress-web`, Services 4750 and 9810 | `deny_ranges` = `denyRanges` + `extraDenyRanges`, plus `allow_ranges`, `deny_addresses`, `allow_missing_role: true`, `acl_file`, `idle_timeout: 600s`, `exit_timeout: 20s`. Prometheus flags `--expose-prometheus-metrics --prometheus-port 9810`. ACL rendered from `acl.globalDenyList` + `acl.extraGlobalDenyList`. `checksum/config` and `checksum/acl`; `terminationGracePeriodSeconds: 30`. |
+  | egress `web` | Deployment `luma-egress-web`; **one** Service `luma-egress-web` with ports 4750 (proxy) and 9810 (metrics). The deploy plan's alerts select `service="luma-egress-web"` (D18) | `deny_ranges` = `denyRanges` + `extraDenyRanges`, plus `allow_ranges`, `deny_addresses`, `allow_missing_role: true`, `acl_file`, `idle_timeout: 600s`, `exit_timeout: 20s`. Prometheus flags `--expose-prometheus-metrics --prometheus-port 9810`. ACL rendered from `acl.globalDenyList` + `acl.extraGlobalDenyList`. `checksum/config` and `checksum/acl`; `terminationGracePeriodSeconds: 30`. |
   | evals | CronJobs `luma-evals-nightly` (`--suite nightly`) and `luma-evals-weekly` (`--suite weekly`): the conductor image, SA `luma-evals`, `concurrencyPolicy: Forbid`, `backoffLimit: 0`, `activeDeadlineSeconds: 1800`, `ttlSecondsAfterFinished: 86400`, `luma-batch` | the CI bearer only; `LUMA_GATEWAY_URL=http://luma-gateway:8080/ci` |
   | evals gate | Job `luma-evals-gate`, rendered only with `evals.gateJob.render: true` | The gateway as a **native sidecar** (`initContainers`, `restartPolicy: Always`), rendered with **routes `[ci]` only**, holding only `ANTHROPIC_KEY_CI` and `GATEWAY_TOKEN_CI`. The evals container runs `--suite gate --gateway http://127.0.0.1:8080/ci`. `ttlSecondsAfterFinished: 600`. |
-  | usage reconcile | CronJob `luma-usage-reconcile` (core image, SA `luma-usage-reconcile`, `luma-batch`, `timeZone`) | the **only** pod mounting `usageReconcile.adminKeySecretName` |
+  | usage reconcile | CronJob `luma-usage-reconcile` (core image, SA `luma-usage-reconcile`, `luma-batch`, `timeZone`) | the **only** pod mounting `usageReconcile.adminKeySecretName`. `command: ["/luma-core"]`, `args: ["usage-reconcile"]` (C8; D10), so a one-off can replace `args` with a `--day` |
   | monitors | ServiceMonitors (when enabled, with `serviceMonitor.labels`) for core, conductor, gateway and egress-web | — |
 
 - **The `egress.web.acl.globalDenyList` default is the curated `exfil-deny` list** (§13.2). Each `*.x` glob is paired with its apex where the apex serves the same thing:
@@ -2338,11 +2345,13 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
     - `TestDefaultDenyRangesPresent`.
     - `TestSmokescreenConfigKeys` (`acl_file`, `idle_timeout: 600s`, `allow_missing_role: true`, `allow_ranges`, and the prometheus flags in `args`).
     - `TestExfilDenyListPairsApexes` (every `*.x` whose apex is in the hand-written expected list also has the apex).
+    - `TestEgressWebOneService` (D18): exactly one Service selects the smokescreen pods, named `luma-egress-web`, with ports 4750 and 9810.
   - **Rollout and CronJobs:**
     - `TestConfigChecksumsRollPods` (gateway and smokescreen).
     - `TestEvalCronJobsForbidConcurrencyAndUseBatchPriority`.
     - `TestEvalsGetOnlyCiGatewayToken`.
     - `TestReconcileIsOnlyAdminKeyMount`.
+    - `TestReconcileCommandArgsSplit` (D10): the reconcile container has `command: ["/luma-core"]` and `args: ["usage-reconcile"]`.
     - `TestEvalsMountGoldenTasksAndImage` (S6): every evals pod mounts the golden tasks at `/etc/luma/evals` and sets `LUMA_IMAGE` to the conductor's `repository:tag@digest`.
     - `TestEnvCoversC6` is extended to the evals and reconcile containers.
   - **Monitors:** `TestServiceMonitorLabels`.
