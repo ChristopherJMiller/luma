@@ -1,0 +1,6 @@
+id: luma-forget-fact
+agent: luma
+tier: fast
+turns:
+  - user: "Forget what you know about my penicillin allergy."
+    expect: {text_matches: '(?i)(forg|removed|dropped)', tools_called: ["mcp__luma__forget"], max_cost_usd: 0.03, remembered_matches: null}

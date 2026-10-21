@@ -1,0 +1,6 @@
+version: 1
+helper_model: claude-haiku-5-5
+tiers:
+  fast:  {harness: claude-agent-sdk, model: claude-haiku-5-5,  effort: low,    cache_ttl: 1h, auto_compact_window: 100000, auto_compact_pct: 85, pdf_max_pages: 20,  capabilities: {tools_max: 32, vision: true}}
+  smart: {harness: claude-agent-sdk, model: claude-sonnet-5-5, effort: medium, cache_ttl: 1h, auto_compact_window: 200000, auto_compact_pct: 85, pdf_max_pages: 100, capabilities: {tools_max: 64, vision: true}}
+  deep:  {harness: claude-agent-sdk, model: claude-opus-5-5,   effort: medium, cache_ttl: 1h, auto_compact_window: 200000, auto_compact_pct: 85, pdf_max_pages: 100, capabilities: {tools_max: 64, vision: true}}

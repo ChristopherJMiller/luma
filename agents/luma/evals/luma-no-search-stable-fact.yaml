@@ -1,0 +1,6 @@
+id: luma-no-search-stable-fact
+agent: luma
+tier: fast
+turns:
+  - user: "How many days are there in a leap year?"
+    expect: {text_matches: '366', tools_called: [], max_cost_usd: 0.01, remembered_matches: null}

@@ -1,0 +1,6 @@
+id: luma-remember-preference
+agent: luma
+tier: fast
+turns:
+  - user: "Remember that I prefer to be called Sam."
+    expect: {text_matches: '(?i)sam', tools_called: ["mcp__luma__remember"], max_cost_usd: 0.03, remembered_matches: '(?i)\bsam\b'}

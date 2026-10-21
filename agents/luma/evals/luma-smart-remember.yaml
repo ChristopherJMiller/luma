@@ -1,0 +1,6 @@
+id: luma-smart-remember
+agent: luma
+tier: smart
+turns:
+  - user: "Remember that my daughter's name is Priya."
+    expect: {text_matches: '(?i)(remember|noted|saved)', tools_called: ["mcp__luma__remember"], max_cost_usd: 0.05, remembered_matches: '(?i)priya'}

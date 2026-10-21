@@ -1,0 +1,6 @@
+id: luma-capital
+agent: luma
+tier: fast
+turns:
+  - user: "What is the capital of Australia?"
+    expect: {text_matches: '(?i)canberra', tools_called: [], max_cost_usd: 0.01, remembered_matches: null}

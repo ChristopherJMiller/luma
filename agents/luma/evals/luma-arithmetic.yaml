@@ -1,0 +1,6 @@
+id: luma-arithmetic
+agent: luma
+tier: fast
+turns:
+  - user: "What is 17 times 23?"
+    expect: {text_matches: '391', tools_called: [], max_cost_usd: 0.01, remembered_matches: null}

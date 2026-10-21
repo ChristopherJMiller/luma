@@ -1,0 +1,6 @@
+id: luma-smart-capital
+agent: luma
+tier: smart
+turns:
+  - user: "What is the capital of Canada, and what river is it on?"
+    expect: {text_matches: '(?i)ottawa', tools_called: [], max_cost_usd: 0.03, remembered_matches: null}

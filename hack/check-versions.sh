@@ -12,7 +12,9 @@
 #      at the direct CLI pin, and every @anthropic-ai/claude-agent-sdk*
 #      package (the SDK and its optional platform packages, each of which
 #      bundles a CLI binary) at the SDK pin, so no second CLI version can
-#      ride in (S19).
+#      ride in (S19);
+#   5. Go's agents.SubagentTool equals SUBAGENT_TOOL in
+#      conductor/src/spike-results.ts (S19).
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -100,6 +102,20 @@ if [[ -f $pkg ]]; then
 	done < <(yq '.packages | keys | .[]' "$lock")
 	if ((found_cli == 0)); then
 		report "$lock: no @anthropic-ai/claude-code package is locked"
+	fi
+fi
+
+# 5. The subagent tool name: Go's agents.SubagentTool and the conductor's
+# SUBAGENT_TOOL spike constant must be the same string (S19).
+go_tool_file=core/internal/agents/compile.go
+ts_tool_file=conductor/src/spike-results.ts
+if [[ -f $go_tool_file && -f $ts_tool_file ]]; then
+	go_tool=$(sed -nE 's/^const SubagentTool = "([^"]*)".*/\1/p' "$go_tool_file")
+	ts_tool=$(sed -nE "s/^export const SUBAGENT_TOOL[^=]*= '([^']*)'.*/\1/p" "$ts_tool_file")
+	if [[ -z $go_tool || -z $ts_tool ]]; then
+		report "cannot read SubagentTool ('$go_tool') or SUBAGENT_TOOL ('$ts_tool')"
+	elif [[ $go_tool != "$ts_tool" ]]; then
+		report "$go_tool_file SubagentTool '$go_tool' differs from $ts_tool_file SUBAGENT_TOOL '$ts_tool'"
 	fi
 fi
 

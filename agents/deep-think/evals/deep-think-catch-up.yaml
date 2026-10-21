@@ -1,0 +1,6 @@
+id: deep-think-catch-up
+agent: deep-think
+tier: smart
+turns:
+  - user: "A train leaves a station at 3pm travelling 60 km/h. Another leaves the same station an hour later at 90 km/h on the same line. When does the second catch the first?"
+    expect: {text_matches: '(?i)(6 ?pm|18:00)', tools_called: [], max_cost_usd: 0.05, remembered_matches: null}

@@ -1,0 +1,8 @@
+id: luma-search-cites
+agent: luma
+tier: fast
+stub_web_search:
+  - {title: "Marlow Library opening hours", url: "https://marlow.example.org/library", snippet: "Marlow Library is open 9am to 6pm Monday to Saturday, closed Sunday."}
+turns:
+  - user: "When is Marlow Library open? Please give me your source."
+    expect: {text_matches: '(?is)(9 ?am|monday).*marlow\.example\.org|marlow\.example\.org.*(9 ?am|monday)', tools_called: ["WebSearch"], max_cost_usd: 0.05, remembered_matches: null}

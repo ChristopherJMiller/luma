@@ -1,0 +1,6 @@
+id: luma-greeting
+agent: luma
+tier: fast
+turns:
+  - user: "Hi, who am I talking to?"
+    expect: {text_matches: '(?i)luma', tools_called: [], max_cost_usd: 0.01, remembered_matches: null}

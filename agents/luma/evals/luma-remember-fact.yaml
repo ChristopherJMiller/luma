@@ -1,0 +1,6 @@
+id: luma-remember-fact
+agent: luma
+tier: fast
+turns:
+  - user: "Please remember that I am allergic to penicillin."
+    expect: {text_matches: '(?i)(remember|noted|saved)', tools_called: ["mcp__luma__remember"], max_cost_usd: 0.03, remembered_matches: '(?i)penicillin'}

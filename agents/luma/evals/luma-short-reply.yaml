@@ -1,0 +1,6 @@
+id: luma-short-reply
+agent: luma
+tier: fast
+turns:
+  - user: "Give me a one-line tip for keeping basil alive."
+    expect: {text_matches: '(?i)basil|water|sun|light', tools_called: [], max_cost_usd: 0.01, remembered_matches: null}

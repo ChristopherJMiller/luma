@@ -1,0 +1,8 @@
+id: luma-smart-search
+agent: luma
+tier: smart
+stub_web_search:
+  - {title: "Seattle weather today", url: "https://weather.example.com/seattle", snippet: "Seattle: 14C, light rain, wind 10 km/h."}
+turns:
+  - user: "What is the weather in Seattle right now?"
+    expect: {text_matches: '(?i)(14|rain)', tools_called: ["WebSearch"], max_cost_usd: 0.1, remembered_matches: null}

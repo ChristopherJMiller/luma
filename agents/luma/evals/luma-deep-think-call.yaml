@@ -1,0 +1,6 @@
+id: luma-deep-think-call
+agent: luma
+tier: fast
+turns:
+  - user: "Think this through carefully: five friends split a 137 dollar bill, two of them had double portions, and one has a 10 dollar voucher. Work out a fair split for each person."
+    expect: {text_matches: '[0-9]', tools_called: ["deep-think"], max_cost_usd: 0.1, remembered_matches: null}

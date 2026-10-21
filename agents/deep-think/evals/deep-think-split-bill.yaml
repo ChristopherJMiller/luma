@@ -1,0 +1,6 @@
+id: deep-think-split-bill
+agent: deep-think
+tier: smart
+turns:
+  - user: "Five friends split a 150 dollar bill, but one of them only ate a 10 dollar meal and pays just that. The other four split the rest equally. How much does each of the four pay?"
+    expect: {text_matches: '35', tools_called: [], max_cost_usd: 0.05, remembered_matches: null}
