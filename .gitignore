@@ -30,8 +30,8 @@ node_modules/
 *.img
 
 # Nix
-result
-result-*
+/result
+/result-*
 /.direnv/
 
 # Editors

@@ -30,9 +30,15 @@ elif [[ $(minor "$mod_go") != "$flake_go" ]]; then
 	report "go.mod says go $mod_go but the flake's Go is $flake_go"
 fi
 
-# 2. Dockerfile(s)
-shopt -s nullglob
-dockerfiles=(Dockerfile Dockerfile.* */Dockerfile)
+# 1b. pnpm: the flake's pnpm must be the package.json packageManager version
+# (.npmrc turns pnpm's self-download off, so a mismatch would go unnoticed).
+pm=$(jq -r '.packageManager // empty' package.json)
+if [[ $pm != "pnpm@$(pnpm --version)" ]]; then
+	report "package.json packageManager is '$pm' but the flake's pnpm is $(pnpm --version)"
+fi
+
+# 2. Dockerfile(s), tracked, anywhere in the tree
+mapfile -t dockerfiles < <(git ls-files -- ':(glob)**/Dockerfile*')
 for df in "${dockerfiles[@]}"; do
 	[[ -f $df ]] || continue
 	while read -r image; do
