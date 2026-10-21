@@ -2,7 +2,7 @@
 
 Luma is a self-hosted household agentic assistant. It aims to be "Claude.ai
 plus Claude Code on the web, for this household": the data stays in the home
-cluster, every tool has a declared owner and scope, and the model behind any
+cluster (apart from inference, which goes to Anthropic), every tool has a declared owner and scope, and the model behind any
 agent can be swapped. The product name in the UI is "Luma, powered by Claude".
 Users are told they are talking to an AI.
 
@@ -23,9 +23,11 @@ services.
   conversation tree, memory, the cost ledger, maintenance mode and retention.
   It stores everything in Postgres.
 - **Conductor (TypeScript).** Hosts the Claude Agent SDK. It executes turns
-  and never decides or stores anything: one long-lived link to Core, and a
-  small pool of SDK `query()` sessions, each backed by a local Claude Code CLI
-  subprocess with no shell or file tools.
+  and decides nothing. It holds no authoritative state: one long-lived link to
+  Core, and a small pool of SDK `query()` sessions, each backed by a local
+  Claude Code CLI subprocess with no shell or file tools. It keeps only SDK
+  transcripts, written to a Core-owned Postgres table (P5), plus a local
+  scratch copy in memory-backed storage (P18).
 - **PWA (assistant-ui).** The chat client for phone and laptop, served by Core.
 - **Agent gateway.** Sits in front of Anthropic. It holds the real API keys,
   sees every model request, and alerts on malformed ones.
@@ -37,12 +39,14 @@ browser (PWA, cookie session)
         <-> conductor (TS) Agent SDK host; CLI subprocess per open chat
                 -> agent gateway -> Anthropic
                 -> egress proxy  -> the web (WebFetch only)
+                -> Postgres      SDK transcripts only (Core-owned table)
    Core -> Postgres
 ```
 
 ## Trust boundaries
 
-From the spec's security model (section 16), trimmed to what exists in phase 1:
+The list is the spec's security model (section 16), renumbered for what exists
+in phase 1:
 
 1. **Clients.** Untrusted. No tokens live in the browser, its storage or URLs.
 2. **The edge.** TLS and routing only.
@@ -52,8 +56,8 @@ From the spec's security model (section 16), trimmed to what exists in phase 1:
    and it holds no user credentials. It sees an opaque per-person reference,
    never a name.
 5. **Conductor-local CLIs.** They make model-chosen tool calls, with no shell.
-6. **Downstream services.** The gateway and the egress proxy each enforce
-   their own limits. Later phases add MCP servers and sandboxes (spec
+6. **Downstream services (the gateway, the egress proxy).** Each enforces
+   its own limits. Later phases add MCP servers and sandboxes (spec
    sections 7 and 9), which are out of scope here.
 
 Prompt injection is handled by treating memory as data and tracking taint:
@@ -70,7 +74,8 @@ laptop:
   `forget` tools;
 - image, camera and PDF attachments;
 - a history list, with edit and regenerate as branches of the conversation;
-- fast and smart model tiers, mapped through site config;
+- model tiers mapped through site config: fast and smart in the UI, deep for
+  admins;
 - a cost ledger with a monthly cap and a warning, reconciled nightly against
   Anthropic's usage report;
 - incognito chats and delete, with retention disclosed in the UI.
@@ -112,5 +117,5 @@ under its retention policy; the UI says so.
 
 Where phase 1 departs from or refines the spec, the reasoning is recorded in
 the [phase-1 plan](plans/phase-1-lean-chat.md), under "Decisions this plan
-makes" (P1 onward). Deviations that bind the code are also listed in
+makes" (P1 onward) and "Pre-flight rulings (2026-10-21)". Deviations that bind the code are also listed in
 [CLAUDE.md](../CLAUDE.md).
