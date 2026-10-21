@@ -1,0 +1,4 @@
+# False positives, by fingerprint (commit:file:rule:line). History is shared, so
+# a fixture value that tripped generic-api-key is ignored here and renamed in
+# the next commit instead of rewriting main.
+ab27616e591cddf572451703611d8f0a99da08f2:protocol/fixtures/link/event-main-request-usage.json:generic-api-key:1
