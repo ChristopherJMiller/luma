@@ -93,8 +93,8 @@
       "automerge": false
     },
     {
-      "description": "agentgateway sits on the request path to Anthropic (Spike G): weekly, and a person reads the release notes; the gateway-spike job reruns the spike against the new image. Its one image is ghcr.io/agentgateway/agentgateway, pinned in the Makefile (AGENTGATEWAY_IMAGE) and, from Task 26b, the chart.",
-      "matchPackageNames": ["ghcr.io/agentgateway/agentgateway"],
+      "description": "agentgateway sits on the request path to Anthropic (Spike G): weekly, and a person reads the release notes; the gateway-spike job reruns the spike against the new image. Today its one image is ghcr.io/agentgateway/agentgateway, pinned in the Makefile (AGENTGATEWAY_IMAGE) and, from Task 26b, the chart. The globs keep this rule on agentgateway if the image or chart moves to another name or registry, so it never falls to the automerge default.",
+      "matchPackageNames": ["ghcr.io/agentgateway/agentgateway", "ghcr.io/agentgateway/**", "agentgateway/**", "cr.agentgateway.dev/**"],
       "groupName": "agentgateway",
       "schedule": ["before 6am on monday"],
       "automerge": false

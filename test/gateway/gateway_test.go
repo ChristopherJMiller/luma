@@ -9,12 +9,20 @@ package gateway
 import (
 	"bufio"
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"maps"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -141,19 +149,20 @@ func (hs *harness) dockerArgs(cfg string, extra ...string) []string {
 // another.
 func gateway(t *testing.T, routeType string) {
 	t.Helper()
-	gatewayWith(t, routeType, "null")
+	gatewayWith(t, routeType, "null", h.up.srv)
 }
 
-// gatewayWith is gateway with __UPSTREAM_TLS__ filled with tls.
-func gatewayWith(t *testing.T, routeType, tls string) {
+// gatewayWith is gateway with __UPSTREAM_TLS__ filled with tlsFill and the
+// upstream port with srv's.
+func gatewayWith(t *testing.T, routeType, tlsFill string, srv *httptest.Server) {
 	t.Helper()
-	want := routeType + ", __UPSTREAM_TLS__ " + tls
+	want := fmt.Sprintf("%s, __UPSTREAM_TLS__ %s, upstream %s", routeType, tlsFill, srv.Listener.Addr())
 	if h.running == want {
 		return
 	}
 	h.stop()
 	cfg := filepath.Join(h.dir, "config.yaml")
-	if err := os.WriteFile(cfg, []byte(render(t, routeType, tls)), 0o644); err != nil {
+	if err := os.WriteFile(cfg, []byte(render(t, routeType, tlsFill, srv)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	args := append([]string{"run", "-d", "--name", containerName}, h.dockerArgs(cfg)...)
@@ -200,15 +209,15 @@ func canonical(t *testing.T) string {
 // the client's Host through to an IP target.
 const upstreamHost = "localhost"
 
-// render fills the canonical config's upstream tokens with the fake's
-// address and tls, and gives /v1/messages routeType, in a copy.
-func render(t *testing.T, routeType, tls string) string {
+// render fills the canonical config's upstream tokens with upstreamHost,
+// srv's port and tlsFill, and gives /v1/messages routeType, in a copy.
+func render(t *testing.T, routeType, tlsFill string, srv *httptest.Server) string {
 	t.Helper()
-	_, port, err := net.SplitHostPort(h.up.srv.Listener.Addr().String())
+	_, port, err := net.SplitHostPort(srv.Listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := strings.NewReplacer("__UPSTREAM_HOST__", upstreamHost, "__UPSTREAM_PORT__", port, "__UPSTREAM_TLS__", tls).Replace(canonical(t))
+	cfg := strings.NewReplacer("__UPSTREAM_HOST__", upstreamHost, "__UPSTREAM_PORT__", port, "__UPSTREAM_TLS__", tlsFill).Replace(canonical(t))
 	from := "/v1/messages: " + RouteType + "\n"
 	if n := strings.Count(cfg, from); n != len(routes) {
 		t.Fatalf("the canonical config has %q %d times, want once per route", strings.TrimSpace(from), n)
@@ -403,19 +412,14 @@ func cliHeaders(bearer, person string) http.Header {
 // post sends body to the gateway at path. The caller closes the body.
 func post(t *testing.T, path string, hd http.Header, body []byte) *http.Response {
 	t.Helper()
-	return do(t, http.MethodPost, path, hd, body)
-}
-
-func do(t *testing.T, method, path string, hd http.Header, body []byte) *http.Response {
-	t.Helper()
-	req, err := http.NewRequestWithContext(t.Context(), method, gatewayURL+path, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, gatewayURL+path, bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.Header = hd
 	resp, err := client.Do(req)
 	if err != nil {
-		t.Fatalf("%s %s: %v", method, path, err)
+		t.Fatalf("POST %s: %v", path, err)
 	}
 	return resp
 }
@@ -759,9 +763,9 @@ func TestCanonicalConfigHasNoUpstream(t *testing.T) {
 	}
 
 	// Both TLS fills load.
-	for _, tls := range []string{"{}", "null"} {
+	for _, tlsFill := range []string{"{}", "null"} {
 		cfg := filepath.Join(t.TempDir(), "config.yaml")
-		if err := os.WriteFile(cfg, []byte(render(t, RouteType, tls)), 0o644); err != nil {
+		if err := os.WriteFile(cfg, []byte(render(t, RouteType, tlsFill, h.up.srv)), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.Chmod(filepath.Dir(cfg), 0o755); err != nil {
@@ -769,7 +773,7 @@ func TestCanonicalConfigHasNoUpstream(t *testing.T) {
 		}
 		args := append([]string{"run", "--rm"}, h.dockerArgs(cfg, "--validate-only")...)
 		if out, err := exec.Command("docker", args...).CombinedOutput(); err != nil {
-			t.Errorf("__UPSTREAM_TLS__=%s does not load: %v\n%s", tls, err, out)
+			t.Errorf("__UPSTREAM_TLS__=%s does not load: %v\n%s", tlsFill, err, out)
 		}
 	}
 }
@@ -813,38 +817,47 @@ func TestBodyExact(t *testing.T) {
 	}
 }
 
+// TestHeadersForwarded covers both routes and both paths, each with and
+// without an x-api-key from the client: the route's key replaces it.
 func TestHeadersForwarded(t *testing.T) {
 	gateway(t, RouteType)
 	keys := map[string]string{}
 	for _, r := range routes {
-		t.Run(r.name, func(t *testing.T) {
-			fake := h.up.use(fakeanthropic.Options{})
-			sent := cliHeaders(r.bearer, "u_5197000002")
-			resp := post(t, "/"+r.name+"/v1/messages?beta=true", sent, simpleBody("Headers.", false))
-			if b := readAll(t, resp); resp.StatusCode != http.StatusOK {
-				t.Fatalf("status %d: %s", resp.StatusCode, b)
+		for _, path := range []string{"/v1/messages?beta=true", "/v1/messages/count_tokens?beta=true"} {
+			for _, clientKey := range []string{"", "client-supplied-key-not-a-secret"} {
+				t.Run(fmt.Sprintf("%s%s x-api-key=%q", r.name, path, clientKey), func(t *testing.T) {
+					fake := h.up.use(fakeanthropic.Options{})
+					sent := cliHeaders(r.bearer, "u_5197000002")
+					if clientKey != "" {
+						sent.Set("X-Api-Key", clientKey)
+					}
+					resp := post(t, "/"+r.name+path, sent, simpleBody("Headers.", false))
+					if b := readAll(t, resp); resp.StatusCode != http.StatusOK {
+						t.Fatalf("status %d: %s", resp.StatusCode, b)
+					}
+					recs := fake.Requests()
+					if len(recs) != 1 {
+						t.Fatalf("the fake recorded %d requests, want 1", len(recs))
+					}
+					got := recs[0].Header
+					for _, k := range []string{"Anthropic-Beta", "X-Claude-Code-Request-Class", "X-Luma-Person", "X-Luma-Agent", "X-Luma-Tier", "X-Luma-Source"} {
+						if !slices.Equal(got.Values(k), sent.Values(k)) {
+							t.Errorf("%s arrived as %q, want %q", k, got.Values(k), sent.Values(k))
+						}
+					}
+					if v := got.Values("Anthropic-Version"); !slices.Equal(v, []string{"2023-06-01"}) {
+						t.Errorf("anthropic-version arrived as %q", v)
+					}
+					if v := got.Values("Authorization"); v != nil {
+						t.Errorf("authorization reached the upstream: %q", v)
+					}
+					if v := got.Values("X-Api-Key"); !slices.Equal(v, []string{r.key}) {
+						t.Errorf("x-api-key arrived as %q, want only the %s key", v, r.name)
+					}
+					keys[r.name] = got.Get("X-Api-Key")
+				})
 			}
-			recs := fake.Requests()
-			if len(recs) != 1 {
-				t.Fatalf("the fake recorded %d requests, want 1", len(recs))
-			}
-			got := recs[0].Header
-			for _, k := range []string{"Anthropic-Beta", "X-Claude-Code-Request-Class", "X-Luma-Person", "X-Luma-Agent", "X-Luma-Tier", "X-Luma-Source"} {
-				if !slices.Equal(got.Values(k), sent.Values(k)) {
-					t.Errorf("%s arrived as %q, want %q", k, got.Values(k), sent.Values(k))
-				}
-			}
-			if v := got.Values("Anthropic-Version"); !slices.Equal(v, []string{"2023-06-01"}) {
-				t.Errorf("anthropic-version arrived as %q", v)
-			}
-			if v := got.Values("Authorization"); v != nil {
-				t.Errorf("authorization reached the upstream: %q", v)
-			}
-			if v := got.Values("X-Api-Key"); !slices.Equal(v, []string{r.key}) {
-				t.Errorf("x-api-key arrived as %q, want the %s key", v, r.name)
-			}
-			keys[r.name] = got.Get("X-Api-Key")
-		})
+		}
 	}
 	if keys[interactive.name] == keys[ci.name] {
 		t.Errorf("both routes sent the key %q", keys[ci.name])
@@ -882,6 +895,8 @@ func TestBearerRequired(t *testing.T) {
 	}
 }
 
+// TestUnlistedPathRejected sends each request line exactly as written, so
+// dot segments and percent-encoding reach the gateway unnormalised.
 func TestUnlistedPathRejected(t *testing.T) {
 	gateway(t, RouteType)
 	for _, c := range []struct{ method, path string }{
@@ -889,14 +904,48 @@ func TestUnlistedPathRejected(t *testing.T) {
 		{http.MethodPost, "/interactive/v1/chat/completions"},
 		{http.MethodPost, "/interactive/v1/messages/batches"},
 		{http.MethodPost, "/v1/messages"},
+		{http.MethodPost, "/interactive/v1/messages/../models"},
+		{http.MethodPost, "/interactive/v1/%6dessages"},
+		{http.MethodPost, "/%69nteractive/v1/messages"},
+		{http.MethodPost, "//interactive/v1/messages"},
 	} {
 		fake := h.up.use(fakeanthropic.Options{})
-		resp := do(t, c.method, c.path, cliHeaders(interactive.bearer, "u_5197000005"), simpleBody("Unlisted.", false))
-		if b := readAll(t, resp); resp.StatusCode != http.StatusNotFound {
-			t.Errorf("%s %s: %d %s, want 404", c.method, c.path, resp.StatusCode, b)
+		status, b := rawRequest(t, c.method, c.path, cliHeaders(interactive.bearer, "u_5197000005"), simpleBody("Unlisted.", false))
+		if status != http.StatusNotFound {
+			t.Errorf("%s %s: %d %s, want 404", c.method, c.path, status, b)
 		}
 		expectNothingUpstream(t, fake)
 	}
+}
+
+// rawRequest writes the request line method requestURI to the gateway as
+// is, on its own connection, and returns the response's status and body.
+func rawRequest(t *testing.T, method, requestURI string, hd http.Header, body []byte) (int, []byte) {
+	t.Helper()
+	addr := strings.TrimPrefix(gatewayURL, "http://")
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var req bytes.Buffer
+	fmt.Fprintf(&req, "%s %s HTTP/1.1\r\nHost: %s\r\nContent-Length: %d\r\nConnection: close\r\n", method, requestURI, addr, len(body))
+	if err := hd.Write(&req); err != nil {
+		t.Fatal(err)
+	}
+	req.WriteString("\r\n")
+	req.Write(body)
+	if _, err := conn.Write(req.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, requestURI, err)
+	}
+	return resp.StatusCode, readAll(t, resp)
 }
 
 func TestUpstreamPathRewritten(t *testing.T) {
@@ -1171,16 +1220,82 @@ func TestUnknownLabelValuesBecomeOther(t *testing.T) {
 	}
 }
 
-// TestUpstreamTLSSwitch: with __UPSTREAM_TLS__ filled with {}, the gateway
-// speaks TLS upstream, so the plain-http fake never gets a request.
-func TestUpstreamTLSSwitch(t *testing.T) {
-	gatewayWith(t, RouteType, "{}")
-	fake := h.up.use(fakeanthropic.Options{})
-	resp := post(t, "/interactive/v1/messages", cliHeaders(interactive.bearer, "u_5197000014"), simpleBody("TLS.", false))
-	if b := readAll(t, resp); resp.StatusCode != http.StatusServiceUnavailable {
-		t.Errorf("status %d (%s), want 503: a TLS handshake with a plain-http upstream", resp.StatusCode, b)
+// selfSignedLeaf is a valid server certificate for name that signs itself:
+// only its trust is wrong.
+func selfSignedLeaf(t *testing.T, name string) tls.Certificate {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
 	}
-	expectNothingUpstream(t, fake)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: name},
+		DNSNames:     []string{name},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+}
+
+// TestUpstreamTLSSwitch: with __UPSTREAM_TLS__ filled with {}, the gateway
+// speaks TLS upstream, verifies the certificate against the system roots,
+// and names upstreamHost in its SNI.
+func TestUpstreamTLSSwitch(t *testing.T) {
+	t.Run("plain-http upstream", func(t *testing.T) {
+		gatewayWith(t, RouteType, "{}", h.up.srv)
+		fake := h.up.use(fakeanthropic.Options{})
+		resp := post(t, "/interactive/v1/messages", cliHeaders(interactive.bearer, "u_5197000014"), simpleBody("TLS.", false))
+		if b := readAll(t, resp); resp.StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("status %d (%s), want 503: a TLS handshake with a plain-http upstream", resp.StatusCode, b)
+		}
+		expectNothingUpstream(t, fake)
+	})
+	t.Run("self-signed upstream", func(t *testing.T) {
+		var (
+			mu      sync.Mutex
+			snis    []string
+			handled int
+		)
+		srv := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			mu.Lock()
+			defer mu.Unlock()
+			handled++
+		}))
+		srv.Config.ErrorLog = log.New(io.Discard, "", 0) // the refused handshakes
+		srv.TLS = &tls.Config{
+			Certificates: []tls.Certificate{selfSignedLeaf(t, upstreamHost)},
+			GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+				mu.Lock()
+				defer mu.Unlock()
+				snis = append(snis, hello.ServerName)
+				return nil, nil
+			},
+		}
+		srv.StartTLS()
+		defer srv.Close()
+		gatewayWith(t, RouteType, "{}", srv)
+		resp := post(t, "/interactive/v1/messages", cliHeaders(interactive.bearer, "u_5197000018"), simpleBody("TLS.", false))
+		b := readAll(t, resp)
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("status %d (%s), want 503: an untrusted certificate", resp.StatusCode, b)
+		}
+		t.Logf("the gateway answered %d: %s", resp.StatusCode, b)
+		mu.Lock()
+		defer mu.Unlock()
+		if handled != 0 {
+			t.Errorf("%d requests reached the self-signed upstream, want none", handled)
+		}
+		if len(snis) == 0 || slices.ContainsFunc(snis, func(s string) bool { return s != upstreamHost }) {
+			t.Errorf("the gateway sent SNI %q, want only %q (the hostOverride host)", snis, upstreamHost)
+		}
+	})
 }
 
 // TestRouteTypes runs the body, SSE and usage checks under both route types

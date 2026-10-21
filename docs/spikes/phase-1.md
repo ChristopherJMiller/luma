@@ -119,20 +119,39 @@ semantically exact.
 - **Paths:** `/<route>/v1/messages` and `/<route>/v1/messages/count_tokens`
   only. `GET /interactive/v1/models`, `POST /interactive/v1/chat/completions`,
   `POST /interactive/v1/messages/batches` and `POST /v1/messages` are 404 and
-  reach nothing. `/ci/v1/messages?beta=true` arrives as
-  `/v1/messages?beta=true`.
-- **Headers:** `anthropic-beta`, `x-claude-code-request-class` and the
-  `x-luma-*` headers arrive unchanged; `anthropic-version` arrives as sent
-  (`2023-06-01`), and the gateway adds that value when a client sends none;
-  `authorization` is removed; `x-api-key` is the route's workspace key.
+  reach nothing. So are request lines sent unnormalised with a dot segment
+  (`/interactive/v1/messages/../models`), percent-encoding
+  (`/interactive/v1/%6dessages`, `/%69nteractive/v1/messages`) or a doubled
+  slash (`//interactive/v1/messages`): none is decoded or cleaned into a
+  route match. `/ci/v1/messages?beta=true`
+  arrives as `/v1/messages?beta=true`.
+- **Headers:** on both routes and both paths, `anthropic-beta`,
+  `x-claude-code-request-class` and the `x-luma-*` headers arrive unchanged;
+  `anthropic-version` arrives as sent (`2023-06-01`), and the gateway adds
+  that value when a client sends none; `authorization` is removed;
+  `x-api-key` is the route's workspace key and nothing else. A client's own
+  `x-api-key` sent with a valid bearer is replaced, not duplicated: the
+  upstream sees one value, the route's.
 - **Host:** for a hostname upstream the gateway sends `Host` as that name
   (here `localhost`, live `api.anthropic.com`), whatever the client sent; for
   an IP upstream it passes the client's `Host` through.
 - **TLS:** `__UPSTREAM_TLS__` = `{}` makes the gateway speak TLS upstream
-  (against the plain-http fake: 503 `received corrupt message of type
-  InvalidContentType`, and nothing reaches the fake); `null` is plain http.
-  Both fills pass `--validate-only`. TLS to `api.anthropic.com` with the
-  image's system roots is the live half's to show.
+  and verify the certificate; `null` is plain http. Both fills pass
+  `--validate-only`. With `{}`:
+  - against the plain-http fake: 503 `upstream call failed: Connect:
+    received corrupt message of type InvalidContentType`, and nothing
+    reaches the fake;
+  - against a TLS server whose valid leaf certificate for `localhost` signs
+    itself: 503 `upstream call failed: Connect: invalid peer certificate:
+    UnknownIssuer`, and no request reaches it. The image's system roots
+    decide trust.
+  - **SNI is the `hostOverride` host:** the gateway's ClientHello names
+    `localhost` (the `__UPSTREAM_HOST__` fill), so live it names
+    `api.anthropic.com`. rustls checks the certificate against that same
+    server name; a name mismatch with a trusted certificate cannot be shown
+    offline without adding a `backendTLS.root` to the config.
+
+  TLS to `api.anthropic.com` itself is the live half's to show.
 - **Errors:** 429 (with `retry-after: 7`), 529 and the fake's binding 400
   reach the client with the upstream's status, body and headers, after one
   upstream attempt (no gateway retry).
@@ -173,7 +192,7 @@ added, `input` is 2100 and `input_cache_write` 300. A cache-read share is
 
 Labels outside their fixed sets are `other`: `x-luma-person: chris`, a
 missing `x-luma-tier`, `x-luma-source: <script>` and a repeated header all
-are. The `request_class` set is provisional (`^[a-z_]{1,32}`) until Task 4
+are. The `request_class` set is provisional (`^[a-z_]{1,32}\z`) until Task 4
 Step 5.
 
 ### Prices
