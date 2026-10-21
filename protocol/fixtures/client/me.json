@@ -1,0 +1,5 @@
+{
+  "person": {"id": "chris", "display_name": "Chris", "tier": "admin"},
+  "budget": {"spent_usd": 12.5, "cap_usd": 150, "ratio": 0.0833, "warn": false, "exhausted": false, "resets_at": "2026-11-01T00:00:00Z"},
+  "maintenance": false
+}

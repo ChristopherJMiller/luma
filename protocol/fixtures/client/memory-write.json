@@ -1,0 +1,12 @@
+{
+  "id": "mem_01J9ZQ3M5K7N8P2R4T6V8W0XYN",
+  "session_id": "ses_01J9ZQ3M5K7N8P2R4T6V8W0XYA",
+  "turn_id": "turn_01J9ZQ3M5K7N8P2R4T6V8W0XYT",
+  "op": "remember",
+  "text": "Owns a kite.",
+  "matched": null,
+  "untrusted": true,
+  "status": "applied",
+  "created_at": "2026-10-21T09:00:08Z",
+  "decided_at": "2026-10-21T09:10:00Z"
+}

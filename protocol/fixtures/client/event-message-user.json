@@ -1,0 +1,22 @@
+{
+  "id": 102,
+  "session_id": "ses_01J9ZQ3M5K7N8P2R4T6V8W0XYA",
+  "type": "message.user",
+  "created_at": "2026-10-21T09:00:01Z",
+  "message": {
+    "id": "msg_01J9ZQ3M5K7N8P2R4T6V8W0XYC",
+    "session_id": "ses_01J9ZQ3M5K7N8P2R4T6V8W0XYA",
+    "parent_message_id": null,
+    "turn_id": "turn_01J9ZQ3M5K7N8P2R4T6V8W0XYT",
+    "role": "user",
+    "content": [
+      {"type": "text", "text": "What is on this synthetic photo?"},
+      {"type": "attachment", "id": "att_01J9ZQ3M5K7N8P2R4T6V8W0XYF", "media_type": "image/png", "filename": "synthetic.png"}
+    ],
+    "sdk_uuid": null,
+    "model": null,
+    "status": "complete",
+    "error_code": null,
+    "created_at": "2026-10-21T09:00:01Z"
+  }
+}

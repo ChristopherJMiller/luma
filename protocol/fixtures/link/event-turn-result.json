@@ -1,0 +1,26 @@
+{
+  "type": "event",
+  "session_id": "ses_01J9ZQ3M5K7N8P2R4T6V8W0XYA",
+  "turn_id": "turn_01J9ZQ3M5K7N8P2R4T6V8W0XYT",
+  "event": {
+    "type": "turn_result",
+    "sdk_uuid": "6f1c2d3e-0a1b-4c2d-8e3f-4a5b6c7d8e9f",
+    "content": [
+      {"type": "tool", "tool_use_id": "toolu_01SyntheticFetch", "name": "WebFetch", "summary": "https://example.com/kites", "is_error": false},
+      {"type": "text", "text": "A red kite."}
+    ],
+    "usage": {
+      "models": {
+        "claude-haiku-5-5": {"input": 12, "output": 40, "cache_read": 9000, "cache_creation": 300, "web_search_requests": 1, "cost_usd": 0.0031}
+      },
+      "cost_usd": 0.0031
+    },
+    "totals": {
+      "models": {
+        "claude-haiku-5-5": {"input": 112, "output": 240, "cache_read": 19000, "cache_creation": 800, "web_search_requests": 3, "cost_usd": 0.0231}
+      },
+      "cost_usd": 0.0231
+    },
+    "cost_basis": "list"
+  }
+}

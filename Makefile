@@ -68,8 +68,10 @@ vet: ## go vet.
 	go vet ./...
 
 .PHONY: lint
-lint: check-chart-sync ## golangci-lint, then helm lint over every chart CI values file.
+lint: check-chart-sync ## golangci-lint, tsc typecheck, then helm lint over every chart CI values file.
 	golangci-lint run ./...
+	@# The typecheck is the exhaustiveness check for `satisfies` tables (S20).
+	pnpm -r --if-present run typecheck
 	@# A no-op until Task 26a adds charts/luma/ci/*-values.yaml.
 	@shopt -s nullglob; for f in charts/luma/ci/*-values.yaml; do \
 		echo "helm lint --strict -f $$f"; \

@@ -1,0 +1,1 @@
+{"agents": [{"id": "assistant", "name": "Assistant", "description": "General household assistant.", "tiers": ["fast", "smart"], "default_tier": "fast"}]}

@@ -1,0 +1,15 @@
+{
+  "suite": "golden",
+  "sdk_version": "0.3.303",
+  "cli_version": "2.1.303",
+  "image": "ghcr.io/christopherjmiller/luma-conductor:sha-0123abc@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "started_at": "2026-10-21T03:00:00Z",
+  "finished_at": "2026-10-21T03:20:00Z",
+  "passed": 1,
+  "failed": 1,
+  "cost_usd": 1.25,
+  "results": [
+    {"id": "greeting", "passed": true, "failures": [], "cost_usd": 0.5},
+    {"id": "search", "passed": false, "failures": ["expected a WebSearch tool use"], "cost_usd": 0.75}
+  ]
+}

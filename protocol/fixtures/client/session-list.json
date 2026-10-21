@@ -1,0 +1,26 @@
+{
+  "sessions": [
+    {
+      "id": "ses_01J9ZQ3M5K7N8P2R4T6V8W0XYA",
+      "root_id": "ses_01J9ZQ3M5K7N8P2R4T6V8W0XYA",
+      "parent_id": null,
+      "fork_at_message_id": null,
+      "agent_id": "assistant",
+      "agent_version": "1.0.0",
+      "title": "",
+      "tier": "fast",
+      "model": "claude-haiku-5-5",
+      "effort": "low",
+      "incognito": true,
+      "workspace": "none",
+      "source": "web",
+      "status": "running",
+      "tainted": false,
+      "archived_at": "2026-10-21T10:00:00Z",
+      "created_at": "2026-10-21T09:00:00Z",
+      "updated_at": "2026-10-21T09:05:00Z",
+      "last_activity_at": "2026-10-21T09:04:00Z"
+    }
+  ],
+  "next": "cursor-2"
+}

@@ -1,0 +1,54 @@
+{
+  "messages": [
+    {
+      "message": {
+        "id": "msg_01J9ZQ3M5K7N8P2R4T6V8W0XYC",
+        "session_id": "ses_01J9ZQ3M5K7N8P2R4T6V8W0XYA",
+        "parent_message_id": null,
+        "turn_id": "turn_01J9ZQ3M5K7N8P2R4T6V8W0XYT",
+        "role": "user",
+        "content": [{"type": "text", "text": "Hello"}],
+        "sdk_uuid": null,
+        "model": null,
+        "status": "complete",
+        "error_code": null,
+        "created_at": "2026-10-21T09:00:01Z"
+      },
+      "parent_id": null,
+      "session_id": "ses_01J9ZQ3M5K7N8P2R4T6V8W0XYA"
+    },
+    {
+      "message": {
+        "id": "msg_01J9ZQ3M5K7N8P2R4T6V8W0XYD",
+        "session_id": "ses_01J9ZQ3M5K7N8P2R4T6V8W0XYA",
+        "parent_message_id": "msg_01J9ZQ3M5K7N8P2R4T6V8W0XYC",
+        "turn_id": "turn_01J9ZQ3M5K7N8P2R4T6V8W0XYT",
+        "role": "assistant",
+        "content": [{"type": "text", "text": "Hi there."}],
+        "sdk_uuid": "6f1c2d3e-0a1b-4c2d-8e3f-4a5b6c7d8e9f",
+        "model": "claude-haiku-5-5",
+        "status": "error",
+        "error_code": "upstream_error",
+        "created_at": "2026-10-21T09:00:02Z"
+      },
+      "parent_id": "msg_01J9ZQ3M5K7N8P2R4T6V8W0XYC",
+      "session_id": "ses_01J9ZQ3M5K7N8P2R4T6V8W0XYA"
+    }
+  ],
+  "head_id": "msg_01J9ZQ3M5K7N8P2R4T6V8W0XYD",
+  "last_event_ids": {"ses_01J9ZQ3M5K7N8P2R4T6V8W0XYA": 111, "ses_01J9ZQ3M5K7N8P2R4T6V8W0XYB": 0},
+  "pending_writes": [
+    {
+      "id": "mem_01J9ZQ3M5K7N8P2R4T6V8W0XYM",
+      "session_id": null,
+      "turn_id": "turn_01J9ZQ3M5K7N8P2R4T6V8W0XYT",
+      "op": "forget",
+      "text": "kites",
+      "matched": ["Likes kites.", "Owns a kite."],
+      "untrusted": false,
+      "status": "pending",
+      "created_at": "2026-10-21T09:00:08Z",
+      "decided_at": null
+    }
+  ]
+}

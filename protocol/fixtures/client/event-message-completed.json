@@ -1,0 +1,22 @@
+{
+  "id": 107,
+  "session_id": "ses_01J9ZQ3M5K7N8P2R4T6V8W0XYA",
+  "type": "message.completed",
+  "created_at": "2026-10-21T09:00:06Z",
+  "message": {
+    "id": "msg_01J9ZQ3M5K7N8P2R4T6V8W0XYD",
+    "session_id": "ses_01J9ZQ3M5K7N8P2R4T6V8W0XYA",
+    "parent_message_id": "msg_01J9ZQ3M5K7N8P2R4T6V8W0XYC",
+    "turn_id": "turn_01J9ZQ3M5K7N8P2R4T6V8W0XYT",
+    "role": "assistant",
+    "content": [
+      {"type": "tool", "tool_use_id": "toolu_01SyntheticSearch", "name": "WebSearch", "summary": "kite flying wind speed", "is_error": false},
+      {"type": "text", "text": "A red kite over a hill. Light wind suits it."}
+    ],
+    "sdk_uuid": "6f1c2d3e-0a1b-4c2d-8e3f-4a5b6c7d8e9f",
+    "model": "claude-haiku-5-5",
+    "status": "complete",
+    "error_code": null,
+    "created_at": "2026-10-21T09:00:02Z"
+  }
+}

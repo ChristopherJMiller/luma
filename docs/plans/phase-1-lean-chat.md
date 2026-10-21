@@ -287,6 +287,15 @@ The tasks refer to these by name. Each is defined once, here. Task 4 Step 5 may 
 
 **Message** mirrors C4 `messages`, including `turn_id`. **MemoryWrite** mirrors C4 `memory_writes` without `person_id`: `{id, session_id, turn_id, op, text, matched, untrusted, status, created_at, decided_at}`.
 
+**Types frozen by Task 5** (`core/internal/protocol`, `packages/protocol`, fixtures in `protocol/fixtures/{client,link,internal}`; timestamps are RFC 3339 strings, nullable fields are `null`, never omitted):
+- `Session{id, root_id, parent_id|null, fork_at_message_id|null, agent_id, agent_version, title, tier, model, effort, incognito, workspace:"none", source:"web"|"ci", status, tainted, archived_at|null, created_at, updated_at, last_activity_at}`. `sdk_session_id`, `last_totals`, `helper_model` and the snapshots stay server-side.
+- Request and result bodies the table leaves unnamed: `SessionList{sessions, next?}`, `SessionPatch{title}`, `ForkRequest{at_message}`, `SendResult{message?}`, `ProfileUpdate{content, version}`, `AgentList{agents}`.
+- `ErrorInfo{code, message}` is the body of every REST error and the `error` of `rpc.result`.
+- `BudgetStatus{spent_usd, cap_usd, ratio, warn, exhausted, resets_at}`.
+- `MessagePart`, `ContentBlock` (`text` | `image` | `document` with a base64 `source`; client events carry text only) and `Message` are shared by C1 and C2.
+- Go also exports `ErrorCopy` (the C3 copy) and `MaxTreeAttachmentBytes`, `MaxImageMegapixels`, `MaxImageLongEdge`, `MaxToolURLLength`, `MaxProfileBytes`; TS has the same limits in SCREAMING_CASE.
+- Go decoders: `DecodeEvent`, `DecodeClientEvent`, `DecodeLinkFrame`, `DecodeLinkEvent`; an unknown `type` is an error. TS: `decodeEvent`, `decodeClientEvent`, `decodeLinkFrame`, `decodeLinkEvent` also check top-level keys.
+
 **ClientEvent:**
 ```
 {type:"user.message", client_id: uuid, content:[{type:"text",text}], attachment_ids:[]}

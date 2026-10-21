@@ -1,0 +1,21 @@
+{
+  "id": "ses_01J9ZQ3M5K7N8P2R4T6V8W0XYB",
+  "root_id": "ses_01J9ZQ3M5K7N8P2R4T6V8W0XYA",
+  "parent_id": "ses_01J9ZQ3M5K7N8P2R4T6V8W0XYA",
+  "fork_at_message_id": "msg_01J9ZQ3M5K7N8P2R4T6V8W0XYD",
+  "agent_id": "assistant",
+  "agent_version": "1.0.0",
+  "title": "Kite wind",
+  "tier": "smart",
+  "model": "claude-sonnet-5-5",
+  "effort": "medium",
+  "incognito": false,
+  "workspace": "none",
+  "source": "web",
+  "status": "idle",
+  "tainted": true,
+  "archived_at": null,
+  "created_at": "2026-10-21T09:00:00Z",
+  "updated_at": "2026-10-21T09:05:00Z",
+  "last_activity_at": "2026-10-21T09:04:00Z"
+}

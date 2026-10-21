@@ -1,0 +1,40 @@
+{
+  "type": "host.open",
+  "session_id": "ses_01J9ZQ3M5K7N8P2R4T6V8W0XYA",
+  "spec": {
+    "session_id": "ses_01J9ZQ3M5K7N8P2R4T6V8W0XYA",
+    "root_id": "ses_01J9ZQ3M5K7N8P2R4T6V8W0XYA",
+    "person": {"ref": "u_0a1b2c3d4e"},
+    "agent": {
+      "id": "assistant",
+      "version": "1.0.0",
+      "system_prompt": "You are a synthetic test assistant.",
+      "tools": ["WebFetch", "WebSearch", "mcp__luma__forget", "mcp__luma__remember"],
+      "builtin_tools": ["WebSearch", "WebFetch"],
+      "mcp": ["memory.remember", "memory.forget"],
+      "untrusted_inputs": ["WebSearch", "WebFetch"],
+      "subagents": {
+        "deep-think": {
+          "description": "Thinks hard about one question.",
+          "prompt": "Think step by step.",
+          "model": "claude-opus-5-5",
+          "effort": "high",
+          "tools": []
+        }
+      },
+      "limits": {"max_turns": 30, "max_tool_calls": 60, "web_search_per_turn": 3, "web_search_per_session": 15},
+      "memory": "person",
+      "tier_binding": {"model": "claude-haiku-5-5", "effort": "low", "cache_ttl": "1h", "auto_compact_window": 100000, "auto_compact_pct": 85, "pdf_max_pages": 20}
+    },
+    "model": "claude-haiku-5-5",
+    "helper_model": "claude-haiku-5-5",
+    "effort": "low",
+    "cache_ttl": "1h",
+    "workspace": "interactive",
+    "source": "web",
+    "timezone": "America/Los_Angeles",
+    "profile_context": "<luma-context>\n- Likes kites.\n</luma-context>",
+    "webfetch_deny_domains": ["internal.example"],
+    "resume": null
+  }
+}

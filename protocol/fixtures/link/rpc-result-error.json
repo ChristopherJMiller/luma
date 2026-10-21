@@ -1,0 +1,1 @@
+{"type": "rpc.result", "rpc_id": "rpc_3", "ok": false, "error": {"code": "upstream_error", "message": "store unavailable"}}

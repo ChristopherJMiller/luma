@@ -1,0 +1,32 @@
+{
+  "type": "host.open",
+  "session_id": "ses_01J9ZQ3M5K7N8P2R4T6V8W0XYA",
+  "spec": {
+    "session_id": "ses_01J9ZQ3M5K7N8P2R4T6V8W0XYA",
+    "root_id": "ses_01J9ZQ3M5K7N8P2R4T6V8W0XYA",
+    "person": {"ref": "u_0a1b2c3d4e"},
+    "agent": {
+      "id": "assistant",
+      "version": "1.0.0",
+      "system_prompt": "You are a synthetic test assistant.",
+      "tools": [],
+      "builtin_tools": [],
+      "mcp": [],
+      "untrusted_inputs": [],
+      "subagents": {},
+      "limits": {"max_turns": 30, "max_tool_calls": 60, "web_search_per_turn": 3, "web_search_per_session": 15},
+      "memory": "none",
+      "tier_binding": {"model": "claude-haiku-5-5", "effort": "low", "cache_ttl": "1h", "pdf_max_pages": 20}
+    },
+    "model": "claude-haiku-5-5",
+    "helper_model": "claude-haiku-5-5",
+    "effort": "low",
+    "cache_ttl": "1h",
+    "workspace": "interactive",
+    "source": "web",
+    "timezone": "UTC",
+    "profile_context": "",
+    "webfetch_deny_domains": [],
+    "resume": {"sdk_session_id": "0d9c8b7a-6f5e-4d3c-9b2a-1f0e9d8c7b6a"}
+  }
+}
