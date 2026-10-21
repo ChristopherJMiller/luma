@@ -8,6 +8,7 @@ run:
   tests: true
   build-tags:
     - e2e
+    - gateway
 
 linters:
   default: standard # errcheck, govet, ineffassign, staticcheck, unused

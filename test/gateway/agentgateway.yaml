@@ -1,0 +1,129 @@
+# agentgateway v1.6.0, standalone: Luma's gateway in front of the Anthropic
+# Messages API. This is the canonical config (Spike G, docs/spikes/phase-1.md
+# section G). Task 26b renders it into the chart, test/chart diffs the two, and
+# the deploy plan runs it against the live API. See README.md here.
+#
+# The upstream is never written in. Every consumer replaces these tokens
+# textually before the file is loaded:
+#   __UPSTREAM_HOST__  the upstream host: the fake in tests, the API live
+#   __UPSTREAM_PORT__  its port
+#   __UPSTREAM_TLS__   `{}` for TLS with the system roots, `null` for plain
+#                      http. agentgateway has no boolean TLS switch: TLS is on
+#                      exactly when a backendTLS policy is present, and a
+#                      hostOverride turns the provider's default TLS off.
+# Drop a route with `yq 'del(.routes[] | select(.name == "interactive"))'`.
+#
+# The whole file, comments included, goes through shellexpand: no dollar
+# sign except the two bearer variables. `config:` is read at startup only,
+# except modelCatalog.
+config:
+  adminAddr: 127.0.0.1:15000
+  statsAddr: 0.0.0.0:15020
+  readinessAddr: 0.0.0.0:15021
+  metrics:
+    fields:
+      # Each label is its header only when the value is in the label's fixed
+      # set; anything else, a missing or repeated header included, is
+      # "other". `\z` anchors the end: a dollar sign would be shell-expanded.
+      # request_class is provisional: Task 4 Step 5 narrows it to the set
+      # Spike S9 records.
+      add:
+        person: 'default(request.headers.join()["x-luma-person"], "").with(v, v.matches("^u_[0-9a-f]{10}\\z") ? v : "other")'
+        agent: 'default(request.headers.join()["x-luma-agent"], "").with(v, v.matches("^[a-z][a-z0-9-]{0,31}\\z") ? v : "other")'
+        tier: 'default(request.headers.join()["x-luma-tier"], "").with(v, v in ["fast", "smart", "deep"] ? v : "other")'
+        source: 'default(request.headers.join()["x-luma-source"], "").with(v, v in ["web", "ci"] ? v : "other")'
+        request_class: 'default(request.headers.join()["x-claude-code-request-class"], "").with(v, v.matches("^[a-z_]{1,32}\\z") ? v : "other")'
+  # A price overlay, USD per million tokens. The gateway's dollars are
+  # informational; the ledger is Core's. A model is listed only with its full
+  # rate set (claude-sonnet-5-5 and claude-opus-5-5 are not, yet).
+  modelCatalog:
+  - inline:
+      providers:
+        anthropic:
+          models:
+            claude-haiku-5-5:
+              # cacheWrite is the 1h write rate.
+              rates: {input: "0.10", output: "0.50", cacheRead: "0.01", cacheWrite: "0.20"}
+              tiers:
+              - contextOver: 100000
+                rates: {input: "0.50", output: "2.50", cacheRead: "0.05", cacheWrite: "1.00"}
+
+frontendPolicies:
+  http:
+    maxBufferSize: 33554432 # 32 MiB: the API's request limit
+
+gateways:
+  default:
+    port: 8080
+
+# One route per Anthropic workspace (P16). A route matches only the exact
+# paths it serves: an ai.routes path that is not listed is parsed as OpenAI
+# completions, so anything else must not reach the backend at all.
+routes:
+- name: interactive
+  matches:
+  - path: {exact: /interactive/v1/messages}
+  - path: {exact: /interactive/v1/messages/count_tokens}
+  policies:
+    # Every auth mode defaults to optional: strict is what makes the bearer
+    # required.
+    apiKey:
+      mode: strict
+      keys:
+      - key: $GATEWAY_TOKEN_INTERACTIVE
+    # Strip the route prefix, keeping the query (?beta=true). urlRewrite's
+    # prefix form needs a prefix match, and these matches are exact.
+    transformations:
+      request:
+        set:
+          ":path": 'request.pathAndQuery.stripPrefix("/interactive")'
+    timeout:
+      responseIdleTimeout: 300s
+    # No promptCaching: unset, the gateway adds no cache markers.
+    ai:
+      routes:
+        /v1/messages: detect
+        /v1/messages/count_tokens: anthropicTokenCount
+  backends:
+  - ai:
+      name: anthropic
+      provider:
+        anthropic: {}
+      hostOverride: __UPSTREAM_HOST__:__UPSTREAM_PORT__
+      policies:
+        backendTLS: __UPSTREAM_TLS__
+        # The workspace key; the file is watched, so a rotation needs no
+        # restart.
+        backendAuth:
+          key:
+            file: /run/secrets/anthropic/interactive
+- name: ci
+  matches:
+  - path: {exact: /ci/v1/messages}
+  - path: {exact: /ci/v1/messages/count_tokens}
+  policies:
+    apiKey:
+      mode: strict
+      keys:
+      - key: $GATEWAY_TOKEN_CI
+    transformations:
+      request:
+        set:
+          ":path": 'request.pathAndQuery.stripPrefix("/ci")'
+    timeout:
+      responseIdleTimeout: 300s
+    ai:
+      routes:
+        /v1/messages: detect
+        /v1/messages/count_tokens: anthropicTokenCount
+  backends:
+  - ai:
+      name: anthropic
+      provider:
+        anthropic: {}
+      hostOverride: __UPSTREAM_HOST__:__UPSTREAM_PORT__
+      policies:
+        backendTLS: __UPSTREAM_TLS__
+        backendAuth:
+          key:
+            file: /run/secrets/anthropic/ci

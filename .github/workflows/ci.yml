@@ -74,8 +74,40 @@ jobs:
           && go mod verify
           && make tools-versions check-hygiene check-versions lint test vulncheck'
 
+  # Spike G: the pinned agentgateway image (Makefile AGENTGATEWAY_IMAGE) in
+  # front of fakeanthropic, on the host network. About 4 minutes, most of it
+  # the 90 s long-stream test and the fake's 2 s SSE step delay.
+  gateway-spike:
+    name: gateway spike
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Restore only: the check job saves these caches.
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.nix', 'flake.lock') }}
+          save: false
+
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'flake.lock') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Spike G
+        run: nix develop -c bash -c 'go mod verify && make gateway-spike'
+
   # Added by later tasks, and then listed in ci-ok's needs:
-  #   gateway-spike  Task 3
   #   sdk-spike      Task 4
   #   image          Task 25
   #   e2e            Task 28a
@@ -89,7 +121,7 @@ jobs:
     # Final: [check, gateway-spike, sdk-spike, image, e2e]. A needs on a job
     # that does not exist is an actionlint error, so each is added by the task
     # that adds the job (see the list above).
-    needs: [check]
+    needs: [check, gateway-spike]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

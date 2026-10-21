@@ -93,8 +93,8 @@
       "automerge": false
     },
     {
-      "description": "agentgateway sits on the request path to Anthropic (Spike G): weekly, and a person reads the release notes.",
-      "matchPackageNames": ["agentgateway/**", "ghcr.io/agentgateway/**", "cr.agentgateway.dev/**"],
+      "description": "agentgateway sits on the request path to Anthropic (Spike G): weekly, and a person reads the release notes; the gateway-spike job reruns the spike against the new image. Its one image is ghcr.io/agentgateway/agentgateway, pinned in the Makefile (AGENTGATEWAY_IMAGE) and, from Task 26b, the chart.",
+      "matchPackageNames": ["ghcr.io/agentgateway/agentgateway"],
       "groupName": "agentgateway",
       "schedule": ["before 6am on monday"],
       "automerge": false

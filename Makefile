@@ -135,9 +135,12 @@ e2e-down: ## Delete the luma-e2e kind cluster.
 
 ##@ Spikes
 
+# Spike G's gateway, pinned by tag and index digest (Renovate moves both).
+AGENTGATEWAY_IMAGE ?= ghcr.io/agentgateway/agentgateway:v1.6.0@sha256:9d3e6044ddcdc0878b1787f77bd401252b95e22684203fb5e874c4c42d2ed90c
+
 .PHONY: gateway-spike
-gateway-spike: ## Spike G: agentgateway passthrough.
-	@echo "gateway-spike: not yet implemented (Task 3)"
+gateway-spike: ## Spike G: agentgateway passthrough (docker; host ports 8080, 15000, 15020, 15021; ~4 min).
+	AGENTGATEWAY_IMAGE='$(AGENTGATEWAY_IMAGE)' go test $(GO_TEST_FLAGS) -tags gateway -timeout 15m -v ./test/gateway/
 
 .PHONY: sdk-spike
 sdk-spike: ## Spike S: Agent SDK behaviour against the fake.
