@@ -132,7 +132,7 @@ Every task's requirements include these. Values are copied from the spec. *(plan
     - a cross-conversation request reads cache over tools + system;
     - captured bodies, from a fresh conversation, a store-resumed one and a `resumeSessionAt` fork, are replayed with `prefix_mismatch_behavior: "error"`. Each capture must carry ≥ 1 signed thinking block.
   - **Weekly:** a forced compaction.
-  - **Alerting:** the gateway alerts on main-class 400s, because the CLI auto-strips thinking and retries, so only the gateway sees them. Each auto-compaction costs one expected main-class binding 400, and every other 400 is sent twice (Spike S4, S11), so the deploy plan's alert nets out compactions and halves the count (S32).
+  - **Alerting:** the gateway alerts on main-class 400s, because the CLI auto-strips thinking and retries, so only the gateway sees them. Each auto-compaction costs one expected main-class binding 400 (Spike S4); a binding 400 is sent once and any other 400 twice, the second time without the thinking-display beta (S11). So the deploy plan's alert subtracts one 400 per compaction and fires on one unexplained 400 (S32).
 - **Logs:** Core and the conductor log metadata only: ids, tool names, durations, decisions. Never content or tool arguments. CLI stderr is not forwarded, and WebFetch appears in logs and metrics as **host only**.
 - **Product name:** "Luma, powered by Claude", never "Claude Code". Disclose that users are talking to an AI. (§16)
 - **Expected cost, Chris alone:** about **$8–20 a month** in typical use *(plan)*.
@@ -224,7 +224,7 @@ S1–S23 come from the pre-flight consistency scan (48 findings), S24–S35 from
 - **S29** (Task 4): no `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` in phase 1 (needs bubblewrap; no shell tools to scrub); phase 4 revisits it. Touches Global Constraints, 16.
 - **S30** (Task 4): `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`, so deep-think runs in the foreground inside its turn. Touches Global Constraints, 16.
 - **S31** (Task 4): the cost baseline is the newest `cost-state` entry of the loaded transcript, else zero; never Core's last totals. Touches Global Constraints (cost), P11, 17, 19a, 19b.
-- **S32** (Task 4): each auto-compaction yields one main-class binding 400, and other 400s are sent twice; the deploy plan's main-class-400 alert nets out compactions and halves the count. Touches Global Constraints (alerting), deploy Task 9.
+- **S32** (Task 4): each auto-compaction yields one main-class binding 400, and other 400s are sent twice; the deploy plan's main-class-400 alert excludes `request_class=compaction`, subtracts one 400 per compaction, and keeps its threshold at one send (a binding 400 is sent once, so halving would hide it). Touches Global Constraints (alerting), deploy Task 9.
 - **S33** (Task 4): smokescreen `web` allows `api.anthropic.com:443` for the CLI's WebFetch domain check (a chart default no site value may deny); the URL guard still denies model-chosen fetches there. Touches Global Constraints (web tools), C8, 18, 26b, 27, 28b, deploy Global Constraints/Task 7.
 - **S34** (Task 4): a store resume runs the CLI in the SDK's `${TMPDIR}/claude-resume-<uuid>`; `TMPDIR` is the conductor's own, inside the sized emptyDir, and the cleanup covers it. Touches Global Constraints, P18, C6, C8, 16, 19b, 19c, 26a.
 - **S35** (Task 4): the conductor launches the platform package's native `claude` (`bin/claude.exe` is a stub); Task 25's image ships it in its own final layer. Touches Global Constraints, C6, 16, 19b, 25, 26a.
