@@ -6,6 +6,7 @@
 import { createServer as createHttpServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { createServer as createHttpsServer } from 'node:https'
 import { connect, type AddressInfo, type Socket } from 'node:net'
+import { atCaseEnd } from './harness.js'
 import type { TlsFixtures } from './tlsfixtures.js'
 
 export interface Origin {
@@ -77,6 +78,7 @@ export class ConnectProxy {
     }
     await new Promise<void>((ok) => p.proxy.listen(0, '127.0.0.1', ok))
     p.url = `http://127.0.0.1:${(p.proxy.address() as AddressInfo).port}`
+    atCaseEnd(() => p.stop())
     return p
   }
 

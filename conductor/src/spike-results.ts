@@ -59,11 +59,13 @@ export const COST_BASIS_FIELD: string | null = 'modelUsage[model].costBasis'
 export const FORK_STRATEGY: 'resumeSessionAt' | 'storeForkSession' = 'resumeSessionAt'
 
 /**
- * S7. `precomputeCompactionEnabled` is declared in the SDK's Settings type,
- * but neither `true` nor `false` changes a request: no precompute request
- * appears below or at the compaction threshold. Task 16 leaves the key out.
+ * S7. The pinned CLI declares and reads `precomputeCompactionEnabled`
+ * (default true), gated by the server flag tengu_sepia_moth, which is off
+ * offline: so no precompute request appeared with either value here, and the
+ * setting cannot be seen working offline. It also gates the CLI's idle
+ * compaction mode compact_on_return. Task 16 passes it as false.
  */
-export const PRECOMPUTE_SETTING_EXISTS: boolean = false
+export const PRECOMPUTE_SETTING_EXISTS: boolean = true
 
 /** S11. The API tool name of the subagent tool. */
 export const SUBAGENT_TOOL: 'Task' | 'Agent' = 'Agent'
@@ -85,20 +87,24 @@ export const IDLE_EVICT_MS: number = 600_000
 export const COMPACTION_TRIGGER_TOKENS: number = 66_965
 
 /**
- * S11. How a model change shows. The refusal fixture switches nothing (the CLI
- * notes the refusal and retries once on the same model), and PostModelSwitch
- * fires only for an SDK setModel(). A reply from another model shows only in
- * the assistant message's `message.model`.
+ * S11. How a model change shows. The refusal fixture switched nothing (the CLI
+ * noted the refusal and retried once on the same model; the fake sends no
+ * refusal category, so a flag-routed fallback switch was not exercised).
+ * PostModelSwitch fired for an SDK setModel(), and not for a reply from
+ * another model, which shows only in the assistant message's `message.model`.
+ * Whether it fires for a flag-routed switch is untested, so the reply's model
+ * is the signal. Live, an alias may come back as a dated snapshot id; the
+ * comparison must allow for that (live spike).
  */
 export const MODEL_SWITCH_SIGNAL: 'postModelSwitchHook' | 'assistantModelField' = 'assistantModelField'
 
 /**
- * S17. Where a WebSearch call's search count appears. The nested request's
- * usage.server_tool_use.web_search_requests (3) reaches only the result's
- * modelUsage[model].webSearchRequests; PostToolUse's tool_response has
- * `searchCount`, which counted the reply's server_tool_use blocks (1).
+ * S17. Where a WebSearch call's search count appears. A nested reply with
+ * three server_tool_use / web_search_tool_result pairs (and
+ * web_search_requests: 3) gives PostToolUse's tool_response `searchCount: 3`,
+ * per call, and the result's modelUsage[model].webSearchRequests agrees.
  */
-export const WEB_SEARCH_COUNT_SOURCE: 'postToolUse' | 'resultDelta' = 'resultDelta'
+export const WEB_SEARCH_COUNT_SOURCE: 'postToolUse' | 'resultDelta' = 'postToolUse'
 
 /**
  * S16. With ANTHROPIC_BETAS=thinking-binding-controls-2026-08-01, a reply's

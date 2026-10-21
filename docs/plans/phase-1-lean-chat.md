@@ -68,7 +68,7 @@ Every task's requirements include these. Values are copied from the spec. *(plan
 - **Inline `settings` (SDK option, never `extraArgs`):**
   - `switchModelsOnFlag: true`. Model switches are accepted and recorded *(Chris)*.
   - `idleCompaction: false`. It defaults on for the 1h TTL and would rewrite history after an idle hour.
-  - No `precomputeCompactionEnabled`: Spike S7 found it changes nothing (`PRECOMPUTE_SETTING_EXISTS = false`).
+  - `precomputeCompactionEnabled: false`. Spike S7 found the CLI reads the key, defaulting to true, behind a server flag that is off offline (`PRECOMPUTE_SETTING_EXISTS = true`).
 - **Environment:** `env` replaces the subprocess env. It sets:
   - per person: `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`;
   - switches: `DISABLE_AUTOUPDATER`, `DISABLE_TELEMETRY`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `CLAUDE_AGENT_SDK_CLIENT_APP=luma`, `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`, `CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS=1`, **`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`** (S30: a background subagent ends the turn early and later starts a turn Core never sent);
@@ -82,9 +82,9 @@ Every task's requirements include these. Values are copied from the spec. *(plan
   - Core counts main requests over 100K input.
 - **Effort:** `low` for chat, with `<luma-now>` as appended context and guidance on when to search. Subagents get explicit effort. Phase 1 ships **no mid-session effort control**; live spike L4 informs phase 2 *(plan)*.
 - **Web tools:**
-  - The caps count **searches, not calls**: 3 per turn and 15 per session. Spike S17 found `WEB_SEARCH_COUNT_SOURCE = 'resultDelta'`: the true count is the result's `webSearchRequests` delta, and PostToolUse carries none (its `searchCount` counts the reply's `server_tool_use` blocks).
-  - One WebSearch call can run `max_uses: 8` (S17: the nested request's `web_search_20250305` tool).
-  - **Worst case under `resultDelta` (S21, restated by Task 4 Step 5).** The hook counts each call as 1 until `turn_result` sets the session's true count, so a turn runs at most 3 calls: **24 searches a turn ($0.24)**. A session can reach 12 counted searches and then run one more turn of 3 calls: **36 a session ($0.36)**. (Under `postToolUse` it would have been 10 a turn and 22 a session.)
+  - The caps count **searches, not calls**: 3 per turn and 15 per session, counted from PostToolUse's `tool_response.searchCount` (Spike S17: `WEB_SEARCH_COUNT_SOURCE = 'postToolUse'`; the result's `webSearchRequests` delta agrees).
+  - One WebSearch call can run `max_uses: 8` (S17: the nested request's `web_search_20250305` tool), so the worst case is 10 searches a turn ($0.10) and 22 a session ($0.22).
+  - **These bounds hold for `WEB_SEARCH_COUNT_SOURCE = 'postToolUse'` (S21), which Spike S17 found.** With `resultDelta`, the hook would count each call as 1 until `turn_result` set the true count, and the worst case would become 3 calls × `max_uses` a turn.
   - WebFetch must pass the URL guard (Task 18), then goes through smokescreen (`HTTPS_PROXY`). The CLI's own domain check goes to `api.anthropic.com:443` through it too, so smokescreen allows that host and the guard denies model-chosen fetches there (S33).
 - **CLI:** CLI ≥ 2.1.268, and the SDK and CLI are pinned exactly. Renovate groups their bumps **weekly** with a **3-day** minimum age, behind the eval gate. The CLI lives in its own final image layer.
 - **SDK issues to design around:** #348 (keep the input iterable open), #391 (one long-lived query; `pathToClaudeCodeExecutable` = the platform package's native `claude`, never `bin/claude.exe`, a stub under pnpm 10; S35), #268 (never `listSessions`), #370 (MCP proxies as a local **HTTP** server), #289 (large-session resume test), #432 (no `cache_control` in streamed user messages), #378 (a stream outlives its bearer; phase 1 uses static gateway bearers).
@@ -705,7 +705,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
   - `cache_control` (the CLI moves breakpoints each turn); a string vs a single text block; leading and trailing whitespace; whitespace-only blocks; key order; `tools` as a name-keyed set; parameters outside `system`/`tools`/`messages`;
   - thinking blocks are outside the prefix, but the contiguous-window chain rule is enforced;
   - everything else is byte-exact. **Unmodelled, so the fake is stricter:** `defer_loading` and compaction (the README lists them).
-- **Server tools:** a request whose `tools` contain a `web_search_*` server tool is **auto-answered** with a `server_tool_use` and a `web_search_tool_result` from `SearchResults`, and `usage.server_tool_use.web_search_requests` = `Usage.WebSearchRequests` (default 1).
+- **Server tools:** a request whose `tools` contain a `web_search_*` server tool is **auto-answered** with one `server_tool_use` and `web_search_tool_result` (from `SearchResults`) pair per search, as the API answers, and `usage.server_tool_use.web_search_requests` = that count = `Usage.WebSearchRequests` (default 1). The CLI counts a call's searches from the pairs (Spike S17).
 - Responses are deterministic: no clock, no randomness. Message ids are `msg_fake_<seq>`.
 
 - [ ] **Step 1: Write failing tests** in `fake_test.go`:
@@ -1675,7 +1675,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
     - `tools` and `allowedTools`, both exactly `spec.agent.tools`;
     - `permissionMode: "default"`, `settingSources: []`, `strictMcpConfig: true`;
     - `mcpServers: { luma: { type: "http", url, headers: { Authorization: "Bearer <token>" } } }`, omitted when `mcp` is null.
-  - **Settings (inline):** `settings: { switchModelsOnFlag: true, idleCompaction: false }`, exactly. No `precomputeCompactionEnabled`: Spike S7 found `PRECOMPUTE_SETTING_EXISTS = false` (CLAUDE.md "Deviations" records it).
+  - **Settings (inline):** `settings: { switchModelsOnFlag: true, idleCompaction: false, ...(PRECOMPUTE_SETTING_EXISTS ? { precomputeCompactionEnabled: false } : {}) }`. Spike S7 found `PRECOMPUTE_SETTING_EXISTS = true`, so the key is passed.
   - **Process:** `env`, `cwd: ${dataDir}/conv/${root_id}`, `pathToClaudeCodeExecutable: cliPath`, `stderr: (d) => deps.onStderr(d.length)`. CLI stderr is **never forwarded**, only counted.
     - `cliPath` is the **platform package's native `claude`** (`@anthropic-ai/claude-code-<platform>-<arch>/claude`; in the image `/opt/claude-cli/claude`), never `@anthropic-ai/claude-code/bin/claude.exe`, a stub because pnpm 10 skips its postinstall (S35). Tests resolve it as `conductor/spike/harness.ts`'s `cliPath()` does.
   - **Streaming and sessions:** `includePartialMessages: true`, `sessionStore`.
@@ -1693,7 +1693,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
   - `env uses the person ref, never a name`.
   - `env pins sonnet and opus aliases to the session model`.
   - `options for luma/fast` (field by field), and `options for a fork` (`resume`, `forkSession: true`, `resumeSessionAt`).
-  - `settings are passed inline, not as extraArgs`, and equal `{switchModelsOnFlag: true, idleCompaction: false}` exactly.
+  - `settings are passed inline, not as extraArgs`, and equal `{switchModelsOnFlag: true, idleCompaction: false, precomputeCompactionEnabled: false}` exactly.
   - `pathToClaudeCodeExecutable is the site cliPath`, and `loadSite` refuses an empty `LUMA_CLI_PATH` (S35).
   - `tools and allowedTools are AgentSpec.tools verbatim`.
   - `no mcpServers when the agent has no mcp`.
@@ -1869,7 +1869,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
   - Each main-loop assistant message (`parent_tool_use_id === null`), deduped by API `message.id`:
     - updates `lastMainUuid`;
     - emits `main_request_usage` with `slo_exclusion = pendingExclusion`, which is then reset to `none`;
-    - emits `model_switched` once when `MODEL_SWITCH_SIGNAL === 'assistantModelField'` and `message.model` differs from the session's (the PostModelSwitch fallback).
+    - emits `model_switched` once when `MODEL_SWITCH_SIGNAL === 'assistantModelField'` and `message.model` differs from the session's (the PostModelSwitch fallback). The API may answer an alias with its dated snapshot id; the live spike decides how the comparison allows for that.
   - `system/compact_boundary` → `pendingExclusion = 'post_compaction'`.
   - The result → `turn_result{sdk_uuid: lastMainUuid, …}`, after a `flush()`.
 

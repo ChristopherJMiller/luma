@@ -98,17 +98,12 @@ Decided in the phase-1 plan; the design doc does not describe them.
   (section 6): only the conductor sees the SDK's `compact_boundary`.
 - **Spike S's other taken branches** (`conductor/src/spike-results.ts`,
   `docs/spikes/phase-1.md` section S):
-  - **Model switches are read from replies.** The refusal fixture switches no
-    model and `PostModelSwitch` fires only for `setModel()`, so
-    `MODEL_SWITCH_SIGNAL = 'assistantModelField'`: Task 19a emits
-    `model_switched` when a main-loop reply's `message.model` differs.
-  - **Search counts come from the result.** `WEB_SEARCH_COUNT_SOURCE =
-    'resultDelta'` (S17): PostToolUse counts each WebSearch call as 1 and
-    `turn_result` sets the true count, so the worst case is 24 searches a turn
-    and 36 a session (S21, Global Constraints).
-  - **`precomputeCompactionEnabled` is dropped.** It is in the SDK's
-    `Settings` type but changed no request (S7), so Task 16's inline settings
-    are `{switchModelsOnFlag: true, idleCompaction: false}`.
+  - **Model switches are read from replies.** The refusal fixture switched
+    no model. `PostModelSwitch` fired for `setModel()`, and not for a reply
+    from another model; whether it fires for a flag-routed switch is untested
+    offline. So `MODEL_SWITCH_SIGNAL = 'assistantModelField'`: Task 19a emits
+    `model_switched` when a main-loop reply's `message.model` differs. Live,
+    an alias may come back as a dated snapshot id, which is not a switch.
   - **Dropped thinking is counted.** The SDK exposes `input_transformations`
     (S16), so Task 16 sets `ANTHROPIC_BETAS=thinking-binding-controls-2026-08-01`
     and Task 19a counts `luma_conductor_thinking_dropped_total`.

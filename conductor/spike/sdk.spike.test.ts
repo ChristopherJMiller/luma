@@ -5,18 +5,24 @@
 // that changes the behaviour fails `make sdk-spike`.
 //
 // Every request is answered by the fake, which checks thinking bindings, so
-// each resume and fork case is also a preserved-thinking check. The cases
-// run in file order; S9's last case reads the requests of all of them.
-import { existsSync } from 'node:fs'
-import { afterAll, describe, expect, it } from 'vitest'
+// each resume and fork case is also a preserved-thinking check. Each case is
+// self-contained (any one runs alone under -t); afterEach ends it (stops its
+// CLIs, fakes and servers, removes its temp dirs), and afterAll checks every
+// request the run made against S9's paths, classes and headers.
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterAll, afterEach, describe, expect, it } from 'vitest'
 import * as R from '../src/spike-results.js'
 import { ConnectProxy } from './connectproxy.js'
 import {
   AGENT_BODY,
-  allFakes,
   cacheControls,
+  cliPath,
   Clock,
   count,
+  endCase,
+  endRun,
   Fake,
   GATEWAY_TOKEN,
   hasThinking,
@@ -36,6 +42,7 @@ import {
   RecordingStore,
   requestClass,
   systemText,
+  tempDir,
   texts,
   tokenTotals,
   userIdOf,
@@ -45,21 +52,56 @@ import {
 } from './harness.js'
 import { makeTlsFixtures } from './tlsfixtures.js'
 
-afterAll(async () => {
-  for (const f of allFakes) await f.stop()
-})
-
 const TTL_1H = '"cache_control":{"type":"ephemeral","ttl":"1h"}'
 const TTL_DEFAULT = '"cache_control":{"type":"ephemeral"}'
 
 /** deep-think as Task 16 defines it (AgentSpec.subagents). */
 const DEEP_THINK = { 'deep-think': { description: 'Thinks hard about a question.', prompt: 'You think hard.', tools: [], model: 'claude-opus-5-5', effort: 'high' as const } }
 
+/** Every request of every case that ran, for the S9 invariants in afterAll. */
+const seen: FakeRequest[] = []
+
+afterEach(async () => {
+  seen.push(...(await endCase()))
+})
+
+/** S9: what every request the CLI makes looks like (paths, auth, our headers, system[0]). */
+function expectOurs(r: FakeRequest) {
+  expect(isMessages(r)).toBe(true)
+  expect(r.path).toBe('/v1/messages?beta=true')
+  expect(R.CLI_PATHS).toContain(r.path.split('?')[0])
+  expect(R.REQUEST_CLASSES).toContain(requestClass(r))
+  expect(header(r, 'authorization')).toBe(`Bearer ${GATEWAY_TOKEN}`)
+  expect(header(r, 'x-api-key')).toBeUndefined()
+  expect([header(r, 'x-luma-person'), header(r, 'x-luma-agent'), header(r, 'x-luma-tier'), header(r, 'x-luma-source')]).toEqual([PERSON_REF, 'luma', 'fast', 'web'])
+  expect(header(r, 'user-agent')).toBe('claude-cli/2.1.303 (external, sdk-ts, agent-sdk/0.3.303, client-app/luma)')
+  expect(header(r, 'x-client-app')).toBe('luma')
+  expect(r.json.system[0].text.startsWith('x-anthropic-billing-header: cc_version=2.1.303.')).toBe(true)
+  // Our prompt is its own system block on every main request, after the
+  // billing header and the SDK's line.
+  if (requestClass(r) === 'main') {
+    expect(r.json.system.map((b: any) => b.text).slice(1)).toEqual(["You are a Claude agent, built on Anthropic's Claude Agent SDK.", AGENT_BODY])
+  }
+}
+
+afterAll(() => {
+  try {
+    for (const r of seen) expectOurs(r)
+  } finally {
+    endRun()
+  }
+})
+
 /**
  * A clock offset that puts the CLI at 06:00 UTC today, so that no case whose
  * bytes include the date crosses midnight while it runs.
  */
-function morning(): { base: number; day0: string; day1: string } {
+interface Morning {
+  base: number
+  day0: string
+  day1: string
+}
+function morning(): Morning {
   const now = Date.now()
   const six = new Date(now)
   six.setUTCHours(6, 0, 0, 0)
@@ -74,6 +116,12 @@ const sdkMessages = (h: Host, type: string, subtype?: string): any[] =>
   h.messages.filter((m: any) => m.type === type && (subtype === undefined || m.subtype === subtype))
 const hooksOf = (h: Host, event: string): any[] => h.hookInputs.filter((i: any) => i.hook_event_name === event)
 
+/** Waits (up to 5 s) until pred holds. */
+async function eventually(pred: () => boolean): Promise<boolean> {
+  for (let i = 0; i < 50 && !pred(); i++) await new Promise((ok) => setTimeout(ok, 100))
+  return pred()
+}
+
 it('runs the pinned CLI', async () => {
   const fake = await Fake.start({ v: [{ text: 'Hi.' }] })
   const h = new Host({ fake, store: new RecordingStore(), root: 'tree-version' })
@@ -82,15 +130,30 @@ it('runs the pinned CLI', async () => {
   expect(sdkMessages(h, 'system', 'init')[0].claude_code_version).toBe('2.1.303')
 })
 
+it('S29: CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 stops the CLI at start when bubblewrap is not on PATH', async () => {
+  const fake = await Fake.start({ x: [{ text: 'Never.' }] })
+  const h = new Host({ fake, store: new RecordingStore(), root: 'tree-scrub', env: { CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '1', PATH: tempDir('empty-path') } })
+  await expect(h.send('Hi [[fake:x]]')).rejects.toThrow(/query ended/)
+  expect(h.stderr.join('')).toContain('bubblewrap is required for subprocess env scrubbing and isolation')
+  expect(fake.requests()).toEqual([])
+})
+
 describe('S1: resume is byte-identical', () => {
   const steps = { s1: [{ text: 'One.' }, { text: 'Two.' }, { text: 'Three.' }] }
   const turns = ['First [[fake:s1]]', 'Second [[fake:s1]]', 'Third [[fake:s1]]']
-  const dataDir = newDataDir()
-  const t = morning()
-  let a: FakeRequest[] = []
 
-  // Run B: two turns, close, delete the local JSONL, resume from the store, turn three.
-  async function runB(resumeClock: Clock): Promise<FakeRequest[]> {
+  // Run A: three turns in one query.
+  async function runA(dataDir: string, t: Morning): Promise<FakeRequest[]> {
+    const fake = await Fake.start(steps)
+    const h = new Host({ fake, store: new RecordingStore(), root: 'tree-s1', dataDir, clock: new Clock(t.base) })
+    for (const turn of turns) await h.send(turn)
+    await h.close()
+    return mainRequests(fake.requests())
+  }
+
+  // Run B, in the same data dir path (wiped): two turns, close, delete the
+  // local JSONL, resume from the store with the clock `resumeOffset` ahead, turn three.
+  async function runB(dataDir: string, t: Morning, resumeOffset: number) {
     const fake = await Fake.start(steps)
     const store = new RecordingStore()
     const h1 = new Host({ fake, store, root: 'tree-s1', dataDir, wipe: true, clock: new Clock(t.base) })
@@ -99,19 +162,20 @@ describe('S1: resume is byte-identical', () => {
     const sid = h1.sessionId
     await h1.close()
     h1.removeLocalTranscript(sid)
-    const h2 = new Host({ fake, store, root: 'tree-s1', dataDir, resume: sid, clock: resumeClock })
+    const h2 = new Host({ fake, store, root: 'tree-s1', dataDir, resume: sid, clock: new Clock(t.base + resumeOffset) })
     await h2.send(turns[2]!)
+    const resumeDir = h2.cliProcess().env.CLAUDE_CONFIG_DIR!
+    const resumeFiles = readdirSync(resumeDir).sort()
+    const transcriptInResumeDir = existsSync(join(resumeDir, 'projects', 'tree-s1', `${sid}.jsonl`))
     await h2.close()
-    return mainRequests(fake.requests())
+    return { reqs: mainRequests(fake.requests()), resumeDir, resumeFiles, transcriptInResumeDir, resumeDirRemoved: await eventually(() => !existsSync(resumeDir)) }
   }
 
   it('S1: request 3 after a store resume equals the unbroken run outside metadata, thinking accepted', async () => {
-    const fake = await Fake.start(steps)
-    const h = new Host({ fake, store: new RecordingStore(), root: 'tree-s1', dataDir, clock: new Clock(t.base) })
-    for (const turn of turns) await h.send(turn)
-    await h.close()
-    a = mainRequests(fake.requests())
-    const b = await runB(new Clock(t.base))
+    const dataDir = newDataDir()
+    const t = morning()
+    const a = await runA(dataDir, t)
+    const { reqs: b, resumeDir, resumeFiles, transcriptInResumeDir, resumeDirRemoved } = await runB(dataDir, t, 0)
 
     expect(a).toHaveLength(3)
     expect(b).toHaveLength(3)
@@ -124,10 +188,20 @@ describe('S1: resume is byte-identical', () => {
     expect(userIdOf(b[2]!)).toEqual(userIdOf(b[1]!))
     expect(userIdOf(b[2]!).session_id).not.toBe(userIdOf(a[2]!).session_id)
     expect(R.IDLE_EVICT_MS).toBe(600_000)
+
+    // S34: the resumed CLI ran in the SDK's own config dir under the SDK
+    // process's tmpdir, holding the loaded transcript, removed at close.
+    expect(resumeDir.startsWith(join(tmpdir(), 'claude-resume-'))).toBe(true)
+    expect(resumeFiles).toEqual(['.claude.json', 'projects', 'sessions'])
+    expect(transcriptInResumeDir).toBe(true)
+    expect(resumeDirRemoved).toBe(true)
   })
 
   it('S1b: a resume a day later keeps the date line in the prefix and notes the new date at the tail', async () => {
-    const b = await runB(new Clock(t.base + 86_400))
+    const dataDir = newDataDir()
+    const t = morning()
+    const a = await runA(dataDir, t)
+    const { reqs: b } = await runB(dataDir, t, 86_400)
     expect(b.map((r) => r.bindingOk)).toEqual([true, true, true])
     const am = a[2]!.json.messages
     const bm = b[2]!.json.messages
@@ -159,6 +233,11 @@ it('S2: every session of a tree writes under projectKey = the root', async () =>
   const sid2 = h2.sessionId
   await h2.close()
 
+  // One request per turn, each passing the binding check: no strip-and-retry.
+  expect(fake.requests().map((r) => [requestClass(r), r.bindingOk])).toEqual([
+    ['main', true],
+    ['main', true],
+  ])
   expect(sid2).not.toBe(sid)
   const keys = new Set(store.appends.map((x) => `${x.key.projectKey}|${x.key.sessionId}|${x.key.subpath ?? ''}`))
   expect([...keys].sort()).toEqual([`tree-s2|${sid}|`, `tree-s2|${sid2}|`].sort())
@@ -206,7 +285,7 @@ it('S3: main requests cache for 1h; subagent requests for the default 5m; helper
 describe('S4: compaction, with S14 the threshold', () => {
   const CTX = 'LUMA-S4-PROFILE-CONTEXT'
   // Four turns, the fourth reply reporting `contextTokens`, then a fifth (and sixth).
-  async function probe(contextTokens: number, o: { sixth?: boolean; settings?: Record<string, unknown> } = {}) {
+  async function probe(contextTokens: number, o: { sixth?: boolean } = {}) {
     const fake = await Fake.start({
       p: [{ text: 'A.' }, { text: 'B.' }, { text: 'C.' }, { text: 'D.', usage: { input: contextTokens } }, { text: 'E.' }, { text: 'F.' }, { text: 'G.' }, { text: 'H.' }],
     })
@@ -214,7 +293,6 @@ describe('S4: compaction, with S14 the threshold', () => {
       fake,
       store: new RecordingStore(),
       root: 'tree-s4',
-      ...(o.settings ? { settings: o.settings } : {}),
       hooks: {
         SessionStart: [
           {
@@ -391,6 +469,9 @@ it('S6: totals run within a query, are restored from cost-state entries, and giv
   expect(delta(b2, base)).toEqual([2000, 200])
   expect(delta(b2, tokens(b1) as [number, number])).toEqual([1000, 100])
 
+  // Eight turns, eight requests, every one passing the binding check: no
+  // resume or fork here cost a strip-and-retry.
+  expect(fake.requests().map((r) => r.bindingOk)).toEqual([true, true, true, true, true, true, true, true])
   expect(R.TOTALS_RESTORED).toEqual({ resume: true, resumeAfterKill: false, fork: true })
   // Every delta in dollars is non-negative too, against the same baselines.
   expect(r3.total_cost_usd).toBeGreaterThan(r2.total_cost_usd)
@@ -407,13 +488,20 @@ describe('S7: settings', () => {
     await h.send('One [[fake:s7]]')
     const { argv } = h.cliProcess()
     await h.close()
-    expect(argv[argv.indexOf('--settings') + 1]).toBe('{"switchModelsOnFlag":true,"idleCompaction":false}')
+    expect(argv[argv.indexOf('--settings') + 1]).toBe('{"switchModelsOnFlag":true,"idleCompaction":false,"precomputeCompactionEnabled":false}')
     expect(argv).toContain('--setting-sources=')
     expect(argv).toContain('--strict-mcp-config')
     expect(argv).toContain('--permission-mode=default')
   })
 
-  it('S7: precomputeCompactionEnabled, true or false, changes no request below or at the threshold', async () => {
+  it('S7: the CLI reads precomputeCompactionEnabled (default on) behind a server flag, so offline neither value changes a request', async () => {
+    // The pinned CLI reads both settings with a default of true, and gates
+    // precompute on the tengu_sepia_moth server flag (default off): offline,
+    // the flag is off, so this case cannot see the setting work.
+    const bin = readFileSync(cliPath())
+    for (const s of ['"precomputeCompactionEnabled",!0)', '"idleCompaction",!0)', '"tengu_sepia_moth",!1)']) expect(bin.includes(s), s).toBe(true)
+    expect(R.PRECOMPUTE_SETTING_EXISTS).toBe(true)
+
     async function classes(contextTokens: number, precompute: boolean): Promise<(string | undefined)[]> {
       const fake = await Fake.start({
         p: [{ text: 'A.' }, { text: 'B.' }, { text: 'C.' }, { text: 'D.', usage: { input: contextTokens } }, { text: 'E.' }, { text: 'F.' }, { text: 'G.' }],
@@ -430,7 +518,6 @@ describe('S7: settings', () => {
       expect(await classes(R.COMPACTION_TRIGGER_TOKENS - 3000, precompute)).toEqual(['main', 'main', 'main', 'main', 'main'])
       expect(await classes(R.COMPACTION_TRIGGER_TOKENS, precompute)).toEqual(['main', 'main', 'main', 'main', 'compaction', 'main', 'main'])
     }
-    expect(R.PRECOMPUTE_SETTING_EXISTS).toBe(false)
   })
 })
 
@@ -456,10 +543,16 @@ it('S8: a fork at a message, from a second host reading only the store, replays 
   await h2.close()
   expect(h2.sessionId).not.toBe(sid)
 
+  expect(fake.requests().map((r) => [requestClass(r), r.bindingOk])).toEqual([
+    ['main', true],
+    ['auxiliary', true],
+    ['main', true],
+    ['main', true],
+    ['main', true],
+  ])
   const mains = mainRequests(fake.requests())
   const orig = mains[2]!.json.messages // turn 2: [U1, A1…, U2, trailing system]
   const fork = mains[3]!
-  expect(fork.bindingOk).toBe(true)
   expect(fork.json.messages).toHaveLength(orig.length)
   expect(fork.json.messages.slice(0, -2).map((m: any) => JSON.stringify(m))).toEqual(orig.slice(0, -2).map((m: any) => JSON.stringify(m)))
   expect(fork.json.messages.at(-2)).toEqual({ role: 'user', content: 'And after, edited? [[fake:s8]]' })
@@ -499,6 +592,39 @@ it('S9: a resume after an idle longer than the cache TTL looks exactly like a wa
   expect(R.SLO_SIGNALS.coldResume).toBeNull()
 })
 
+it('S9: one conversation sends every request class, on one path, with our headers and system blocks', async () => {
+  // A subagent call, a web search, four turns, then a compaction.
+  const fake = await Fake.start({
+    s9u: [
+      { tool_uses: [{ name: 'Agent', input: { subagent_type: 'deep-think', description: 'Think', prompt: 'Think it over [[fake:s9sub]]' } }] },
+      { tool_uses: [{ name: 'WebSearch', input: { query: 'rain [[fake:s9search]]' } }] },
+      { text: 'A.' },
+      { text: 'B.' },
+      { text: 'C.' },
+      { text: 'D.', usage: { input: 90_000 } },
+      { text: 'E.' },
+      { text: 'F.' },
+      { text: 'G.' },
+    ],
+    s9sub: [{ text: 'Deep.' }],
+    s9search: [{ text: 'Searched.' }],
+  })
+  const h = new Host({
+    fake,
+    store: new RecordingStore(),
+    root: 'tree-s9u',
+    tools: ['WebSearch', 'WebFetch', 'Agent'],
+    agents: DEEP_THINK,
+    env: { CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1' },
+  })
+  for (const w of ['One', 'Two', 'Three', 'Four', 'Five']) await h.send(`${w} [[fake:s9u]]`)
+  await h.close()
+  const rs = fake.requests()
+  expect([...new Set(rs.map((r) => r.path.split('?')[0]))]).toEqual([...R.CLI_PATHS])
+  expect([...new Set(rs.map((r) => requestClass(r)))].sort()).toEqual([...R.REQUEST_CLASSES])
+  for (const r of rs) expectOurs(r)
+})
+
 it('S10: polling mcpServerStatus() until connected means the first request lists the memory tools', async () => {
   const mcp = await McpServer.start({ initializeDelayMs: 1000 })
   const fake = await Fake.start({ s10: [{ text: 'One.' }] })
@@ -522,6 +648,7 @@ it('S10: polling mcpServerStatus() until connected means the first request lists
   // (messages), not in system.
   expect(count(messagesText(first), 'Luma memory tools (Spike S fixture).')).toBe(1)
   expect(count(systemText(first), 'Luma memory tools')).toBe(0)
+  expect(hooksOf(h, 'SessionStart')).toEqual([])
 })
 
 describe('S11: errors, the subagent tool and model switches', () => {
@@ -631,7 +758,7 @@ describe('S11: errors, the subagent tool and model switches', () => {
     expect(sdkMessages(fg.h, 'result')).toHaveLength(1)
   })
 
-  it('S11: the refusal fixture switches no model, and PostModelSwitch fires only for setModel()', async () => {
+  it('S11: the refusal fixture switches no model; a reply from another model fires no PostModelSwitch; setModel() does', async () => {
     const fake = await Fake.start({ r: [{ text: 'I cannot.', stop_reason: 'refusal' }, { text: 'Two.', model: 'claude-other-5-5' }, { text: 'Three.' }] })
     const h = new Host({ fake, store: new RecordingStore(), root: 'tree-s11r' })
     const t1 = await h.send('Flagged [[fake:r]]')
@@ -658,7 +785,6 @@ describe('S11: errors, the subagent tool and model switches', () => {
 })
 
 describe('S12: WebFetch through a CONNECT proxy', () => {
-  const tls = makeTlsFixtures(['site.test', 'api.anthropic.com'])
   const page = (_req: unknown, res: any) => {
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
     res.end('<html><head><title>Spike page</title></head><body><h1>Hello</h1><p>The page body.</p></body></html>')
@@ -667,8 +793,13 @@ describe('S12: WebFetch through a CONNECT proxy', () => {
     res.writeHead(200, { 'content-type': 'application/json' })
     res.end(JSON.stringify({ domain: 'site.test', can_fetch: true }))
   }
-  async function fetchOnce(origins: { target: string; handler: (q: any, s: any) => void }[], settings = INLINE_SETTINGS) {
-    const proxy = await ConnectProxy.start(tls, origins)
+  async function fetchOnce(origins: string[], settings = INLINE_SETTINGS) {
+    const tls = makeTlsFixtures(['site.test', 'api.anthropic.com'])
+    const handlers: Record<string, (q: any, s: any) => void> = { 'site.test:443': page, 'api.anthropic.com:443': domainInfo }
+    const proxy = await ConnectProxy.start(
+      tls,
+      origins.map((target) => ({ target, handler: handlers[target]! })),
+    )
     const fake = await Fake.start({
       w: [{ tool_uses: [{ name: 'WebFetch', input: { url: 'https://site.test/page', prompt: 'What does it say?' } }] }, { text: 'It says hello.' }],
     })
@@ -687,10 +818,7 @@ describe('S12: WebFetch through a CONNECT proxy', () => {
   }
 
   it('S12: the page and a domain check go through the proxy; the extraction request goes to the fake on the helper model', async () => {
-    const { proxy, fake, rs, toolResult } = await fetchOnce([
-      { target: 'site.test:443', handler: page },
-      { target: 'api.anthropic.com:443', handler: domainInfo },
-    ])
+    const { proxy, fake, rs, toolResult } = await fetchOnce(['site.test:443', 'api.anthropic.com:443'])
     expect(proxy.connects).toEqual(['api.anthropic.com:443', 'site.test:443'])
     expect(proxy.connects).not.toContain(fake.hostPort)
     expect(proxy.plain).toEqual([])
@@ -708,22 +836,25 @@ describe('S12: WebFetch through a CONNECT proxy', () => {
   })
 
   it('S12: a denied domain check fails the WebFetch, unless skipWebFetchPreflight', async () => {
-    const denied = await fetchOnce([{ target: 'site.test:443', handler: page }])
+    const denied = await fetchOnce(['site.test:443'])
     expect(denied.proxy.connects).toEqual(['api.anthropic.com:443'])
     expect(denied.toolResult.is_error).toBe(true)
     expect(denied.toolResult.content).toBe(
       'Unable to verify if domain site.test is safe to fetch. This may be due to network restrictions or enterprise security policies blocking claude.ai.',
     )
-    const skipped = await fetchOnce([{ target: 'site.test:443', handler: page }], { ...INLINE_SETTINGS, skipWebFetchPreflight: true })
+    const skipped = await fetchOnce(['site.test:443'], { ...INLINE_SETTINGS, skipWebFetchPreflight: true })
     expect(skipped.proxy.connects).toEqual(['site.test:443'])
     expect(skipped.toolResult.is_error).toBeUndefined()
   })
 })
 
 it('S13: an idle hour after six 4 KB tool results changes no earlier message, with or without idleCompaction: false', async () => {
-  const tls = makeTlsFixtures(['site.test', 'api.anthropic.com'])
+  // Not a regression guard for idleCompaction: false: the CLI gates idle
+  // compaction on a server-side mode that is off offline, so neither run can
+  // compact. It records that nothing else rewrites the history while idle.
   const big = (i: number) => `Result ${i}: ` + 'lorem ipsum dolor sit amet '.repeat(200)
   async function run(settings: Record<string, unknown>) {
+    const tls = makeTlsFixtures(['site.test', 'api.anthropic.com'])
     const proxy = await ConnectProxy.start(tls, [
       {
         target: 'site.test:443',
@@ -827,7 +958,7 @@ it('S16: with the thinking-binding beta, input_transformations reach the SDK mes
   expect(R.INPUT_TRANSFORMATIONS_VISIBLE).toBe(true)
 })
 
-it('S17: a WebSearch call whose nested request reports 3 searches shows 3 only in the result delta', async () => {
+it('S17: a WebSearch call whose nested request runs 3 searches reports 3 in PostToolUse', async () => {
   const fake = await Fake.start({
     s17: [{ tool_uses: [{ name: 'WebSearch', input: { query: 'rain tomorrow [[fake:s17search]]' } }] }, { text: 'Rain.' }],
     s17search: [{ text: 'Search summary.', usage: { web_search_requests: 3 } }],
@@ -839,31 +970,13 @@ it('S17: a WebSearch call whose nested request reports 3 searches shows 3 only i
   expect(requestClass(nested)).toBe('auxiliary')
   expect(nested.json.model).toBe(MODEL)
   expect(nested.json.tools).toEqual([{ type: 'web_search_20250305', name: 'web_search', max_uses: 8 }])
+  // The nested reply holds three server_tool_use / web_search_tool_result
+  // pairs and reports web_search_requests: 3. PostToolUse's searchCount
+  // counts the pairs, per call, so the hook can count searches as they run.
   const post = hooksOf(h, 'PostToolUse')
-  // PostToolUse carries searchCount, the reply's server_tool_use blocks, and no usage.
-  expect(post.map((i) => [i.tool_name, i.tool_response.searchCount])).toEqual([['WebSearch', 1]])
+  expect(post.map((i) => [i.tool_name, i.tool_response.searchCount])).toEqual([['WebSearch', 3]])
   expect(Object.keys(post[0].tool_response).sort()).toEqual(['durationSeconds', 'query', 'results', 'searchCount'])
+  // The result's delta agrees.
   expect(tokenTotals(t.result)[MODEL]![2]).toBe(3)
-  expect(R.WEB_SEARCH_COUNT_SOURCE).toBe('resultDelta')
-})
-
-it('S9: paths, request classes, headers and system blocks of every request above', () => {
-  const rs = allFakes.flatMap((f) => f.requests())
-  expect(rs.length).toBeGreaterThan(100)
-  expect([...new Set(rs.map((r) => r.path.split('?')[0]))].sort()).toEqual([...R.CLI_PATHS])
-  expect([...new Set(rs.map((r) => r.path))]).toEqual(['/v1/messages?beta=true'])
-  expect([...new Set(rs.map((r) => requestClass(r)))].sort()).toEqual([...R.REQUEST_CLASSES])
-  for (const r of rs) {
-    expect(isMessages(r)).toBe(true)
-    expect(header(r, 'authorization')).toBe(`Bearer ${GATEWAY_TOKEN}`)
-    expect(header(r, 'x-api-key')).toBeUndefined()
-    expect([header(r, 'x-luma-person'), header(r, 'x-luma-agent'), header(r, 'x-luma-tier'), header(r, 'x-luma-source')]).toEqual([PERSON_REF, 'luma', 'fast', 'web'])
-    expect(header(r, 'user-agent')).toBe('claude-cli/2.1.303 (external, sdk-ts, agent-sdk/0.3.303, client-app/luma)')
-    expect(header(r, 'x-client-app')).toBe('luma')
-    expect(r.json.system[0].text.startsWith('x-anthropic-billing-header: cc_version=2.1.303.')).toBe(true)
-  }
-  // Our prompt is its own system block on every main request, after the billing header and the SDK's line.
-  for (const r of mainRequests(rs)) {
-    expect(r.json.system.map((b: any) => b.text).slice(1)).toEqual(["You are a Claude agent, built on Anthropic's Claude Agent SDK.", AGENT_BODY])
-  }
+  expect(R.WEB_SEARCH_COUNT_SOURCE).toBe('postToolUse')
 })

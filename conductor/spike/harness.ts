@@ -3,6 +3,7 @@
 // query(), against the fakeanthropic binary. The fake records every request
 // the CLI makes, with its thinking-binding verdict.
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs'
 import { createServer, type Server } from 'node:http'
 import { createRequire } from 'node:module'
@@ -47,14 +48,54 @@ export const PERSON_REF = 'u_0123456789'
 /** The agent body: the static system prompt. */
 export const AGENT_BODY = 'You are Luma, a household assistant (Spike S fixture agent).\nAnswer briefly.'
 
-/** Task 16's inline settings, without the precompute key (S7). */
-export const INLINE_SETTINGS: Settings = { switchModelsOnFlag: true, idleCompaction: false }
+/** Task 16's inline settings. */
+export const INLINE_SETTINGS: Settings = { switchModelsOnFlag: true, idleCompaction: false, precomputeCompactionEnabled: false }
 
 /** The native CLI of the direct @anthropic-ai/claude-code dependency (S19). */
 export function cliPath(): string {
   const pkg = createRequire(import.meta.url).resolve('@anthropic-ai/claude-code/package.json')
   const native = createRequire(pkg).resolve(`@anthropic-ai/claude-code-${process.platform}-${process.arch}/package.json`)
   return join(dirname(native), 'claude')
+}
+
+// ---------------------------------------------------------------------------
+// Per-case resources. Every temp dir, fake, host and server a case starts is
+// tracked; endCase() (the test file's afterEach) stops and removes them all,
+// and returns every request the case's fakes saw.
+
+const tracked: { dirs: string[]; fakes: Fake[]; hosts: Host[]; stops: (() => Promise<unknown>)[] } = { dirs: [], fakes: [], hosts: [], stops: [] }
+const runDirs: string[] = []
+
+/** A fresh temp dir, removed at the end of the case, or of the run. */
+export function tempDir(name: string, scope: 'case' | 'run' = 'case'): string {
+  const d = mkdtempSync(join(tmpdir(), `spike-s-${name}-`))
+  ;(scope === 'case' ? tracked.dirs : runDirs).push(d)
+  return d
+}
+
+/** Runs stop at the end of the case (it may already have run). */
+export function atCaseEnd(stop: () => Promise<unknown>) {
+  tracked.stops.push(stop)
+}
+
+/** Ends the case: closes its hosts, stops its fakes and servers, removes its temp dirs. */
+export async function endCase(): Promise<FakeRequest[]> {
+  const { dirs, fakes, hosts, stops } = tracked
+  tracked.dirs = []
+  tracked.fakes = []
+  tracked.hosts = []
+  tracked.stops = []
+  for (const h of hosts) h.abandon()
+  for (const stop of stops) await stop()
+  const seen = fakes.flatMap((f) => f.requests())
+  for (const f of fakes) await f.stop()
+  for (const d of dirs) rmSync(d, { recursive: true, force: true })
+  return seen
+}
+
+/** Ends the run: removes the run's temp dirs (the clock shim). */
+export function endRun() {
+  for (const d of runDirs.splice(0)) rmSync(d, { recursive: true, force: true })
 }
 
 // ---------------------------------------------------------------------------
@@ -89,9 +130,6 @@ export interface FakeRequest {
   json: any
 }
 
-/** Every fake this process started, for S9's union of paths and classes. */
-export const allFakes: Fake[] = []
-
 export class Fake {
   private readonly proc: ChildProcess
   readonly baseUrl: string
@@ -104,7 +142,7 @@ export class Fake {
   }
 
   static async start(scripts: Record<string, Step[]>): Promise<Fake> {
-    const dir = mkdtempSync(join(tmpdir(), 'spike-s-fake-'))
+    const dir = tempDir('fake')
     const scriptsPath = join(dir, 'scripts.json')
     writeFileSync(scriptsPath, JSON.stringify(scripts))
     const recordDir = join(dir, 'rec')
@@ -122,7 +160,7 @@ export class Fake {
       })
     })
     const f = new Fake(proc, `http://${addr}`, recordDir)
-    allFakes.push(f)
+    tracked.fakes.push(f)
     return f
   }
 
@@ -256,7 +294,9 @@ export class RecordingStore extends InMemorySessionStore {
 // CLOCK_REALTIME, gettimeofday and time run ahead by an offset that the
 // harness can change while the CLI runs, and with LUMA_CLOCK_MONOTONIC the
 // monotonic clocks jump too. It makes raw syscalls only, so it never
-// allocates, and it depends on no glibc symbol newer than syscall().
+// allocates, and it depends on no glibc symbol newer than syscall(). It maps
+// the offset in a constructor, which the loader runs before the CLI's own
+// initialisers and before any thread exists, so no lazy init can race.
 const CLOCK_SHIM_C = String.raw`
 #define _GNU_SOURCE
 #include <fcntl.h>
@@ -269,25 +309,22 @@ const CLOCK_SHIM_C = String.raw`
 #include <unistd.h>
 
 static volatile int64_t *offset_p;
-static int tried;
 static int all_clocks;
 
-/* The offset, int64 seconds (little endian) at the start of $LUMA_CLOCK_FILE,
-   mapped shared so a rewrite in place moves the clock of a running process. */
+/* Maps the offset, int64 seconds (little endian) at the start of
+   $LUMA_CLOCK_FILE, shared, so a rewrite in place moves a running clock. */
+__attribute__((constructor)) static void clockshim_init(void) {
+  all_clocks = getenv("LUMA_CLOCK_MONOTONIC") != 0;
+  const char *path = getenv("LUMA_CLOCK_FILE");
+  if (!path) return;
+  long fd = syscall(SYS_openat, AT_FDCWD, path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return;
+  void *p = (void *)syscall(SYS_mmap, 0, 8, PROT_READ, MAP_SHARED, fd, 0);
+  syscall(SYS_close, fd);
+  if (p != MAP_FAILED) offset_p = (volatile int64_t *)p;
+}
+
 static int64_t offset(void) {
-  if (!tried) {
-    tried = 1;
-    all_clocks = getenv("LUMA_CLOCK_MONOTONIC") != 0;
-    const char *path = getenv("LUMA_CLOCK_FILE");
-    if (path) {
-      long fd = syscall(SYS_openat, AT_FDCWD, path, O_RDONLY | O_CLOEXEC);
-      if (fd >= 0) {
-        void *p = (void *)syscall(SYS_mmap, 0, 8, PROT_READ, MAP_SHARED, fd, 0);
-        syscall(SYS_close, fd);
-        if (p != MAP_FAILED) offset_p = (volatile int64_t *)p;
-      }
-    }
-  }
   return offset_p ? *offset_p : 0;
 }
 
@@ -320,7 +357,7 @@ let shimPath: string | undefined
 /** Builds the clock shim once per process, with the dev shell's cc. */
 function clockShim(): string {
   if (shimPath) return shimPath
-  const dir = mkdtempSync(join(tmpdir(), 'spike-s-clock-'))
+  const dir = tempDir('shim', 'run')
   writeFileSync(join(dir, 'clockshim.c'), CLOCK_SHIM_C)
   execFileSync('cc', ['-shared', '-fPIC', '-O2', '-fno-delete-null-pointer-checks', '-Wno-nonnull-compare', '-o', join(dir, 'clockshim.so'), join(dir, 'clockshim.c')])
   shimPath = join(dir, 'clockshim.so')
@@ -337,7 +374,7 @@ export class Clock {
   readonly monotonic: boolean
   constructor(offsetSeconds = 0, opts: { monotonic?: boolean } = {}) {
     this.monotonic = opts.monotonic ?? false
-    this.file = join(mkdtempSync(join(tmpdir(), 'spike-s-clockfile-')), 'offset')
+    this.file = join(tempDir('clock'), 'offset')
     writeFileSync(this.file, Buffer.alloc(8))
     this.set(offsetSeconds)
   }
@@ -426,6 +463,7 @@ export class McpServer {
     const s = new McpServer(o)
     await new Promise<void>((ok) => s.srv.listen(0, '127.0.0.1', ok))
     s.url = `http://127.0.0.1:${(s.srv.address() as AddressInfo).port}/mcp`
+    atCaseEnd(() => s.stop())
     return s
   }
 
@@ -472,7 +510,7 @@ export interface HostOptions {
   effort?: Options['effort']
 }
 
-export const newDataDir = () => mkdtempSync(join(tmpdir(), 'spike-s-data-'))
+export const newDataDir = () => tempDir('data')
 
 export interface Turn {
   messages: SDKMessage[]
@@ -525,6 +563,8 @@ export class Host {
   readonly hookInputs: HookInput[] = []
   readonly stderr: string[] = []
   readonly q: Query
+  /** Marks this host's CLI in its environment (hosts of one tree share HOME). */
+  private readonly marker = randomUUID()
   private readonly input = new InputQueue()
   private waiters: (() => void)[] = []
   private ended = false
@@ -532,6 +572,7 @@ export class Host {
 
   constructor(o: HostOptions) {
     this.o = o
+    tracked.hosts.push(this)
     this.dataDir = o.dataDir ?? newDataDir()
     if (o.wipe) for (const d of readdirSync(this.dataDir)) rmSync(join(this.dataDir, d), { recursive: true, force: true })
     this.cwd = join(this.dataDir, 'conv', o.root)
@@ -607,6 +648,7 @@ export class Host {
       CLAUDE_CODE_AUTO_COMPACT_WINDOW: '100000',
       CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: '85',
       NO_PROXY: '127.0.0.1,localhost',
+      LUMA_SPIKE_HOST: this.marker,
       ...(o.clock ? o.clock.env() : {}),
       ...(o.env ?? {}),
     }
@@ -674,17 +716,18 @@ export class Host {
   }
 
   /**
-   * The CLI processes of this host, matched by HOME. Not by
-   * CLAUDE_CONFIG_DIR: for a store resume the SDK replaces it with a temp
-   * dir of its own (claude-resume-<uuid> under the SDK process's tmpdir).
+   * This host's CLI processes, found by the LUMA_SPIKE_HOST marker in their
+   * environment. Neither HOME nor CLAUDE_CONFIG_DIR would do: the hosts of one
+   * tree share HOME, and for a store resume the SDK replaces
+   * CLAUDE_CONFIG_DIR with a temp dir of its own (claude-resume-<uuid>).
    */
   cliPids(): number[] {
-    const home = `HOME=${this.home}`
+    const marker = `LUMA_SPIKE_HOST=${this.marker}`
     const pids: number[] = []
     for (const p of readdirSync('/proc')) {
       if (!/^\d+$/.test(p)) continue
       try {
-        if (readFileSync(`/proc/${p}/environ`, 'utf8').split('\0').includes(home)) pids.push(Number(p))
+        if (readFileSync(`/proc/${p}/environ`, 'utf8').split('\0').includes(marker)) pids.push(Number(p))
       } catch {
         // gone, or not ours
       }
@@ -692,10 +735,10 @@ export class Host {
     return pids
   }
 
-  /** The argv and environment of this host's one CLI process. */
+  /** The argv and environment of this host's own CLI process. */
   cliProcess(): { argv: string[]; env: Record<string, string> } {
     const pids = this.cliPids()
-    if (pids.length !== 1) throw new Error(`want one CLI process, found ${pids.length}`)
+    if (pids.length !== 1) throw new Error(`want this host's one CLI process, found ${pids.length}`)
     const argv = readFileSync(`/proc/${pids[0]}/cmdline`, 'utf8').split('\0').slice(0, -1)
     const env = Object.fromEntries(
       readFileSync(`/proc/${pids[0]}/environ`, 'utf8').split('\0').filter(Boolean).map((kv) => [kv.slice(0, kv.indexOf('=')), kv.slice(kv.indexOf('=') + 1)]),
@@ -707,6 +750,13 @@ export class Host {
   async close(): Promise<void> {
     this.input.end()
     await this.until(() => this.ended, 30_000).catch(() => undefined)
+    this.q.close()
+  }
+
+  /** Ends a host its case left open (endCase): the SDK kills the CLI. */
+  abandon() {
+    if (this.ended) return
+    this.input.end()
     this.q.close()
   }
 

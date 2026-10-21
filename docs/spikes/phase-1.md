@@ -249,21 +249,33 @@ model switches, WebFetch egress, idle behaviour, effort changes,
 `input_transformations` and web-search counts?
 
 **Answer.** Resume and fork are byte-exact and keep thinking valid, so the
-idle eviction stays at 10 minutes and forks use `resumeSessionAt`. Five
-results take the plan's fallback branch:
+idle eviction stays at 10 minutes and forks use `resumeSessionAt`.
+PostToolUse carries a WebSearch call's search count
+(`WEB_SEARCH_COUNT_SOURCE = 'postToolUse'`), and the CLI reads
+`precomputeCompactionEnabled` (`PRECOMPUTE_SETTING_EXISTS = true`), as the
+plan assumed. Three results take a branch:
 
 - **`CONTEXT_DELIVERY = 'first-user-turn'`.** An SDK SessionStart callback
   never runs for `startup`, `resume` or `fork`. It does run for `compact`.
 - **`MODEL_SWITCH_SIGNAL = 'assistantModelField'`.** The refusal fixture
-  switches no model, and `PostModelSwitch` fires only for `setModel()`.
-- **`WEB_SEARCH_COUNT_SOURCE = 'resultDelta'`.** The worst-case search spend
-  is restated below.
-- **`PRECOMPUTE_SETTING_EXISTS = false`.** The setting changes no request.
+  switched no model. `PostModelSwitch` fired for `setModel()` and not for a
+  reply from another model; whether it fires for a flag-routed switch could
+  not be tested offline.
 - **`INPUT_TRANSFORMATIONS_VISIBLE = true`.** Task 16 adds the beta and Task
   19a counts dropped thinking.
 
 Eight more facts change later tasks. They are listed under "Consequences"
 below.
+
+*Correction (Task 4 review).* The first version of this section had
+`resultDelta` and `PRECOMPUTE_SETTING_EXISTS = false`, both artefacts:
+
+- The fake answered every web search with one `server_tool_use` /
+  `web_search_tool_result` pair, whatever the search count. The CLI counts a
+  call's searches from those pairs, so PostToolUse said 1. The fake now sends
+  one pair per search, as the API does.
+- A server flag gates precompute, and it is off offline, so no request could
+  show the setting working.
 
 ### What ran
 
@@ -279,42 +291,52 @@ below.
 - **Harness:** `conductor/spike/` drives one long-lived `query()` per host
   over an input queue held open (#348), with Task 16's options and
   environment, the SDK's `InMemorySessionStore` with every `append` recorded,
-  inline `settings`, and a fresh data dir per tree. The CLI writes its cwd
-  into the conversation, so the hosts of one tree share the data dir path, as
-  the conductor's do, and "an empty local dir" is that path wiped.
-- **Fake:** the fakeanthropic binary at main `42e2c02`, binding check on, with
-  a fixed test key. Every request is recorded with its verdict, so each resume
-  and fork case is also a preserved-thinking check.
+  inline `settings`, and a fresh data dir per tree.
+  - The CLI writes its cwd into the conversation, so the hosts of one tree
+    share the data dir path, as the conductor's do, and "an empty local dir"
+    is that path wiped.
+  - Each case runs on its own (`-t` selects any one). After each case the
+    harness stops its CLIs, fakes and servers and removes its temp dirs
+    (transcripts, recordings, the test CA's keys); the clock shim is removed
+    at the end of the run.
+  - At the end, every request any case made is checked against S9's paths,
+    classes and headers.
+- **Fake:** the fakeanthropic binary at main, binding check on, with a fixed
+  test key. Every request is recorded with its verdict, so each resume and
+  fork case is also a preserved-thinking check. Since the review fix it
+  answers a web search with one `server_tool_use` / `web_search_tool_result`
+  pair per search.
 - **Command:** `nix develop -c make sdk-spike`, 2026-10-21, on rowlett (Linux
-  6.18, Node 24.21, vitest 5.0.5). Four consecutive runs passed. Output:
+  6.18, Node 24.21, vitest 5.0.5). Output:
 
   ```
-  ✓ runs the pinned CLI 368ms
-  ✓ S1: request 3 after a store resume equals the unbroken run outside metadata, thinking accepted 1497ms
-  ✓ S1b: a resume a day later keeps the date line in the prefix and notes the new date at the tail 706ms
-  ✓ S2: every session of a tree writes under projectKey = the root 698ms
-  ✓ S3: main requests cache for 1h; subagent requests for the default 5m; helper requests not at all 501ms
-  ✓ S14: the CLI compacts at COMPACTION_TRIGGER_TOKENS of context, not one token before 905ms
-  ✓ S4: compact_boundary, SessionStart(compact) context in messages, and one binding retry 478ms
-  ✓ S5: a SessionStart callback never runs for startup, resume or fork, so its context reaches no request 1128ms
-  ✓ S6: totals run within a query, are restored from cost-state entries, and give non-negative deltas 2070ms
-  ✓ S7: inline settings reach the CLI as its --settings flag (the flag settings layer) 342ms
-  ✓ S7: precomputeCompactionEnabled, true or false, changes no request below or at the threshold 13853ms
-  ✓ S8: a fork at a message, from a second host reading only the store, replays the kept turn byte for byte 790ms
-  ✓ S9: a resume after an idle longer than the cache TTL looks exactly like a warm one 1477ms
-  ✓ S10: polling mcpServerStatus() until connected means the first request lists the memory tools 1491ms
-  ✓ S11: what the SDK reports for a 429, a 529 and a workspace-limit 400 2326ms
-  ✓ S11: a binding 400 is invisible to the SDK: the CLI strips the thinking and retries 767ms
-  ✓ S11: the subagent tool is Agent, and its subagent runs in the background unless CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 942ms
-  ✓ S11: the refusal fixture switches no model, and PostModelSwitch fires only for setModel() 417ms
-  ✓ S12: the page and a domain check go through the proxy; the extraction request goes to the fake on the helper model 494ms
-  ✓ S12: a denied domain check fails the WebFetch, unless skipWebFetchPreflight 799ms
-  ✓ S13: an idle hour after six 4 KB tool results changes no earlier message, with or without idleCompaction: false 11252ms
-  ✓ S15: applyFlagSettings({effortLevel: "medium"}) changes output_config and the new turn tail only 470ms
-  ✓ S16: with the thinking-binding beta, input_transformations reach the SDK messages 407ms
-  ✓ S17: a WebSearch call whose nested request reports 3 searches shows 3 only in the result delta 460ms
-  ✓ S9: paths, request classes, headers and system blocks of every request above 30ms
-  Tests  25 passed (25)    Duration  45.24s
+  ✓ runs the pinned CLI 357ms
+  ✓ S29: CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 stops the CLI at start when bubblewrap is not on PATH 121ms
+  ✓ S1: request 3 after a store resume equals the unbroken run outside metadata, thinking accepted 1457ms
+  ✓ S1b: a resume a day later keeps the date line in the prefix and notes the new date at the tail 1258ms
+  ✓ S2: every session of a tree writes under projectKey = the root 819ms
+  ✓ S3: main requests cache for 1h; subagent requests for the default 5m; helper requests not at all 469ms
+  ✓ S14: the CLI compacts at COMPACTION_TRIGGER_TOKENS of context, not one token before 913ms
+  ✓ S4: compact_boundary, SessionStart(compact) context in messages, and one binding retry 512ms
+  ✓ S5: a SessionStart callback never runs for startup, resume or fork, so its context reaches no request 1101ms
+  ✓ S6: totals run within a query, are restored from cost-state entries, and give non-negative deltas 2349ms
+  ✓ S7: inline settings reach the CLI as its --settings flag (the flag settings layer) 852ms
+  ✓ S7: the CLI reads precomputeCompactionEnabled (default on) behind a server flag, so offline neither value changes a request 14161ms
+  ✓ S8: a fork at a message, from a second host reading only the store, replays the kept turn byte for byte 806ms
+  ✓ S9: a resume after an idle longer than the cache TTL looks exactly like a warm one 1597ms
+  ✓ S9: one conversation sends every request class, on one path, with our headers and system blocks 613ms
+  ✓ S10: polling mcpServerStatus() until connected means the first request lists the memory tools 1441ms
+  ✓ S11: what the SDK reports for a 429, a 529 and a workspace-limit 400 2229ms
+  ✓ S11: a binding 400 is invisible to the SDK: the CLI strips the thinking and retries 871ms
+  ✓ S11: the subagent tool is Agent, and its subagent runs in the background unless CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 1074ms
+  ✓ S11: the refusal fixture switches no model; a reply from another model fires no PostModelSwitch; setModel() does 581ms
+  ✓ S12: the page and a domain check go through the proxy; the extraction request goes to the fake on the helper model 647ms
+  ✓ S12: a denied domain check fails the WebFetch, unless skipWebFetchPreflight 928ms
+  ✓ S13: an idle hour after six 4 KB tool results changes no earlier message, with or without idleCompaction: false 11509ms
+  ✓ S15: applyFlagSettings({effortLevel: "medium"}) changes output_config and the new turn tail only 438ms
+  ✓ S16: with the thinking-binding beta, input_transformations reach the SDK messages 447ms
+  ✓ S17: a WebSearch call whose nested request runs 3 searches reports 3 in PostToolUse 489ms
+  Tests  26 passed (26)    Duration  48.71s
   ```
 
 The values are committed in `conductor/src/spike-results.ts`, each typed by
@@ -337,7 +359,8 @@ The dev shell's `cc` compiles it once per run.
 - It adds an offset to `CLOCK_REALTIME`, `gettimeofday` and `time`. With
   `monotonic`, it also moves the monotonic clocks, as `FAKETIME` does.
 - The offset is read from a file mapped shared, so a running CLI's clock can
-  be moved.
+  be moved. The shim maps it in a constructor, before the CLI's own
+  initialisers run and before any thread exists.
 - It makes raw syscalls only, so it never allocates. It uses no glibc symbol
   newer than `syscall`, so it loads into the CLI's own glibc, which is not
   the flake's.
@@ -355,10 +378,17 @@ The dev shell's `cc` compiles it once per run.
   `session_id` is the session's; `device_id` lives in the config dir's
   `.claude.json`. So A and B differ there because they are two sessions, and
   B's resumed request has the same `metadata` as B's second.
-- The SDK does not resume in the host's `CLAUDE_CONFIG_DIR`. It loads the
-  store into a temp dir, `<SDK process tmpdir>/claude-resume-<uuid>`. It
-  copies `.claude.json` there, runs the CLI with `CLAUDE_CONFIG_DIR` pointing
-  at it, and deletes it after `close()`.
+- The SDK does not resume in the host's `CLAUDE_CONFIG_DIR` (S34). It loads
+  the store into a temp dir, `<SDK process tmpdir>/claude-resume-<uuid>`,
+  under `projects/<projectKey>/<sid>.jsonl`. It runs the CLI with
+  `CLAUDE_CONFIG_DIR` pointing at it, and deletes it after `close()`; the
+  case asserts each of these.
+- The SDK's resume code (sdk.mjs) also copies the config dir's
+  `.credentials.json`, `.claude.json` and `.config.json` there when present.
+  Here only `.claude.json` exists (auth is `ANTHROPIC_AUTH_TOKEN`), and the
+  case pins the dir's listing to `.claude.json`, `projects` and `sessions`.
+  A `.credentials.json` in a person's config dir would be copied into
+  `TMPDIR` too.
 - `system[0]` is `x-anthropic-billing-header: cc_version=2.1.303.<3 hex>;
   cc_entrypoint=sdk-ts;`. The 3 hex digits follow the conversation's first
   user message: they are stable within a conversation, and change when a
@@ -378,7 +408,8 @@ The dev shell's `cc` compiles it once per run.
 **S2, project key.** With `CLAUDE_CODE_PROJECT_DIR_NAME=<root>` and cwd
 `conv/<root>`, a session and its fork append only under
 `{projectKey: <root>, sessionId}`, with no subpath. The fresh session's
-local copy is `config/<ref>/projects/<root>/<sid>.jsonl`.
+local copy is `config/<ref>/projects/<root>/<sid>.jsonl`. There are exactly
+two requests, one per turn, and both pass the binding check.
 
 **S3, cache TTLs.** The beta header on main requests includes
 `extended-cache-ttl-2025-04-11`.
@@ -459,17 +490,31 @@ output tokens.
   undercounts by 1000/100.
 - `modelUsage[<model>].costBasis` is `"list"` on every result. It is per
   model, and absent until the process has priced a request for that model.
+- The eight turns made exactly eight requests, all passing the binding
+  check: no resume or fork here cost a strip-and-retry.
 
-**S7, settings (`PRECOMPUTE_SETTING_EXISTS = false`).**
+**S7, settings (`PRECOMPUTE_SETTING_EXISTS = true`).**
 - The SDK passes inline `settings` as the CLI's `--settings
-  {"switchModelsOnFlag":true,"idleCompaction":false}`, the flag settings
-  layer. The case reads it from `/proc/<pid>/cmdline`, next to
-  `--setting-sources=`, `--strict-mcp-config` and `--permission-mode=default`.
-- `precomputeCompactionEnabled` is declared in the SDK's `Settings` type.
-  With `true` or `false`, the requests below the threshold (63965) and at it
-  are the same classes, with a 3 s pause before the fifth turn, and no
-  precompute request appears. The setting's effects are shown by S11
-  (`switchModelsOnFlag`) and S13 (`idleCompaction`).
+  {"switchModelsOnFlag":true,"idleCompaction":false,"precomputeCompactionEnabled":false}`,
+  the flag settings layer. The case reads it from `/proc/<pid>/cmdline`, next
+  to `--setting-sources=`, `--strict-mcp-config` and
+  `--permission-mode=default`.
+- **`precomputeCompactionEnabled` exists and defaults to true.** It is
+  declared in the SDK's `Settings` type, and the CLI reads it as
+  `bs("precomputeCompactionEnabled", !0)`.
+- **Precompute is gated by the server flag `tengu_sepia_moth`** (default off):
+  `if(!k("tengu_sepia_moth",!1))return!1`. The flag also gates the idle
+  compaction mode `compact_on_return`, whose check returns
+  `"precompute_compaction_off"` when the setting is false. The case asserts
+  the binary holds `"precomputeCompactionEnabled",!0)`, `"idleCompaction",!0)`
+  and `"tengu_sepia_moth",!1)`.
+- Offline the flag is off, so with `true` or `false` the requests below the
+  threshold (63965) and at it are the same classes, with a 3 s pause before
+  the fifth turn, and no precompute request appears. This shows the gate, not
+  the setting's effect: Task 16 keeps `precomputeCompactionEnabled: false`.
+- Neither setting's effect is shown offline. S11's refusal switched nothing,
+  so `switchModelsOnFlag` went unexercised. S13 cannot observe
+  `idleCompaction` (below).
 
 **S8, fork (`FORK_STRATEGY = 'resumeSessionAt'`).**
 - The source turn: U1, then A1 (thinking + a `WebSearch` tool use, its
@@ -483,8 +528,10 @@ output tokens.
 - The fork gets a new session id, and its store key holds the whole kept
   history.
 
-**S9, headers, paths and system blocks.** Over every request of every case
-(more than 100):
+**S9, headers, paths and system blocks.** One case runs a conversation that
+makes every kind of request (a subagent call, a web search, four turns, a
+compaction) and asserts the exact sets. A check after the run then holds
+every request of every case (more than 100 in a full run) to the same rules:
 
 - **Paths:** `CLI_PATHS = ['/v1/messages']`; every request was `POST
   /v1/messages?beta=true`. No `count_tokens` request occurred.
@@ -526,8 +573,8 @@ output tokens.
 
 - The result subtype is `success` in every case, so the conductor maps on
   `is_error`, `api_error_status` and the text (Task 19a).
-- Any 400 is sent a second time without the `thinking-display-updates-2026-08-18`
-  beta and without `thinking.display`.
+- A 400 other than a binding 400 is sent a second time without the
+  `thinking-display-updates-2026-08-18` beta and without `thinking.display`.
 - The binding 400 never reaches the SDK: the CLI strips every thinking block
   and retries, and only the gateway sees the 400.
 - With the default retries, an exploratory 429 run made 11 requests over
@@ -557,9 +604,15 @@ output tokens.
   hook fires. The fake cannot send the refusal category a fallback is routed
   on.
 - A reply from another model shows only as the assistant message's
-  `message.model`. `modelUsage` stays keyed by the requested model.
+  `message.model`, and fires no `PostModelSwitch`. `modelUsage` stays keyed
+  by the requested model.
 - `PostModelSwitch` fires for `setModel()` (`source: "sdk"`), which Luma
   never calls.
+- **Untested:** whether `PostModelSwitch` fires for a switch the CLI makes on
+  a flagged reply. The fake cannot trigger one, so the reply's model is the
+  signal.
+- **For the live spike:** the API may answer an alias with a dated snapshot
+  id. The `message.model` comparison must not count that as a switch.
 
 **S12, WebFetch through a CONNECT proxy.** With `HTTPS_PROXY` set,
 `NO_PROXY=127.0.0.1,localhost` and `NODE_EXTRA_CA_CERTS` = the test CA:
@@ -583,8 +636,14 @@ output tokens.
   request while idle. The next request's earlier messages equal the previous
   request's (apart from cache markers and the old trailing system message
   becoming a string), and every other field is unchanged.
-- No clearing or idle compaction was observable offline, so the setting stays
-  as the plan has it.
+- **This is not a regression guard for `idleCompaction: false`.** The CLI
+  decides idle compaction on a server-side mode first, returning
+  `"disabled"` while that mode is `"off"`. Only after that does it check
+  `idleCompaction` (`"idle_compaction_off"`) and, for the `compact_on_return`
+  mode, `precomputeCompactionEnabled`. Offline the mode stays off (neither
+  run compacted), so this case cannot tell the two settings apart.
+- The case records only that nothing else rewrites the history across an
+  idle hour. The settings stay as the plan has them.
 
 **S15, `applyFlagSettings({effortLevel: 'medium'})` mid-session.** The next
 request changes in two places only:
@@ -604,20 +663,23 @@ Whether the API keeps the cache across that is live spike L4's question.
 - A reply's `input_transformations` show on every assistant message's
   `message.input_transformations` and on the `stream_event` `message_start`.
 
-**S17 (`WEB_SEARCH_COUNT_SOURCE = 'resultDelta'`).**
+**S17 (`WEB_SEARCH_COUNT_SOURCE = 'postToolUse'`).**
 - WebSearch runs a nested request: class `auxiliary`, the session model,
   `tools: [{type: "web_search_20250305", name: "web_search", max_uses: 8}]`.
-- The nested reply reported `web_search_requests: 3`. That 3 appears only in
-  the result's `modelUsage[model].webSearchRequests`.
+- The nested reply held three `server_tool_use` / `web_search_tool_result`
+  pairs, as the API sends one per search, and reported
+  `web_search_requests: 3`.
 - PostToolUse's `tool_response` is `{query, results, durationSeconds,
-  searchCount}`, with `searchCount: 1`: it counts the reply's
-  `server_tool_use` blocks (the fake sends one), not billed searches.
+  searchCount}`, with `searchCount: 3`. The CLI counts it as the larger of the
+  two block counts, per call, so the hook can count searches as they run. The
+  result's `modelUsage[model].webSearchRequests` delta agrees.
 
 ### Environment
 
-- **`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`** (in Task 16's `buildEnv`) makes the
-  CLI refuse to start: "bubblewrap is required for subprocess env scrubbing
-  and isolation". The harness leaves it out.
+- **`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`** makes the CLI refuse to start
+  when bubblewrap is not on `PATH`: "bubblewrap is required for subprocess env
+  scrubbing and isolation". The S29 case pins this with an empty `PATH`; the
+  harness leaves the variable out.
 - **A host must end its input and wait for the stream to end before it
   reports closed.** In an exploratory run, `query.close()` called while the
   input was still open returned before the CLI's graceful exit had written
@@ -630,11 +692,11 @@ Whether the API keeps the cache across that is live spike L4's question.
 
 Applied to `docs/plans/phase-1-lean-chat.md`:
 
-- **Global Constraints, web tools (S21):** restated for `resultDelta` from
-  S17's numbers. The hook counts each call as 1 until `turn_result` corrects
-  the session count, so a turn runs at most 3 calls of up to `max_uses: 8`.
-  The worst case is **24 searches a turn ($0.24)**, and **36 a session
-  ($0.36)**: 12 counted searches, then 3 calls of 8.
+- **Global Constraints, web tools:** S17 found `postToolUse`, so the bound
+  is the plan's own: one call of up to `max_uses: 8` searches after two
+  counted ones, **10 searches a turn ($0.10)** and **22 a session ($0.22)**.
+  The first version of this section restated it for `resultDelta`; the
+  review fix reverted that.
 - **C2:** `HostSpec.resume.baseline_totals` stays optional, because
   `TOTALS_ENTRY_TYPE` is not null. A note records that it is never the delta
   baseline (S6). `turn_result.cost_basis` stays, because `COST_BASIS_FIELD`
@@ -666,7 +728,8 @@ Not applied here; they need the plan's owner:
    - Add `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`, or a background deep-think
      ends the turn early and starts turns Core never sent.
    - Add `ANTHROPIC_BETAS=thinking-binding-controls-2026-08-01` (S16).
-2. **Task 16 options.** Drop `precomputeCompactionEnabled` (S7).
+2. **Task 16 options.** Keep `precomputeCompactionEnabled: false` (S7: the
+   key exists, and defaults to true).
 3. **Task 17/19b baseline.** The baseline is the latest `cost-state` of the
    loaded transcript, else zero. It is never `spec.resume.baseline_totals`:
    that gives negative deltas after a SIGKILL, and undercounts when a session
@@ -676,7 +739,8 @@ Not applied here; they need the plan's owner:
      does work, if Task 19b prefers it for re-injection.
    - The subagent lock must also refuse `run_in_background: true`, unless
      item 1's env var is set.
-   - Search counting per S21.
+   - Search counting from PostToolUse's `tool_response.searchCount`
+     (`postToolUse`), so Task 18's 8-search test runs.
 5. **Task 19a errors.** Every API failure is a `success` result with
    `is_error: true`. Map on `api_error_status` and the text (429 →
    `rate_limited`, 529 → `overloaded` via status, not via the assistant's
