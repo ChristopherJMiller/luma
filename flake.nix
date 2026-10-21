@@ -22,15 +22,22 @@
         pkgs:
         let
           # GO-2026-6809 (crypto/x509) fixed in 1.26.10; drop this override
-          # when nixos-unstable ships go >= 1.26.10. The let binding shadows
-          # `with pkgs;` below, so the list's go_1_26 is this one.
-          go_1_26 = pkgs.go_1_26.overrideAttrs (_: {
-            version = "1.26.10";
-            src = pkgs.fetchurl {
-              url = "https://go.dev/dl/go1.26.10.src.tar.gz";
-              hash = "sha256-/WPog7ovK/ypPBZGsx6+9j4rHk0rMXyXidl2po2B828=";
-            };
-          });
+          # when nixos-unstable ships go >= 1.26.10. Until then the shell
+          # builds 1.26.10 from source; once nixpkgs' go_1_26 reaches it, the
+          # version check below falls through to nixpkgs' own, so the
+          # override retires itself. The let binding shadows `with pkgs;`
+          # below, so the list's go_1_26 is this one.
+          go_1_26 =
+            if pkgs.lib.versionAtLeast pkgs.go_1_26.version "1.26.10" then
+              pkgs.go_1_26
+            else
+              pkgs.go_1_26.overrideAttrs (_: {
+                version = "1.26.10";
+                src = pkgs.fetchurl {
+                  url = "https://go.dev/dl/go1.26.10.src.tar.gz";
+                  hash = "sha256-/WPog7ovK/ypPBZGsx6+9j4rHk0rMXyXidl2po2B828=";
+                };
+              });
         in
         {
           default = pkgs.mkShell {
