@@ -192,8 +192,9 @@ added, `input` is 2100 and `input_cache_write` 300. A cache-read share is
 
 Labels outside their fixed sets are `other`: `x-luma-person: chris`, a
 missing `x-luma-tier`, `x-luma-source: <script>` and a repeated header all
-are. The `request_class` set is provisional (`^[a-z_]{1,32}\z`) until Task 4
-Step 5.
+are. The `request_class` set was provisional (`^[a-z_]{1,32}\z`) here; Task
+4 Step 5 narrowed it to the classes Spike S saw (section S, "Contract and
+gateway amendments").
 
 ### Prices
 
@@ -237,3 +238,464 @@ the load during the spike).
   `api.anthropic.com`.
 - The live `message_delta` usage shape decides whether `detect` keeps its
   input and cache counts (above).
+
+## S. Agent SDK behaviour against the fake (Task 4; spec section 17, rows 2–4, offline)
+
+**Question.** How do `@anthropic-ai/claude-agent-sdk` 0.3.303 and Claude Code
+CLI 2.1.303 actually behave on the paths the conductor is built on: resume
+and fork from a `SessionStore`, thinking bindings across them, cache TTLs,
+compaction, SessionStart context, totals, settings, MCP readiness, errors,
+model switches, WebFetch egress, idle behaviour, effort changes,
+`input_transformations` and web-search counts?
+
+**Answer.** Resume and fork are byte-exact and keep thinking valid, so the
+idle eviction stays at 10 minutes and forks use `resumeSessionAt`. Five
+results take the plan's fallback branch:
+
+- **`CONTEXT_DELIVERY = 'first-user-turn'`.** An SDK SessionStart callback
+  never runs for `startup`, `resume` or `fork`. It does run for `compact`.
+- **`MODEL_SWITCH_SIGNAL = 'assistantModelField'`.** The refusal fixture
+  switches no model, and `PostModelSwitch` fires only for `setModel()`.
+- **`WEB_SEARCH_COUNT_SOURCE = 'resultDelta'`.** The worst-case search spend
+  is restated below.
+- **`PRECOMPUTE_SETTING_EXISTS = false`.** The setting changes no request.
+- **`INPUT_TRANSFORMATIONS_VISIBLE = true`.** Task 16 adds the beta and Task
+  19a counts dropped thinking.
+
+Eight more facts change later tasks. They are listed under "Consequences"
+below.
+
+### What ran
+
+- **SDK:** `@anthropic-ai/claude-agent-sdk` 0.3.303, whose `claudeCodeVersion`
+  is 2.1.303. Its optional `@anthropic-ai/claude-agent-sdk-<platform>`
+  packages carry the same CLI binary.
+- **CLI:** the direct `@anthropic-ai/claude-code` 2.1.303 (`2.1.303 (Claude
+  Code)`, Bun 1.4.4), its native `@anthropic-ai/claude-code-linux-x64` binary,
+  passed as `pathToClaudeCodeExecutable` (S19). The package's `bin/claude.exe`
+  is a stub until its postinstall copies the binary over it, and pnpm 10 does
+  not run that script, so the conductor must point at the platform package's
+  `claude` too (Task 25).
+- **Harness:** `conductor/spike/` drives one long-lived `query()` per host
+  over an input queue held open (#348), with Task 16's options and
+  environment, the SDK's `InMemorySessionStore` with every `append` recorded,
+  inline `settings`, and a fresh data dir per tree. The CLI writes its cwd
+  into the conversation, so the hosts of one tree share the data dir path, as
+  the conductor's do, and "an empty local dir" is that path wiped.
+- **Fake:** the fakeanthropic binary at main `42e2c02`, binding check on, with
+  a fixed test key. Every request is recorded with its verdict, so each resume
+  and fork case is also a preserved-thinking check.
+- **Command:** `nix develop -c make sdk-spike`, 2026-10-21, on rowlett (Linux
+  6.18, Node 24.21, vitest 5.0.5). Four consecutive runs passed. Output:
+
+  ```
+  ✓ runs the pinned CLI 368ms
+  ✓ S1: request 3 after a store resume equals the unbroken run outside metadata, thinking accepted 1497ms
+  ✓ S1b: a resume a day later keeps the date line in the prefix and notes the new date at the tail 706ms
+  ✓ S2: every session of a tree writes under projectKey = the root 698ms
+  ✓ S3: main requests cache for 1h; subagent requests for the default 5m; helper requests not at all 501ms
+  ✓ S14: the CLI compacts at COMPACTION_TRIGGER_TOKENS of context, not one token before 905ms
+  ✓ S4: compact_boundary, SessionStart(compact) context in messages, and one binding retry 478ms
+  ✓ S5: a SessionStart callback never runs for startup, resume or fork, so its context reaches no request 1128ms
+  ✓ S6: totals run within a query, are restored from cost-state entries, and give non-negative deltas 2070ms
+  ✓ S7: inline settings reach the CLI as its --settings flag (the flag settings layer) 342ms
+  ✓ S7: precomputeCompactionEnabled, true or false, changes no request below or at the threshold 13853ms
+  ✓ S8: a fork at a message, from a second host reading only the store, replays the kept turn byte for byte 790ms
+  ✓ S9: a resume after an idle longer than the cache TTL looks exactly like a warm one 1477ms
+  ✓ S10: polling mcpServerStatus() until connected means the first request lists the memory tools 1491ms
+  ✓ S11: what the SDK reports for a 429, a 529 and a workspace-limit 400 2326ms
+  ✓ S11: a binding 400 is invisible to the SDK: the CLI strips the thinking and retries 767ms
+  ✓ S11: the subagent tool is Agent, and its subagent runs in the background unless CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 942ms
+  ✓ S11: the refusal fixture switches no model, and PostModelSwitch fires only for setModel() 417ms
+  ✓ S12: the page and a domain check go through the proxy; the extraction request goes to the fake on the helper model 494ms
+  ✓ S12: a denied domain check fails the WebFetch, unless skipWebFetchPreflight 799ms
+  ✓ S13: an idle hour after six 4 KB tool results changes no earlier message, with or without idleCompaction: false 11252ms
+  ✓ S15: applyFlagSettings({effortLevel: "medium"}) changes output_config and the new turn tail only 470ms
+  ✓ S16: with the thinking-binding beta, input_transformations reach the SDK messages 407ms
+  ✓ S17: a WebSearch call whose nested request reports 3 searches shows 3 only in the result delta 460ms
+  ✓ S9: paths, request classes, headers and system blocks of every request above 30ms
+  Tests  25 passed (25)    Duration  45.24s
+  ```
+
+The values are committed in `conductor/src/spike-results.ts`, each typed by
+hand from these observations. Every case asserts that its observation equals
+its constant, so these are change detectors (S20).
+
+### Clock control
+
+The plan named libfaketime (`LD_PRELOAD=$LUMA_FAKETIME_LIB`, `FAKETIME=…`).
+The flake's libfaketime 0.9.11 **hangs the CLI at start**, with every
+`FAKETIME` value and with `libfaketimeMT` too. One thread waits in
+`futex_wait` before `main`. The cause: libfaketime's lazy init calls `dlsym`.
+That allocates through the CLI's own allocator (Bun's), which reads the
+clock, which re-enters libfaketime's init under `pthread_once`. Its source
+says as much ("If ftpl_init ends up recursing, pthread_once will deadlock").
+
+The harness builds its own shim instead (`CLOCK_SHIM_C` in `harness.ts`).
+The dev shell's `cc` compiles it once per run.
+
+- It adds an offset to `CLOCK_REALTIME`, `gettimeofday` and `time`. With
+  `monotonic`, it also moves the monotonic clocks, as `FAKETIME` does.
+- The offset is read from a file mapped shared, so a running CLI's clock can
+  be moved.
+- It makes raw syscalls only, so it never allocates. It uses no glibc symbol
+  newer than `syscall`, so it loads into the CLI's own glibc, which is not
+  the flake's.
+
+`LUMA_FAKETIME_LIB` stays in the flake, unused.
+
+### Results
+
+**S1, resume (`IDLE_EVICT_MS = 600_000`).**
+- Run A: three turns. Run B: two turns, `close()`, the local JSONL deleted, a
+  store `resume`, turn three.
+- B's third main request equals A's **byte for byte, outside
+  `metadata.user_id`**. Every request passed the binding check.
+- `metadata.user_id` is `{device_id, account_uuid: "", session_id}`.
+  `session_id` is the session's; `device_id` lives in the config dir's
+  `.claude.json`. So A and B differ there because they are two sessions, and
+  B's resumed request has the same `metadata` as B's second.
+- The SDK does not resume in the host's `CLAUDE_CONFIG_DIR`. It loads the
+  store into a temp dir, `<SDK process tmpdir>/claude-resume-<uuid>`. It
+  copies `.claude.json` there, runs the CLI with `CLAUDE_CONFIG_DIR` pointing
+  at it, and deletes it after `close()`.
+- `system[0]` is `x-anthropic-billing-header: cc_version=2.1.303.<3 hex>;
+  cc_entrypoint=sdk-ts;`. The 3 hex digits follow the conversation's first
+  user message: they are stable within a conversation, and change when a
+  compaction replaces that message.
+
+**S1b, a day later.**
+- The first turn's environment block, a `role: "system"` message right after
+  U1, ends `Today's date is <day 0>.`. A resume under a clock one day ahead
+  restores that line unchanged.
+- The CLI adds `\n\nThe date has changed. Today's date is now <day 1>. No
+  need to announce the new date — the user's own clock shows it.` to the
+  trailing system message. That message comes after the previous request's
+  cached prefix.
+- Every other byte equals A's, and thinking passes. The case runs the CLI at
+  06:00 UTC by clock offset, so it never crosses midnight.
+
+**S2, project key.** With `CLAUDE_CODE_PROJECT_DIR_NAME=<root>` and cwd
+`conv/<root>`, a session and its fork append only under
+`{projectKey: <root>, sessionId}`, with no subpath. The fresh session's
+local copy is `config/<ref>/projects/<root>/<sid>.jsonl`.
+
+**S3, cache TTLs.** The beta header on main requests includes
+`extended-cache-ttl-2025-04-11`.
+
+| Request (`x-claude-code-request-class`) | Model | `cache_control` |
+|---|---|---|
+| `main` | session | every marker `{"type":"ephemeral","ttl":"1h"}` (three) |
+| `subagent` (deep-think) | the agent's (`claude-opus-5-5`) | `{"type":"ephemeral"}`: the 5m default |
+| `compaction` | session | `{"type":"ephemeral"}` |
+| `auxiliary` (WebSearch's nested request, the WebFetch extraction) | session / helper | none |
+
+**S4 and S14, compaction (`COMPACTION_TRIGGER_TOKENS = 66_965`).**
+- A binary search over the fourth reply's `input_tokens`, with window 100000
+  and pct 85, found the trigger at 66965. The case checks 66964 (no
+  compaction) and 66965 (compaction).
+- The count is the last response's `input + cache_read + cache_creation +
+  output`. Splitting 66965 across those fields compacts the same.
+- The next turn's own size counts toward it: a 40000-character fifth message
+  compacted at 60000.
+- With only one earlier turn, the compaction fails (`compact_result:
+  "failed", compact_error: "too_few_groups"`), so the probe runs four turns
+  first.
+
+After the compaction:
+
+- The compaction request is class `compaction` on the session model, with
+  header `x-claude-code-compaction: auto` and 5m cache markers.
+- The SDK emits `system/compact_boundary` (`trigger: "auto"`, with
+  `preserved_messages`).
+- `SessionStart` fires once, with `source: "compact"`. Its
+  `additionalContext` lands **in `messages`**, in the trailing system message
+  of the first post-compaction turn, exactly once, and stays there.
+- The main requests of that turn carry `x-claude-code-context-compacted:
+  auto`; later turns do not. `SLO_SIGNALS.postCompaction =
+  'compact_boundary'`.
+- **The first main request after a compaction fails the binding check.**
+  Compaction keeps the last turn verbatim after the summary, its signed
+  thinking included. That thinking was bound to the pre-compaction prefix.
+  The fake answers 400, as the API would, and the CLI strips the thinking and
+  retries; the retry and later requests pass. The plan expected that request
+  to pass.
+
+**S5, SessionStart (`CONTEXT_DELIVERY = 'first-user-turn'`,
+`SESSION_START_CONTEXT_SOURCES = ['compact']`).**
+- A callback hook with matcher `startup|compact`, plus a recorder on every
+  source, never ran for a fresh session, a store resume or a fork. Its context
+  reached no request.
+- With `--await-initialize` forced (`extraArgs`, as a diagnostic only), it
+  still did not run. The CLI's debug log shows `session.start` raised before
+  the SDK's hooks are in place.
+- A settings-file `command` hook does run for `startup`. It needs a shell in
+  the image, so it is not an option for the conductor.
+
+**S6, totals (`TOTALS_ENTRY_TYPE = 'cost-state'`, `COST_BASIS_FIELD =
+'modelUsage[model].costBasis'`).** Turn k reported 1000·k input and 100·k
+output tokens.
+
+| Case | First result's tokens (in/out) | Store's latest `cost-state` at open | Delta = result − that |
+|---|---|---|---|
+| turns 1, 2 in one query | 1000/100, then 3000/300 (running) | none | — |
+| clean-close resume, turn 3 | 6000/600 | 3000/300 | 3000/300 |
+| SIGKILL after turn 4 (10000/1000), resume, turn 5 | 8000/800 | 3000/300 | 5000/500 |
+| fork at turn 1 from an empty dir, turn 6 | 14000/1400 | 8000/800 (the source's latest) | 6000/600 |
+| killed before any clean close, resume, turn 2 | 2000/200 | none | 2000/200 |
+
+- A clean close appends `{type: "cost-state", sessionId, totalCostUSD,
+  totalAPIDuration, …, modelUsage: {<model>: {inputTokens, outputTokens,
+  thinkingTokens, cacheReadInputTokens, cacheCreationInputTokens,
+  webSearchRequests, costUSD}}, hasUnknownModelCost}`. Results are running
+  totals within a query.
+- A resume or a fork restores the latest `cost-state` of the transcript it
+  loads. A SIGKILL writes none, so `TOTALS_RESTORED = {resume: true,
+  resumeAfterKill: false, fork: true}`.
+- **The baseline rule that gives exact, never-negative deltas:** the latest
+  `cost-state` entry of the loaded transcript, or zero when there is none.
+- Core's last persisted totals would be wrong as a fallback. After the kill
+  it gives −2000/−200, and for the session killed before any clean close it
+  undercounts by 1000/100.
+- `modelUsage[<model>].costBasis` is `"list"` on every result. It is per
+  model, and absent until the process has priced a request for that model.
+
+**S7, settings (`PRECOMPUTE_SETTING_EXISTS = false`).**
+- The SDK passes inline `settings` as the CLI's `--settings
+  {"switchModelsOnFlag":true,"idleCompaction":false}`, the flag settings
+  layer. The case reads it from `/proc/<pid>/cmdline`, next to
+  `--setting-sources=`, `--strict-mcp-config` and `--permission-mode=default`.
+- `precomputeCompactionEnabled` is declared in the SDK's `Settings` type.
+  With `true` or `false`, the requests below the threshold (63965) and at it
+  are the same classes, with a 3 s pause before the fifth turn, and no
+  precompute request appears. The setting's effects are shown by S11
+  (`switchModelsOnFlag`) and S13 (`idleCompaction`).
+
+**S8, fork (`FORK_STRATEGY = 'resumeSessionAt'`).**
+- The source turn: U1, then A1 (thinking + a `WebSearch` tool use, its
+  result, thinking + text), then U2 and A2.
+- A second host, after its data dir was wiped, forked with `resume` +
+  `forkSession` + `resumeSessionAt` = the uuid of turn 1's last main-loop
+  assistant message, and sent U2'.
+- The fork's request is `[U1, env, A1(thinking, tool_use), tool_result,
+  system, A1(thinking, text), U2', system]`. Every message before U2' is byte
+  for byte the original's, and the binding check passes.
+- The fork gets a new session id, and its store key holds the whole kept
+  history.
+
+**S9, headers, paths and system blocks.** Over every request of every case
+(more than 100):
+
+- **Paths:** `CLI_PATHS = ['/v1/messages']`; every request was `POST
+  /v1/messages?beta=true`. No `count_tokens` request occurred.
+- **Classes:** `REQUEST_CLASSES = ['auxiliary', 'compaction', 'main',
+  'subagent']`.
+- **Auth and identity:** `Authorization: Bearer <ANTHROPIC_AUTH_TOKEN>`, no
+  `x-api-key`. `x-luma-person|agent|tier|source` from
+  `ANTHROPIC_CUSTOM_HEADERS` reached every request. `User-Agent: claude-cli/2.1.303
+  (external, sdk-ts, agent-sdk/0.3.303, client-app/luma)`, and `x-client-app: luma`.
+- **System blocks:** `system[0]` is the billing header on every request. On
+  main requests, `system[1]` is "You are a Claude agent, built on Anthropic's
+  Claude Agent SDK." and `system[2]` is the agent body, byte for byte.
+
+**Cold resume (`SLO_SIGNALS.coldResume = null`).**
+- A resume under a clock 70 minutes ahead sends a body equal to a warm
+  resume's outside `metadata`, with the same header names.
+- No SDK message carries anything "expired". The SessionStart input that
+  would carry `prompt_cache_likely_expired` never runs (S5).
+- The conductor derives a cold resume from the idle gap (Task 19b).
+
+**S10, MCP.**
+- The local HTTP server held `initialize` for 1 s. Polling
+  `mcpServerStatus()` every 100 ms took 12 polls to see `connected`.
+- The first request then listed `mcp__luma__forget` and
+  `mcp__luma__remember`, without `defer_loading`. In an exploratory run
+  without the poll, the CLI also waited for this server.
+- The server's `instructions` travel in the first turn's environment block,
+  in `messages`, not in `system`. The CLI also sends `server/discover` first;
+  a -32601 answer is fine.
+
+**S11, errors.** With `CLAUDE_CODE_MAX_RETRIES=1` to keep the case short:
+
+| Upstream | `system/api_retry` | assistant `error` | assistant text | result |
+|---|---|---|---|---|
+| 429 | `rate_limit`, 429 | `rate_limit` | `API Error: Request rejected (429) · Rate limit exceeded` | `success`, `is_error: true`, `api_error_status: 429`, `terminal_reason: api_error` |
+| 529 | `overloaded`, 529 | `server_error` | `API Error: 529 Overloaded. This is a server-side issue, usually temporary — …` | the same, 529 |
+| 400 workspace limit | none | `unknown` | `API Error: 400 You have reached your specified workspace API usage limits. …` | the same, 400 |
+| binding 400 (a tampered stored U1) | none | none | — | `success`, `is_error: false` |
+
+- The result subtype is `success` in every case, so the conductor maps on
+  `is_error`, `api_error_status` and the text (Task 19a).
+- Any 400 is sent a second time without the `thinking-display-updates-2026-08-18`
+  beta and without `thinking.display`.
+- The binding 400 never reaches the SDK: the CLI strips every thinking block
+  and retries, and only the gateway sees the 400.
+- With the default retries, an exploratory 429 run made 11 requests over
+  180 s before the error surfaced, ignoring `retry-after: 0`.
+
+**S11, subagent (`SUBAGENT_TOOL = 'Agent'`).**
+- The API tool is `Agent`. Its input schema has `subagent_type`,
+  `description`, `prompt`, `model` (enum `sonnet|opus|haiku|fable`),
+  `effort`, `run_in_background` and `isolation`.
+- The subagent request is class `subagent` on the agent's model and effort,
+  with `cc_is_subagent=true;` in its billing header.
+- **By default the subagent runs in the background.** The tool result is
+  "Async agent launched successfully…", the turn ends, and the task
+  notification later starts a turn of its own that no user sent.
+- `background: false` in the agent definition does not change that.
+  `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` does: the subagent runs in the
+  foreground, the tool result is its report ("[Subagent hand-back] …"), and
+  there is one result.
+
+**S11, refusal (`MODEL_SWITCH_SIGNAL = 'assistantModelField'`).**
+- With `switchModelsOnFlag: true`, a `stop_reason: "refusal"` reply switches
+  nothing. The CLI emits `system/informational` "Sonnet 5.5's safeguards
+  stopped the response above · continuing once with that noted", adds a
+  synthetic user message (`isSynthetic`, `refused_message_id`), and retries
+  once on the same model.
+- No `model_refusal_fallback` message appears, and no `Pre`/`PostModelSwitch`
+  hook fires. The fake cannot send the refusal category a fallback is routed
+  on.
+- A reply from another model shows only as the assistant message's
+  `message.model`. `modelUsage` stays keyed by the requested model.
+- `PostModelSwitch` fires for `setModel()` (`source: "sdk"`), which Luma
+  never calls.
+
+**S12, WebFetch through a CONNECT proxy.** With `HTTPS_PROXY` set,
+`NO_PROXY=127.0.0.1,localhost` and `NODE_EXTRA_CA_CERTS` = the test CA:
+
+- **CONNECTs:** `api.anthropic.com:443`, then `site.test:443`, and none to
+  the fake.
+- **The first CONNECT is a domain check:** `GET
+  /api/web/domain_info?domain=site.test`, once per session.
+- **The extraction request** reached the fake as class `auxiliary` on the
+  helper model, with `effort: medium` and no cache markers.
+- **A proxy that refuses `api.anthropic.com` fails the WebFetch:** "Unable
+  to verify if domain site.test is safe to fetch. This may be due to network
+  restrictions or enterprise security policies blocking claude.ai." Settings
+  `skipWebFetchPreflight: true` skips the check.
+
+**S13, idle.**
+- Six WebFetch results of 5 KB each, then the CLI's clocks, monotonic
+  included, jumped 65 minutes ahead while it idled for 5 s, then another
+  turn.
+- With `idleCompaction: false`, and with the key absent, the CLI made no
+  request while idle. The next request's earlier messages equal the previous
+  request's (apart from cache markers and the old trailing system message
+  becoming a string), and every other field is unchanged.
+- No clearing or idle compaction was observable offline, so the setting stays
+  as the plan has it.
+
+**S15, `applyFlagSettings({effortLevel: 'medium'})` mid-session.** The next
+request changes in two places only:
+
+- top-level `output_config` goes from `{"effort":"low"}` to
+  `{"effort":"medium"}`;
+- the new turn's trailing `role: "system"` message carries
+  `output_config: {"effort":"medium"}`. The first turn's environment message
+  carries the initial `{"effort":"low"}` the same way.
+
+Earlier messages, the beta header and the thinking bindings are unchanged.
+Whether the API keeps the cache across that is live spike L4's question.
+
+**S16 (`INPUT_TRANSFORMATIONS_VISIBLE = true`).**
+- With `ANTHROPIC_BETAS=thinking-binding-controls-2026-08-01`, the beta joins
+  every request's `anthropic-beta`.
+- A reply's `input_transformations` show on every assistant message's
+  `message.input_transformations` and on the `stream_event` `message_start`.
+
+**S17 (`WEB_SEARCH_COUNT_SOURCE = 'resultDelta'`).**
+- WebSearch runs a nested request: class `auxiliary`, the session model,
+  `tools: [{type: "web_search_20250305", name: "web_search", max_uses: 8}]`.
+- The nested reply reported `web_search_requests: 3`. That 3 appears only in
+  the result's `modelUsage[model].webSearchRequests`.
+- PostToolUse's `tool_response` is `{query, results, durationSeconds,
+  searchCount}`, with `searchCount: 1`: it counts the reply's
+  `server_tool_use` blocks (the fake sends one), not billed searches.
+
+### Environment
+
+- **`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`** (in Task 16's `buildEnv`) makes the
+  CLI refuse to start: "bubblewrap is required for subprocess env scrubbing
+  and isolation". The harness leaves it out.
+- **A host must end its input and wait for the stream to end before it
+  reports closed.** In an exploratory run, `query.close()` called while the
+  input was still open returned before the CLI's graceful exit had written
+  its `cost-state` to the store. A resume opened at once loaded the
+  transcript without it, and the entry landed afterwards. The harness's
+  `close()` ends the input, waits for the stream to end, then calls
+  `close()`; S6 resumes straight after it and found the entry every time.
+
+### Contract and gateway amendments (Step 5)
+
+Applied to `docs/plans/phase-1-lean-chat.md`:
+
+- **Global Constraints, web tools (S21):** restated for `resultDelta` from
+  S17's numbers. The hook counts each call as 1 until `turn_result` corrects
+  the session count, so a turn runs at most 3 calls of up to `max_uses: 8`.
+  The worst case is **24 searches a turn ($0.24)**, and **36 a session
+  ($0.36)**: 12 counted searches, then 3 calls of 8.
+- **C2:** `HostSpec.resume.baseline_totals` stays optional, because
+  `TOTALS_ENTRY_TYPE` is not null. A note records that it is never the delta
+  baseline (S6). `turn_result.cost_basis` stays, because `COST_BASIS_FIELD`
+  is not null. `MODEL_SWITCH_SIGNAL` and `CONTEXT_DELIVERY` change nothing in
+  C2 or Core.
+- **C4:** unchanged.
+- **C7:** S1 passed, so `luma_conductor_resume_prefix_changed_total` is not
+  added, and the idle default stays 10. `luma_conductor_thinking_dropped_total`
+  is no longer conditional, because S16 shows `input_transformations`.
+
+The gateway config (`test/gateway/agentgateway.yaml`):
+
+- **Routes unchanged.** `CLI_PATHS` is one of the two documented paths.
+  `count_tokens` stays routed for `getContextUsage({detail: 'full'})`.
+- **`request_class`'s provisional `^[a-z_]{1,32}\z` became the exact set**
+  `v in ["main", "auxiliary", "compaction", "subagent"]`.
+- `TestUnknownLabelValuesBecomeOther` checks the four kept and `title`,
+  `Main` mapped to `other`.
+- `nix develop -c make gateway-spike` then passed every test again
+  (217.7 s, 2026-10-21).
+
+### Consequences for later tasks
+
+Not applied here; they need the plan's owner:
+
+1. **Task 16 `buildEnv`.**
+   - Drop `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`, or install bubblewrap in the
+     image. With no shell or file tools there is no subprocess to scrub.
+   - Add `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`, or a background deep-think
+     ends the turn early and starts turns Core never sent.
+   - Add `ANTHROPIC_BETAS=thinking-binding-controls-2026-08-01` (S16).
+2. **Task 16 options.** Drop `precomputeCompactionEnabled` (S7).
+3. **Task 17/19b baseline.** The baseline is the latest `cost-state` of the
+   loaded transcript, else zero. It is never `spec.resume.baseline_totals`:
+   that gives negative deltas after a SIGKILL, and undercounts when a session
+   never closed cleanly.
+4. **Task 18.**
+   - The SessionStart hook is off (`first-user-turn`). Its `compact` source
+     does work, if Task 19b prefers it for re-injection.
+   - The subagent lock must also refuse `run_in_background: true`, unless
+     item 1's env var is set.
+   - Search counting per S21.
+5. **Task 19a errors.** Every API failure is a `success` result with
+   `is_error: true`. Map on `api_error_status` and the text (429 →
+   `rate_limited`, 529 → `overloaded` via status, not via the assistant's
+   `server_error`). The binding 400 never reaches the SDK.
+6. **Task 19b paths.**
+   - A resumed CLI's local transcript lives in the SDK's
+     `claude-resume-<uuid>` temp dir under the conductor's `TMPDIR`, not in
+     `config/<ref>/projects/<root>`. The SDK deletes it on `close()`. P18's
+     cleanup of `<sdk_session_id>.jsonl` applies to fresh sessions only.
+   - `TMPDIR` (an in-memory emptyDir) must have room for the largest
+     transcript.
+7. **Deploy plan and Task 26b, alerts.** Each auto-compaction costs one
+   main-class binding 400 (S4), and every other 400 is sent twice (S11). The
+   "main-class 400" thinking alert will fire on compactions unless it allows
+   for them. The 400 carries `x-claude-code-context-compacted: auto`, which
+   the metrics do not label today.
+8. **Task 26b smokescreen.**
+   - WebFetch needs `api.anthropic.com:443` through the egress proxy for its
+     domain check, or `skipWebFetchPreflight: true` (S12). Otherwise every
+     WebFetch fails.
+   - The check sends each fetched domain to Anthropic, which already sees the
+     URL.

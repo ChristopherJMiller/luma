@@ -43,6 +43,7 @@ Everything runs inside the flake: `nix develop -c make <target>`.
 | `build`, `images`, `chart-test` | build, images, chart render tests |
 | `e2e`, `e2e-up`, `e2e-down` | the kind suite and its cluster |
 | `gateway-spike`, `sdk-spike`, `transcript-fixture` | Spike G, Spike S, the synthetic CLI transcript |
+| `fakeanthropic` | build `bin/fakeanthropic` (Spike S and the conductor's integration tests run it) |
 
 Targets that later tasks fill print "not yet implemented (Task N)" and succeed.
 CI (`.github/workflows/ci.yml`) runs `make` targets in the same shell; `ci-ok`
@@ -89,11 +90,31 @@ Decided in the phase-1 plan; the design doc does not describe them.
 - **Smart and deep default to `medium` effort.** `models.yaml` keeps `low`
   for the fast tier only; the spec says `low` for chat (section 6). This is
   the plan's C5 choice; Spike S15 and live spike L4 inform any change.
-- **The context fallback is the conductor's.** If Spike S5 shows SessionStart
-  `additionalContext` does not land as specified, the fenced profile opens a
-  fresh session's first user turn and is re-injected after each compaction by
-  the conductor (Task 19b), not by Core (section 6): only the conductor sees
-  the SDK's `compact_boundary`.
+- **The context fallback is the conductor's, and it is taken.** Spike S5
+  showed that an SDK SessionStart callback never runs for `startup`, `resume`
+  or `fork` (it does for `compact`), so `CONTEXT_DELIVERY = 'first-user-turn'`:
+  the fenced profile opens a fresh session's first user turn and is
+  re-injected after each compaction by the conductor (Task 19b), not by Core
+  (section 6): only the conductor sees the SDK's `compact_boundary`.
+- **Spike S's other taken branches** (`conductor/src/spike-results.ts`,
+  `docs/spikes/phase-1.md` section S):
+  - **Model switches are read from replies.** The refusal fixture switches no
+    model and `PostModelSwitch` fires only for `setModel()`, so
+    `MODEL_SWITCH_SIGNAL = 'assistantModelField'`: Task 19a emits
+    `model_switched` when a main-loop reply's `message.model` differs.
+  - **Search counts come from the result.** `WEB_SEARCH_COUNT_SOURCE =
+    'resultDelta'` (S17): PostToolUse counts each WebSearch call as 1 and
+    `turn_result` sets the true count, so the worst case is 24 searches a turn
+    and 36 a session (S21, Global Constraints).
+  - **`precomputeCompactionEnabled` is dropped.** It is in the SDK's
+    `Settings` type but changed no request (S7), so Task 16's inline settings
+    are `{switchModelsOnFlag: true, idleCompaction: false}`.
+  - **Dropped thinking is counted.** The SDK exposes `input_transformations`
+    (S16), so Task 16 sets `ANTHROPIC_BETAS=thinking-binding-controls-2026-08-01`
+    and Task 19a counts `luma_conductor_thinking_dropped_total`.
+  - **Cold resumes are inferred.** Nothing in band marks one
+    (`SLO_SIGNALS.coldResume = null`); the conductor compares the idle gap
+    with the cache TTL (Task 19b).
 - **`deep` is hidden in the PWA.** The new-chat menu offers Fast and Smart
   only. The spec lets admins pick `deep` (section 5.1), and Core still accepts
   it from an admin through the API; escalation in the UI is `deep-think`

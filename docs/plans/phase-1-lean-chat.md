@@ -81,9 +81,9 @@ Every task's requirements include these. Values are copied from the spec. *(plan
   - Core counts main requests over 100K input.
 - **Effort:** `low` for chat, with `<luma-now>` as appended context and guidance on when to search. Subagents get explicit effort. Phase 1 ships **no mid-session effort control**; live spike L4 informs phase 2 *(plan)*.
 - **Web tools:**
-  - The caps count **searches, not calls**: 3 per turn and 15 per session, counted from PostToolUse or the result's `webSearchRequests` (Spike S17).
-  - One WebSearch call can run `max_uses: 8`, so the worst case is 10 searches a turn ($0.10) and 22 a session ($0.22).
-  - **These bounds hold for `WEB_SEARCH_COUNT_SOURCE = 'postToolUse'` (S21).** With `resultDelta`, the hook counts each call as 1 until `turn_result` sets the true count, so the per-turn cap allows one WebSearch call after the 2nd counted search, and the worst case becomes 3 calls × `max_uses` a turn. Task 4 Step 5 then restates both worst-case figures here from S17's numbers.
+  - The caps count **searches, not calls**: 3 per turn and 15 per session. Spike S17 found `WEB_SEARCH_COUNT_SOURCE = 'resultDelta'`: the true count is the result's `webSearchRequests` delta, and PostToolUse carries none (its `searchCount` counts the reply's `server_tool_use` blocks).
+  - One WebSearch call can run `max_uses: 8` (S17: the nested request's `web_search_20250305` tool).
+  - **Worst case under `resultDelta` (S21, restated by Task 4 Step 5).** The hook counts each call as 1 until `turn_result` sets the session's true count, so a turn runs at most 3 calls: **24 searches a turn ($0.24)**. A session can reach 12 counted searches and then run one more turn of 3 calls: **36 a session ($0.36)**. (Under `postToolUse` it would have been 10 a turn and 22 a session.)
   - WebFetch must pass the URL guard (Task 18), then goes through smokescreen (`HTTPS_PROXY`).
 - **CLI:** CLI ≥ 2.1.268, and the SDK and CLI are pinned exactly. Renovate groups their bumps **weekly** with a **3-day** minimum age, behind the eval gate. The CLI lives in its own final image layer.
 - **SDK issues to design around:** #348 (keep the input iterable open), #391 (one long-lived query; `pathToClaudeCodeExecutable`), #268 (never `listSessions`), #370 (MCP proxies as a local **HTTP** server), #289 (large-session resume test), #432 (no `cache_control` in streamed user messages), #378 (a stream outlives its bearer; phase 1 uses static gateway bearers).
@@ -324,7 +324,7 @@ Core accepts `event` and `rpc` only for a session opened **on this link**, and o
 - `tool_started{tool_use_id, name, summary}`, `tool_finished{tool_use_id, is_error, summary?}` (summaries per C1's rules)
 - `main_request_usage{api_message_id, model, slo_exclusion:"none"|"first"|"cold_resume"|"post_compaction", input, cache_read, cache_creation}`
 - `model_switched{from, to}`
-- `turn_result{sdk_uuid, content: MessagePart[], usage: TurnUsage, totals: Totals, cost_basis: string|null}`: Core persists `totals` as `sessions.last_totals` (S2)
+- `turn_result{sdk_uuid, content: MessagePart[], usage: TurnUsage, totals: Totals, cost_basis: string|null}`: Core persists `totals` as `sessions.last_totals` (S2). `cost_basis` comes from the result's `modelUsage[model].costBasis` (Spike S6: `list`, `managed` or `unknown`, per model)
 - `error{code, retryable, detail?: "thinking_binding"}`: Core increments `luma_thinking_binding_errors_total` on `detail: "thinking_binding"` (S16)
 
 **Usage types:**
@@ -341,6 +341,7 @@ Core accepts `event` and `rpc` only for a session opened **on this link**, and o
 - `workspace` is the session's **`api_workspace`** (the gateway route and Anthropic workspace), not the sandbox `workspace`, which is `none` in phase 1 (S5).
 - `helper_model` is the session's stored `helper_model` (S11). `profile_context` is the stored `profile_snapshot`, already fenced (S13).
 - `resume` is set on **every** `host.open` of a session with an `sdk_session_id`: `{sdk_session_id, baseline_totals: last_totals}`, plus `fork` for a fork's first open (Task 11). It is null only for a fresh session (S2).
+- `baseline_totals` stays optional (Spike S6 found `TOTALS_ENTRY_TYPE = 'cost-state'`), and it is **never the host's delta baseline**. The baseline is the latest `cost-state` entry of the transcript the host loads, or zero when there is none. A SIGKILL writes no `cost-state`, so the CLI restores the one from before the kill: Core's last totals would make the next delta negative, and would undercount a session killed before its first clean close.
 
 **AgentSpec** (the compiled output of `agents.Compile`):
 ```
@@ -489,7 +490,7 @@ The registries are created **before their first users** (S3): every Core descrip
 - `luma_conductor_hosts{state=starting|ready|running}`, `luma_conductor_cli_rss_bytes` (summed over CLIs);
 - `luma_conductor_cli_spawns_total{reason=start|resume|fork}`, `luma_conductor_mirror_errors_total`;
 - `luma_conductor_web_search_denied_total{scope=turn|session}`, `luma_conductor_webfetch_denied_total{reason}`, `luma_conductor_subagent_denied_total`;
-- `luma_conductor_cli_stderr_bytes_total`, and `luma_conductor_thinking_dropped_total` when S16 shows `input_transformations`.
+- `luma_conductor_cli_stderr_bytes_total`, and `luma_conductor_thinking_dropped_total` (Spike S16 shows `input_transformations`).
 
 ### C8. Chart values (each image is `{repository, tag, digest}`; `tag` defaults to appVersion). The "Rendered as" column is the contract with the deploy plan.
 

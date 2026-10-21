@@ -65,8 +65,9 @@ consumer drops one with
 
 `config.metrics.fields.add` labels every metric with `person`, `agent`,
 `tier`, `source` and `request_class`, each from its header when the value is
-in the label's fixed set and `other` otherwise. The `request_class` pattern
-is provisional until Task 4 Step 5.
+in the label's fixed set and `other` otherwise. `request_class`'s set is
+`main`, `auxiliary`, `compaction` and `subagent`: every class the pinned CLI
+sent in Spike S (`REQUEST_CLASSES` in `conductor/src/spike-results.ts`).
 
 The whole file goes through shellexpand, comments included, so it holds no
 dollar sign except the two bearer variables. The CEL patterns anchor their

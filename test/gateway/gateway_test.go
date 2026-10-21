@@ -1218,6 +1218,30 @@ func TestUnknownLabelValuesBecomeOther(t *testing.T) {
 	if len(s) != 1 || s[0].labels["tier"] != "other" || s[0].labels["person"] != "u_5197000017" {
 		t.Errorf("a repeated x-luma-tier: %v, want one sample with tier other", s)
 	}
+
+	// request_class keeps exactly the classes the pinned CLI sends (Spike S9:
+	// REQUEST_CLASSES in conductor/src/spike-results.ts), and nothing else.
+	for i, c := range []struct{ sent, want string }{
+		{"main", "main"},
+		{"auxiliary", "auxiliary"},
+		{"compaction", "compaction"},
+		{"subagent", "subagent"},
+		{"title", "other"},
+		{"Main", "other"},
+	} {
+		agent := fmt.Sprintf("labels-spike-class-%d", i)
+		hd = cliHeaders(interactive.bearer, "u_5197000018")
+		hd.Set("X-Luma-Agent", agent)
+		hd.Set("X-Claude-Code-Request-Class", c.sent)
+		resp = post(t, "/interactive/v1/messages", hd, simpleBody("Class.", false))
+		if b := readAll(t, resp); resp.StatusCode != http.StatusOK {
+			t.Fatalf("status %d: %s", resp.StatusCode, b)
+		}
+		s = metric(t, "agentgateway_requests_total", map[string]string{"agent": agent})
+		if len(s) != 1 || s[0].labels["request_class"] != c.want {
+			t.Errorf("x-claude-code-request-class %q: %v, want one sample with request_class %s", c.sent, s, c.want)
+		}
+	}
 }
 
 // selfSignedLeaf is a valid server certificate for name that signs itself:

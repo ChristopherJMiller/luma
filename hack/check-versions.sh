@@ -6,7 +6,13 @@
 #   2. the Dockerfile's `golang:` and `node:` base images have the flake's
 #      Go and Node minors (skipped while there is no Dockerfile);
 #   3. the Agent SDK is 0.3.N and the Claude Code CLI 2.1.N, with the same N
-#      (skipped while there is no conductor/package.json).
+#      (skipped while there is no conductor/package.json);
+#   4. pnpm-lock.yaml resolves exactly those pins: every
+#      @anthropic-ai/claude-code* package (the CLI and its platform binaries)
+#      at the direct CLI pin, and every @anthropic-ai/claude-agent-sdk*
+#      package (the SDK and its optional platform packages, each of which
+#      bundles a CLI binary) at the SDK pin, so no second CLI version can
+#      ride in (S19).
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -67,6 +73,33 @@ if [[ -f $pkg ]]; then
 		elif [[ ${BASH_REMATCH[1]} != "$sdk_n" ]]; then
 			report "$pkg: SDK 0.3.$sdk_n and CLI $cli must share the same N"
 		fi
+	fi
+
+	# 4. The lockfile. `packages` keys are "<name>@<version>"; importer
+	# versions may carry a "(peer…)" suffix, which is not part of the version.
+	lock=pnpm-lock.yaml
+	locked=$(yq '.importers.conductor.dependencies["@anthropic-ai/claude-code"].version // ""' "$lock")
+	if [[ $locked != "$cli" ]]; then
+		report "$lock: conductor resolves @anthropic-ai/claude-code '$locked', but $pkg pins '$cli'"
+	fi
+	locked=$(yq '.importers.conductor.dependencies["@anthropic-ai/claude-agent-sdk"].version // ""' "$lock")
+	if [[ ${locked%%(*} != "$sdk" ]]; then
+		report "$lock: conductor resolves @anthropic-ai/claude-agent-sdk '${locked%%(*}', but $pkg pins '$sdk'"
+	fi
+	found_cli=0
+	while read -r key; do
+		name=${key%@*} version=${key##*@}
+		case $name in
+		@anthropic-ai/claude-code | @anthropic-ai/claude-code-*) want=$cli found_cli=$((found_cli + 1)) ;;
+		@anthropic-ai/claude-agent-sdk | @anthropic-ai/claude-agent-sdk-*) want=$sdk ;;
+		*) continue ;;
+		esac
+		if [[ $version != "$want" ]]; then
+			report "$lock: $name resolves to $version, not the pinned $want"
+		fi
+	done < <(yq '.packages | keys | .[]' "$lock")
+	if ((found_cli == 0)); then
+		report "$lock: no @anthropic-ai/claude-code package is locked"
 	fi
 fi
 

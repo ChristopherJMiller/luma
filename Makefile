@@ -142,9 +142,13 @@ AGENTGATEWAY_IMAGE ?= ghcr.io/agentgateway/agentgateway:v1.6.0@sha256:9d3e6044dd
 gateway-spike: ## Spike G: agentgateway passthrough (docker; host ports 8080, 15000, 15020, 15021; ~4 min).
 	AGENTGATEWAY_IMAGE='$(AGENTGATEWAY_IMAGE)' go test $(GO_TEST_FLAGS) -tags gateway -timeout 15m -v ./test/gateway/
 
+.PHONY: fakeanthropic
+fakeanthropic: ## Build the fake Messages API binary (bin/fakeanthropic).
+	go build -o bin/fakeanthropic ./test/fakeanthropic/cmd/fakeanthropic
+
 .PHONY: sdk-spike
-sdk-spike: ## Spike S: Agent SDK behaviour against the fake.
-	@echo "sdk-spike: not yet implemented (Task 4)"
+sdk-spike: fakeanthropic ## Spike S: the pinned Agent SDK and CLI against the fake (offline, no key; ~1 min).
+	pnpm --filter conductor exec vitest run -c vitest.spike.config.ts
 
 .PHONY: transcript-fixture
 transcript-fixture: ## Regenerate the synthetic CLI transcript fixture.

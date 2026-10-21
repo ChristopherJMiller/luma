@@ -25,14 +25,14 @@ config:
       # Each label is its header only when the value is in the label's fixed
       # set; anything else, a missing or repeated header included, is
       # "other". `\z` anchors the end: a dollar sign would be shell-expanded.
-      # request_class is provisional: Task 4 Step 5 narrows it to the set
-      # Spike S9 records.
+      # request_class is the set of classes the pinned CLI sends (Spike S9,
+      # REQUEST_CLASSES in conductor/src/spike-results.ts).
       add:
         person: 'default(request.headers.join()["x-luma-person"], "").with(v, v.matches("^u_[0-9a-f]{10}\\z") ? v : "other")'
         agent: 'default(request.headers.join()["x-luma-agent"], "").with(v, v.matches("^[a-z][a-z0-9-]{0,31}\\z") ? v : "other")'
         tier: 'default(request.headers.join()["x-luma-tier"], "").with(v, v in ["fast", "smart", "deep"] ? v : "other")'
         source: 'default(request.headers.join()["x-luma-source"], "").with(v, v in ["web", "ci"] ? v : "other")'
-        request_class: 'default(request.headers.join()["x-claude-code-request-class"], "").with(v, v.matches("^[a-z_]{1,32}\\z") ? v : "other")'
+        request_class: 'default(request.headers.join()["x-claude-code-request-class"], "").with(v, v in ["main", "auxiliary", "compaction", "subagent"] ? v : "other")'
   # A price overlay, USD per million tokens. The gateway's dollars are
   # informational; the ledger is Core's. A model is listed only with its full
   # rate set (claude-sonnet-5-5 and claude-opus-5-5 are not, yet).
