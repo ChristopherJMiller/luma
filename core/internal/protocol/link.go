@@ -133,7 +133,7 @@ func (f EventFrame) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(eventFrameJSON{f.SessionID, f.TurnID, ev})
+	return marshalTyped(f.FrameType(), eventFrameJSON{f.SessionID, f.TurnID, ev})
 }
 
 // UnmarshalJSON decodes the nested LinkEvent by its type; unknown is an error.
@@ -180,7 +180,7 @@ func newFrame(typ string) LinkFrame {
 
 // EncodeLinkFrame encodes a frame with its type tag.
 func EncodeLinkFrame(f LinkFrame) ([]byte, error) {
-	return marshalTyped(f.FrameType(), f)
+	return json.Marshal(f)
 }
 
 // DecodeLinkFrame decodes one link frame; an unknown type is an error.

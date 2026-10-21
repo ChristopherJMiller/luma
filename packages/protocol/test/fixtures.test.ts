@@ -2,38 +2,110 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
+  AGENT_LIST_SHAPE,
+  AGENT_SUMMARY_SHAPE,
+  ATTACHMENT_SHAPE,
+  CREATE_SESSION_SHAPE,
   ERROR_COPY,
+  ERROR_INFO_SHAPE,
+  EVAL_RUN_SHAPE,
+  EVAL_SPEC_SHAPE,
+  FORK_REQUEST_SHAPE,
   MAX_ATTACHMENT_BYTES,
+  MAX_IMAGE_LONG_EDGE,
+  MAX_IMAGE_MEGAPIXELS,
+  MAX_PROFILE_BYTES,
+  MAX_TOOL_URL_LENGTH,
+  MAX_TREE_ATTACHMENT_BYTES,
+  MEMORY_WRITE_SHAPE,
+  ME_SHAPE,
+  PROFILE_SHAPE,
+  PROFILE_UPDATE_SHAPE,
+  SEND_RESULT_SHAPE,
+  SESSION_LIST_SHAPE,
+  SESSION_PATCH_SHAPE,
+  SESSION_SHAPE,
+  TREE_SHAPE,
+  USAGE_RECONCILIATION_RESULT_SHAPE,
+  USAGE_RECONCILIATION_SHAPE,
+  CLIENT_EVENT_FIELD,
+  EVENT_FIELD,
+  LINK_FRAME_FIELD,
   decodeClientEvent,
   decodeEvent,
+  decodeLinkEvent,
   decodeLinkFrame,
 } from '../src/index'
-import type {
-  AgentList,
-  AgentSummary,
-  Attachment,
-  CreateSession,
-  ErrorInfo,
-  EvalRun,
-  EvalSpec,
-  ForkRequest,
-  MemoryWrite,
-  Me,
-  Profile,
-  ProfileUpdate,
-  SendResult,
-  Session,
-  SessionList,
-  SessionPatch,
-  Tree,
-  UsageReconciliation,
-  UsageReconciliationResult,
-} from '../src/index'
+import type { RuntimeField } from '../src/index'
 
 const root = join(import.meta.dirname, '..', '..', '..', 'protocol', 'fixtures')
 
 function load(sub: string, file: string): unknown {
   return JSON.parse(readFileSync(join(root, sub, file), 'utf8'))
+}
+
+const obj = (shape: object): RuntimeField => ({ k: 'obj', shape: shape as Record<string, RuntimeField> })
+
+// A strict walker, independent of the runtime decoder: every key a shape
+// lists is present (unless optional), no key outside the shape is, and every
+// value has its kind. Returns the problems found.
+function strictWalk(v: unknown, f: RuntimeField, path: string, errs: string[] = []): string[] {
+  if (v === null) {
+    if (!f.nullable) errs.push(`${path}: null`)
+    return errs
+  }
+  const isObject = typeof v === 'object' && !Array.isArray(v)
+  const record = (): Record<string, unknown> => v as Record<string, unknown>
+  switch (f.k) {
+    case 'str':
+      if (typeof v !== 'string') errs.push(`${path}: not a string`)
+      break
+    case 'num':
+      if (typeof v !== 'number') errs.push(`${path}: not a number`)
+      break
+    case 'bool':
+      if (typeof v !== 'boolean') errs.push(`${path}: not a boolean`)
+      break
+    case 'lit':
+      if (v !== f.value) errs.push(`${path}: not ${f.value}`)
+      break
+    case 'arr':
+      if (!Array.isArray(v)) errs.push(`${path}: not an array`)
+      else v.forEach((x, i) => strictWalk(x, f.of as RuntimeField, `${path}[${i}]`, errs))
+      break
+    case 'map':
+      if (!isObject) errs.push(`${path}: not an object`)
+      else for (const [k, x] of Object.entries(record())) strictWalk(x, f.of as RuntimeField, `${path}.${k}`, errs)
+      break
+    case 'obj':
+    case 'union': {
+      if (!isObject) {
+        errs.push(`${path}: not an object`)
+        break
+      }
+      const o = record()
+      let shape = f.shape
+      if (f.k === 'union') {
+        const tag = o['type']
+        shape = typeof tag === 'string' ? f.variants?.[tag] : undefined
+        if (!shape) {
+          errs.push(`${path}: unknown type ${String(tag)}`)
+          break
+        }
+      }
+      const fields = shape as Record<string, RuntimeField>
+      for (const [key, field] of Object.entries(fields)) {
+        if (!(key in o)) {
+          if (!field.opt) errs.push(`${path}: missing ${key}`)
+          continue
+        }
+        strictWalk(o[key], field, `${path}.${key}`, errs)
+      }
+      for (const key of Object.keys(o)) if (!(key in fields)) errs.push(`${path}: unexpected ${key}`)
+      break
+    }
+  }
+  return errs
 }
 
 // [file, wire type]: the discriminator each hand-written fixture must carry.
@@ -65,7 +137,10 @@ const frames: [string, string][] = [
   ['host-close.json', 'host.close'],
   ['tree-purge.json', 'tree.purge'],
   ['rpc-result-applied.json', 'rpc.result'],
+  ['rpc-result-full.json', 'rpc.result'],
   ['rpc-result-rejected.json', 'rpc.result'],
+  ['rpc-result-pending.json', 'rpc.result'],
+  ['rpc-result-disabled.json', 'rpc.result'],
   ['rpc-result-error.json', 'rpc.result'],
   ['shutdown.json', 'shutdown'],
   ['hello.json', 'hello'],
@@ -86,52 +161,41 @@ const frames: [string, string][] = [
   ['rpc.json', 'rpc'],
 ]
 
-// A body with no `type`: its top-level keys, required then optional. Each key
-// is checked against the TS type, so a fixture key the type lacks cannot be
-// listed, and an exact-key fixture ties the type to the file.
-interface Plain {
-  file: string
-  required: readonly string[]
-  optional: readonly string[]
-}
-function plain<T>(file: string, required: readonly (keyof T & string)[], optional: readonly (keyof T & string)[] = []): Plain {
-  return { file, required, optional }
-}
-
-const clientPlain: Plain[] = [
-  plain<CreateSession>('create-session.json', ['agent', 'params']),
-  plain<CreateSession>('create-session-minimal.json', ['agent', 'params']),
-  plain<Session>('session.json', ['id', 'root_id', 'parent_id', 'fork_at_message_id', 'agent_id', 'agent_version', 'title', 'tier', 'model', 'effort', 'incognito', 'workspace', 'source', 'status', 'tainted', 'archived_at', 'created_at', 'updated_at', 'last_activity_at']),
-  plain<SessionList>('session-list.json', ['sessions'], ['next']),
-  plain<SessionPatch>('session-patch.json', ['title']),
-  plain<ForkRequest>('fork-request.json', ['at_message']),
-  plain<SendResult>('send-result.json', [], ['message']),
-  plain<Tree>('tree.json', ['messages', 'head_id', 'last_event_ids', 'pending_writes']),
-  plain<Tree>('tree-empty.json', ['messages', 'head_id', 'last_event_ids', 'pending_writes']),
-  plain<Attachment>('attachment.json', ['id', 'media_type', 'filename', 'size_bytes'], ['width', 'height', 'pages']),
-  plain<Attachment>('attachment-pdf.json', ['id', 'media_type', 'filename', 'size_bytes'], ['width', 'height', 'pages']),
-  plain<Profile>('profile.json', ['content', 'version', 'updated_at', 'pending']),
-  plain<ProfileUpdate>('profile-update.json', ['content', 'version']),
-  plain<MemoryWrite>('memory-write.json', ['id', 'session_id', 'turn_id', 'op', 'text', 'matched', 'untrusted', 'status', 'created_at', 'decided_at']),
-  plain<Me>('me.json', ['person', 'budget', 'maintenance']),
-  plain<AgentSummary>('agent-summary.json', ['id', 'name', 'description', 'tiers', 'default_tier']),
-  plain<AgentList>('agent-list.json', ['agents']),
-  plain<ErrorInfo>('error-info.json', ['code', 'message']),
+// Bodies with no `type`: file and the shape it must match.
+const clientPlain: [string, RuntimeField][] = [
+  ['create-session.json', obj(CREATE_SESSION_SHAPE)],
+  ['create-session-minimal.json', obj(CREATE_SESSION_SHAPE)],
+  ['session.json', obj(SESSION_SHAPE)],
+  ['session-list.json', obj(SESSION_LIST_SHAPE)],
+  ['session-patch.json', obj(SESSION_PATCH_SHAPE)],
+  ['fork-request.json', obj(FORK_REQUEST_SHAPE)],
+  ['send-result.json', obj(SEND_RESULT_SHAPE)],
+  ['tree.json', obj(TREE_SHAPE)],
+  ['tree-empty.json', obj(TREE_SHAPE)],
+  ['attachment.json', obj(ATTACHMENT_SHAPE)],
+  ['attachment-pdf.json', obj(ATTACHMENT_SHAPE)],
+  ['profile.json', obj(PROFILE_SHAPE)],
+  ['profile-update.json', obj(PROFILE_UPDATE_SHAPE)],
+  ['memory-write.json', obj(MEMORY_WRITE_SHAPE)],
+  ['me.json', obj(ME_SHAPE)],
+  ['agent-summary.json', obj(AGENT_SUMMARY_SHAPE)],
+  ['agent-list.json', obj(AGENT_LIST_SHAPE)],
+  ['error-info.json', obj(ERROR_INFO_SHAPE)],
 ]
 
-const internalPlain: Plain[] = [
-  plain<EvalSpec>('eval-spec.json', ['agent', 'helper_model', 'timezone', 'webfetch_deny_domains']),
-  plain<EvalRun>('eval-run.json', ['suite', 'sdk_version', 'cli_version', 'image', 'started_at', 'finished_at', 'passed', 'failed', 'cost_usd', 'results']),
-  plain<UsageReconciliation>('usage-reconciliation.json', ['day', 'workspaces']),
-  plain<UsageReconciliationResult>('usage-reconciliation-result.json', ['workspaces']),
+const internalPlain: [string, RuntimeField][] = [
+  ['eval-spec.json', obj(EVAL_SPEC_SHAPE)],
+  ['eval-run.json', obj(EVAL_RUN_SHAPE)],
+  ['usage-reconciliation.json', obj(USAGE_RECONCILIATION_SHAPE)],
+  ['usage-reconciliation-result.json', obj(USAGE_RECONCILIATION_RESULT_SHAPE)],
 ]
 
 const listed = (sub: string): string[] => {
   if (sub === 'client') {
-    return [...events, ...clientEvents].map(([f]) => f).concat(clientPlain.map((p) => p.file))
+    return [...events, ...clientEvents].map(([f]) => f).concat(clientPlain.map(([f]) => f))
   }
   if (sub === 'link') return frames.map(([f]) => f)
-  return internalPlain.map((p) => p.file)
+  return internalPlain.map(([f]) => f)
 }
 
 describe('round-trips every fixture', () => {
@@ -140,6 +204,7 @@ describe('round-trips every fixture', () => {
       const raw = load('client', file)
       const e = decodeEvent(raw)
       expect(e.type).toBe(type)
+      expect(strictWalk(raw, EVENT_FIELD, 'event')).toEqual([])
       expect(JSON.parse(JSON.stringify(e))).toEqual(raw)
     })
   }
@@ -148,6 +213,7 @@ describe('round-trips every fixture', () => {
       const raw = load('client', file)
       const e = decodeClientEvent(raw)
       expect(e.type).toBe(type)
+      expect(strictWalk(raw, CLIENT_EVENT_FIELD, 'client event')).toEqual([])
       expect(JSON.parse(JSON.stringify(e))).toEqual(raw)
     })
   }
@@ -156,16 +222,15 @@ describe('round-trips every fixture', () => {
       const raw = load('link', file)
       const f = decodeLinkFrame(raw)
       expect(f.type).toBe(type)
+      expect(strictWalk(raw, LINK_FRAME_FIELD, 'frame')).toEqual([])
       expect(JSON.parse(JSON.stringify(f))).toEqual(raw)
     })
   }
   for (const [sub, list] of [['client', clientPlain], ['internal', internalPlain]] as const) {
-    for (const p of list) {
-      it(`${sub}/${p.file}`, () => {
-        const raw = load(sub, p.file) as Record<string, unknown>
-        const keys = Object.keys(raw)
-        for (const k of p.required) expect(keys, `${p.file} lacks ${k}`).toContain(k)
-        for (const k of keys) expect([...p.required, ...p.optional], `${p.file} has unexpected ${k}`).toContain(k)
+    for (const [file, shape] of list) {
+      it(`${sub}/${file}`, () => {
+        const raw = load(sub, file)
+        expect(strictWalk(raw, shape, file)).toEqual([])
         expect(JSON.parse(JSON.stringify(raw))).toEqual(raw)
       })
     }
@@ -181,20 +246,90 @@ describe('fixture table', () => {
   }
 })
 
+// The walker and the decoder must be able to fail, or the tests above prove
+// nothing. Each case mutates a deep clone of a real fixture.
+describe('shapes catch drift', () => {
+  const clone = (x: unknown): any => JSON.parse(JSON.stringify(x))
+
+  it('the walker finds an extra key, a missing key, a wrong kind and a bad nullable, deep', () => {
+    const base = load('link', 'host-open.json')
+
+    const extra = clone(base)
+    extra.spec.agent.limits.surprise = 1
+    expect(strictWalk(extra, LINK_FRAME_FIELD, 'f')).toEqual(['f.spec.agent.limits: unexpected surprise'])
+
+    const missing = clone(base)
+    delete missing.spec.agent.tier_binding.pdf_max_pages
+    expect(strictWalk(missing, LINK_FRAME_FIELD, 'f')).toEqual(['f.spec.agent.tier_binding: missing pdf_max_pages'])
+
+    const kind = clone(base)
+    kind.spec.agent.subagents['deep-think'].tools = 'none'
+    expect(strictWalk(kind, LINK_FRAME_FIELD, 'f')).toEqual(['f.spec.agent.subagents.deep-think.tools: not an array'])
+
+    const nul = clone(base)
+    nul.spec.person.ref = null
+    expect(strictWalk(nul, LINK_FRAME_FIELD, 'f')).toEqual(['f.spec.person.ref: null'])
+
+    const part = clone(load('client', 'event-message-completed.json'))
+    part.message.content[0].type = 'video'
+    expect(strictWalk(part, EVENT_FIELD, 'e')).toEqual(['e.message.content[0]: unknown type video'])
+  })
+
+  it('the decoders reject a missing nested key, a wrong kind and a wrong nested type tag', () => {
+    const missing = clone(load('link', 'host-open.json'))
+    delete missing.spec.agent.limits.max_turns
+    expect(() => decodeLinkFrame(missing)).toThrow(/limits: missing key max_turns/)
+
+    const kind = clone(load('link', 'turn-send.json'))
+    kind.untrusted = 'yes'
+    expect(() => decodeLinkFrame(kind)).toThrow(/untrusted: expected boolean/)
+
+    const block = clone(load('link', 'turn-send.json'))
+    block.content[1].type = 'audio'
+    expect(() => decodeLinkFrame(block)).toThrow(/unknown type audio/)
+
+    const nul = clone(load('client', 'event-message-completed.json'))
+    nul.message.turn_id = null
+    expect(() => decodeEvent(nul)).toThrow(/turn_id: unexpected null/)
+
+    const result = clone(load('link', 'event-turn-result.json'))
+    delete result.event.totals.models['claude-haiku-5-5'].cost_usd
+    expect(() => decodeLinkFrame(result)).toThrow(/missing key cost_usd/)
+  })
+
+  it('the decoders ignore unknown keys, at any depth (S37)', () => {
+    const f = clone(load('link', 'host-open.json'))
+    f.added_later = true
+    f.spec.agent.limits.also_later = 1
+    expect(decodeLinkFrame(f).type).toBe('host.open')
+
+    const e = clone(load('client', 'event-message-completed.json'))
+    e.message.content[0].extra = 'x'
+    e.future = 1
+    expect(decodeEvent(e).type).toBe('message.completed')
+  })
+
+  it('decodeLinkEvent checks a bare link event', () => {
+    expect(decodeLinkEvent({ type: 'text_delta', text: 'x' }).type).toBe('text_delta')
+    expect(() => decodeLinkEvent({ type: 'text_delta' })).toThrow(/missing key text/)
+  })
+})
+
 describe('unknown types are rejected', () => {
   it('link frame', () => {
     expect(() => decodeLinkFrame({ type: 'host.explode', session_id: 'x' })).toThrow(/unknown link frame type/)
     expect(() => decodeLinkFrame({ session_id: 'x' })).toThrow()
   })
   it('link event', () => {
-    expect(() => decodeLinkFrame({ type: 'event', session_id: 'x', turn_id: 't', event: { type: 'mystery' } })).toThrow(/unknown link event type/)
+    expect(() => decodeLinkFrame({ type: 'event', session_id: 'x', turn_id: 't', event: { type: 'mystery' } })).toThrow(
+      /unknown type mystery/,
+    )
   })
   it('client event', () => {
     expect(() => decodeEvent({ id: 1, session_id: 'x', type: 'message.vanished', created_at: 'now' })).toThrow(/unknown event type/)
     expect(() => decodeClientEvent({ type: 'user.shout' })).toThrow(/unknown client event type/)
   })
-  it('unexpected and missing keys', () => {
-    expect(() => decodeLinkFrame({ type: 'shutdown', reason: 'x', extra: 1 })).toThrow(/unexpected key extra/)
+  it('a missing top-level key', () => {
     expect(() => decodeLinkFrame({ type: 'shutdown' })).toThrow(/missing key reason/)
   })
 })
@@ -203,7 +338,19 @@ describe('limits', () => {
   it('MAX_ATTACHMENT_BYTES is 20 MiB', () => {
     expect(MAX_ATTACHMENT_BYTES).toBe(20971520)
   })
+  it('every limit equals protocol/fixtures/limits.json, which the Go test also reads', () => {
+    const shared = JSON.parse(readFileSync(join(root, 'limits.json'), 'utf8'))
+    expect({
+      max_attachment_bytes: MAX_ATTACHMENT_BYTES,
+      max_tree_attachment_bytes: MAX_TREE_ATTACHMENT_BYTES,
+      max_image_megapixels: MAX_IMAGE_MEGAPIXELS,
+      max_image_long_edge: MAX_IMAGE_LONG_EDGE,
+      max_tool_url_length: MAX_TOOL_URL_LENGTH,
+      max_profile_bytes: MAX_PROFILE_BYTES,
+    }).toEqual(shared)
+  })
 })
+
 
 // The C3 codes and copy, typed by hand: an intended duplicate of the table.
 const C3: Record<string, string> = {

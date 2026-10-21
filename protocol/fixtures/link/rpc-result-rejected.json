@@ -1,1 +1,1 @@
-{"type": "rpc.result", "rpc_id": "rpc_2", "ok": true, "result": {"status": "full", "code": "memory_full"}}
+{"type": "rpc.result", "rpc_id": "rpc_4", "ok": true, "result": {"status": "rejected", "code": "forget_too_short"}}

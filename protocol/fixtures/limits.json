@@ -1,0 +1,8 @@
+{
+  "max_attachment_bytes": 20971520,
+  "max_tree_attachment_bytes": 20971520,
+  "max_image_megapixels": 40,
+  "max_image_long_edge": 1568,
+  "max_tool_url_length": 2048,
+  "max_profile_bytes": 6000
+}

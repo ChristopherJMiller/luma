@@ -6,7 +6,7 @@
     {"type": "text", "text": "What is on this synthetic photo?"},
     {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
     {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQ="}},
-    {"type": "text", "text": "<luma-now>2026-10-21T09:00:00-07:00</luma-now>"}
+    {"type": "text", "text": "<luma-now>2026-10-21 (Wednesday) 09:00 PDT</luma-now>"}
   ],
   "untrusted": true
 }

@@ -183,11 +183,31 @@ func marshalTyped(typ string, body any) ([]byte, error) {
 // ClientEvent is what a client posts to /v1/sessions/{id}/events.
 type ClientEvent interface{ ClientEventType() string }
 
-// UserMessage is `user.message`. Content holds text blocks only.
+// TextBlock is the only block a client event carries.
+type TextBlock struct {
+	Type string `json:"type"` // "text"
+	Text string `json:"text"`
+}
+
+// UnmarshalJSON rejects any block that is not text.
+func (b *TextBlock) UnmarshalJSON(data []byte) error {
+	type plain TextBlock
+	var v plain
+	if err := json.Unmarshal(data, &v); err != nil {
+		return err
+	}
+	if v.Type != "text" {
+		return fmt.Errorf("protocol: client content block type %q is not text", v.Type)
+	}
+	*b = TextBlock(v)
+	return nil
+}
+
+// UserMessage is `user.message`.
 type UserMessage struct {
-	ClientID      string         `json:"client_id"`
-	Content       []ContentBlock `json:"content"`
-	AttachmentIDs []string       `json:"attachment_ids"`
+	ClientID      string      `json:"client_id"`
+	Content       []TextBlock `json:"content"`
+	AttachmentIDs []string    `json:"attachment_ids"`
 }
 
 // UserInterrupt is `user.interrupt`.
@@ -198,7 +218,7 @@ func (UserInterrupt) ClientEventType() string { return "user.interrupt" }
 
 // EncodeClientEvent encodes a client event with its type tag.
 func EncodeClientEvent(e ClientEvent) ([]byte, error) {
-	return marshalTyped(e.ClientEventType(), e)
+	return json.Marshal(e)
 }
 
 // DecodeClientEvent decodes a client event; an unknown type is an error.

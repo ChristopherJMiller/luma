@@ -1,6 +1,5 @@
 import type { ErrorCode, ErrorInfo } from './errors'
-import { ProtocolError, asObject, checkKeys } from './events'
-import type { ContentBlock, MessagePart, Shape } from './events'
+import type { ContentBlock, MessagePart } from './events'
 
 // ---- Usage ----
 
@@ -274,57 +273,3 @@ export type LinkEvent =
   | TurnResult
   | LinkError
 
-// ---- Decoding ----
-
-type FrameOf<K extends LinkFrame['type']> = Extract<LinkFrame, { type: K }>
-type LinkEventOf<K extends LinkEvent['type']> = Extract<LinkEvent, { type: K }>
-
-const FRAME_SHAPES = {
-  'host.open': { required: ['session_id', 'spec'] },
-  'turn.send': { required: ['session_id', 'turn_id', 'content', 'untrusted'] },
-  'turn.interrupt': { required: ['session_id'] },
-  'host.close': { required: ['session_id', 'reason'] },
-  'tree.purge': { required: ['root_id', 'person_ref'] },
-  'rpc.result': { required: ['rpc_id', 'ok'], optional: ['result', 'error'] },
-  shutdown: { required: ['reason'] },
-  hello: { required: ['conductor_version', 'sdk_version', 'cli_version', 'max_hosts'] },
-  'host.state': { required: ['session_id', 'state'], optional: ['sdk_session_id', 'reason'] },
-  event: { required: ['session_id', 'turn_id', 'event'] },
-  rpc: { required: ['rpc_id', 'session_id', 'turn_id', 'method', 'params'] },
-} satisfies { [K in LinkFrame['type']]: Shape<FrameOf<K>> }
-
-const LINK_EVENT_SHAPES = {
-  message_started: { required: ['model'] },
-  text_delta: { required: ['text'] },
-  tool_started: { required: ['tool_use_id', 'name', 'summary'] },
-  tool_finished: { required: ['tool_use_id', 'is_error'], optional: ['summary'] },
-  main_request_usage: { required: ['api_message_id', 'model', 'slo_exclusion', 'input', 'cache_read', 'cache_creation'] },
-  model_switched: { required: ['from', 'to'] },
-  turn_result: { required: ['sdk_uuid', 'content', 'usage', 'totals', 'cost_basis'] },
-  error: { required: ['code', 'retryable'], optional: ['detail'] },
-} satisfies { [K in LinkEvent['type']]: Shape<LinkEventOf<K>> }
-
-function shapeOf<T extends Record<string, Shape<never>>>(table: T, type: unknown): { required: readonly string[]; optional: readonly string[] } | undefined {
-  if (typeof type !== 'string' || !Object.hasOwn(table, type)) return undefined
-  const s = table[type] as { required: readonly string[]; optional?: readonly string[] }
-  return { required: s.required, optional: s.optional ?? [] }
-}
-
-/** Validates a LinkEvent's envelope and top-level keys; unknown types throw. */
-export function decodeLinkEvent(raw: unknown): LinkEvent {
-  const o = asObject(raw, 'link event')
-  const s = shapeOf(LINK_EVENT_SHAPES, o['type'])
-  if (!s) throw new ProtocolError(`unknown link event type ${String(o['type'])}`)
-  checkKeys(o, String(o['type']), ['type', ...s.required], s.optional)
-  return o as unknown as LinkEvent
-}
-
-/** Validates a LinkFrame's envelope and top-level keys; unknown types throw. */
-export function decodeLinkFrame(raw: unknown): LinkFrame {
-  const o = asObject(raw, 'link frame')
-  const s = shapeOf(FRAME_SHAPES, o['type'])
-  if (!s) throw new ProtocolError(`unknown link frame type ${String(o['type'])}`)
-  checkKeys(o, String(o['type']), ['type', ...s.required], s.optional)
-  if (o['type'] === 'event') decodeLinkEvent(o['event'])
-  return o as unknown as LinkFrame
-}

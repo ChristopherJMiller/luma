@@ -247,7 +247,7 @@ agents/{luma,deep-think}/AGENT.md  agents/luma/evals/*.yaml  agents/deep-think/e
 core/cmd/luma-core/            main.go (serve | maintenance | usage-reconcile | config-check)
 core/internal/{version,config,protocol,agents,store,auth,internalauth,sessions,link,maintenance,attachments,memory,ledger,reconcile,web,janitor,metrics}/
 packages/protocol/src/         TS mirror of core/internal/protocol
-protocol/fixtures/{client,link}/*.json   shared golden frames, hand-written
+protocol/fixtures/{client,link,internal}/*.json   shared golden frames, hand-written
 protocol/fixtures/binding-error.txt      the thinking-binding error substring (S9)
 conductor/src/{main,link,pool,host,options,env,pgconfig,context,hooks,guard,translate,usage,errors,metrics,queue,site,turnstate,coalesce}.ts
 conductor/src/{sessionstore/pg.ts, mcp/server.ts, evals/*.ts}
@@ -290,11 +290,14 @@ The tasks refer to these by name. Each is defined once, here. Task 4 Step 5 may 
 **Types frozen by Task 5** (`core/internal/protocol`, `packages/protocol`, fixtures in `protocol/fixtures/{client,link,internal}`; timestamps are RFC 3339 strings, nullable fields are `null`, never omitted):
 - `Session{id, root_id, parent_id|null, fork_at_message_id|null, agent_id, agent_version, title, tier, model, effort, incognito, workspace:"none", source:"web"|"ci", status, tainted, archived_at|null, created_at, updated_at, last_activity_at}`. `sdk_session_id`, `last_totals`, `helper_model` and the snapshots stay server-side.
 - Request and result bodies the table leaves unnamed: `SessionList{sessions, next?}`, `SessionPatch{title}`, `ForkRequest{at_message}`, `SendResult{message?}`, `ProfileUpdate{content, version}`, `AgentList{agents}`.
-- `ErrorInfo{code, message}` is the body of every REST error and the `error` of `rpc.result`.
+- `ErrorInfo{code, message}` is the body of every REST error and the `error` of `rpc.result`. `message` is the **rendered** C3 copy, placeholders filled (`pdf_too_long` carries its `{max}`).
+- **Containers are never `null` on the wire.** A Go nil slice or map encodes as `[]` / `{}` (a `MarshalJSON` on every type that carries one); `null` is only for fields the contract marks nullable (`parent_id`, `sdk_uuid`, `model`, `matched`, `decided_at`, `archived_at`, `cost_basis`, `resume`, `head_id`...). Every Go frame and client event also writes its own `type`, so `json.Marshal` equals `EncodeLinkFrame`.
+- **Compatibility (S37).** Additive fields are backward-compatible; removals and renames are lockstep. The runtime decoders (Go and TS) reject a missing required key, a wrong kind or an unknown `type`, and **ignore unknown keys** (a service-worker-cached PWA can meet a newer Core; Core and the conductor roll out apart). The tests stay strict against the fixtures (exact keys, at every depth).
+- **TS names.** `Event` shadows the DOM global in any module that imports it: import it as `import type { Event as LumaEvent }`. The `error` event's TS name is `SessionErrorEvent`. A client `user.message` carries `TextBlock[]` (Go `TextBlock`); `ContentBlock` is Core's turn.send input.
 - `BudgetStatus{spent_usd, cap_usd, ratio, warn, exhausted, resets_at}`.
 - `MessagePart`, `ContentBlock` (`text` | `image` | `document` with a base64 `source`; client events carry text only) and `Message` are shared by C1 and C2.
 - Go also exports `ErrorCopy` (the C3 copy) and `MaxTreeAttachmentBytes`, `MaxImageMegapixels`, `MaxImageLongEdge`, `MaxToolURLLength`, `MaxProfileBytes`; TS has the same limits in SCREAMING_CASE.
-- Go decoders: `DecodeEvent`, `DecodeClientEvent`, `DecodeLinkFrame`, `DecodeLinkEvent`; an unknown `type` is an error. TS: `decodeEvent`, `decodeClientEvent`, `decodeLinkFrame`, `decodeLinkEvent` also check top-level keys.
+- Go decoders: `DecodeEvent`, `DecodeClientEvent`, `DecodeLinkFrame`, `DecodeLinkEvent`; an unknown `type` is an error. TS: `decodeEvent`, `decodeClientEvent`, `decodeLinkFrame`, `decodeLinkEvent` check every level against `packages/protocol/src/schema.ts`, whose shapes are `satisfies Spec<T>`: `tsc` (in `make lint`) fails when a TS field and its shape disagree on name, optionality, nullability or kind. Limits live once in `protocol/fixtures/limits.json`, read by both tests.
 
 **ClientEvent:**
 ```
@@ -943,7 +946,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
 ### Task 5: The protocol contracts (Go + TS, shared fixtures)
 
 **Files:**
-- Create: `core/internal/protocol/{events.go,link.go,api.go,internal.go,errors.go,limits.go,fixtures_test.go}`, `packages/protocol/{package.json,tsconfig.json,src/index.ts,src/events.ts,src/link.ts,src/api.ts,src/internal.ts,src/errors.ts,src/limits.ts,test/fixtures.test.ts}`, `protocol/fixtures/client/*.json`, `protocol/fixtures/link/*.json`
+- Create: `core/internal/protocol/{events.go,link.go,api.go,internal.go,errors.go,limits.go,marshal.go,fixtures_test.go,marshal_test.go}`, `packages/protocol/{package.json,tsconfig.json,vitest.config.ts,src/index.ts,src/events.ts,src/link.ts,src/api.ts,src/internal.ts,src/errors.ts,src/limits.ts,src/schema.ts,test/fixtures.test.ts}`, `protocol/fixtures/{client,link,internal}/*.json`, `protocol/fixtures/limits.json`
 - Modify: `Makefile` (`lint` also runs `pnpm -r --if-present run typecheck`; S20)
 
 **Interfaces:**
@@ -1866,7 +1869,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
   export interface TranslateCtx { spec: HostSpec; seenApiMessageIds: Set<string>; firstMainPending: boolean; pendingExclusion: 'none'|'first'|'cold_resume'|'post_compaction'; started: boolean; lastMainUuid: string | null }
   export function translate(m: SDKMessage, c: TranslateCtx): LinkEvent[]           // pure; mutates only c
   export function turnUsageDelta(baseline: Totals | null, r: SDKResultMessage): { delta: TurnUsage; totals: Totals }  // P11; baseline = the loaded transcript's newest cost-state (null = zero), never HostSpec.resume.baseline_totals (S31)
-  export function mapError(x: { status?: number; message?: string; sdkError?: string; resultSubtype?: string }): ErrorInfo & { detail?: 'thinking_binding' }  // table from Spike S11
+  export function mapError(x: { status?: number; message?: string; sdkError?: string; resultSubtype?: string }): Omit<LinkError, 'type'>  // table from Spike S11
   export class DeltaCoalescer { constructor(flushMs: number /* 100 */, send: (text: string) => void, clock?: Clock); push(text: string): void; flush(): void }
   ```
 - **Translation:**

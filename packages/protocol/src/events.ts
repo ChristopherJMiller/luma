@@ -46,7 +46,7 @@ export interface MemoryWrite {
   decided_at: Timestamp | null
 }
 
-/** An Anthropic-shaped input block. Client events carry only text blocks. */
+/** An Anthropic-shaped input block, as Core sends it to the conductor. */
 export type ContentBlock =
   | { type: 'text'; text: string }
   | { type: 'image'; source: Base64Source }
@@ -60,10 +60,16 @@ export interface Base64Source {
 
 // ---- Client events (client -> Core) ----
 
+/** The only block a client event carries. */
+export interface TextBlock {
+  type: 'text'
+  text: string
+}
+
 export interface UserMessage {
   type: 'user.message'
   client_id: string
-  content: ContentBlock[]
+  content: TextBlock[]
   attachment_ids: string[]
 }
 
@@ -132,7 +138,7 @@ export interface UsageEvent extends EventBase {
   turn_id: string
   cost_usd: number
 }
-export interface ErrorEvent extends EventBase {
+export interface SessionErrorEvent extends EventBase {
   type: 'error'
   code: ErrorCode
   retryable: boolean
@@ -149,84 +155,5 @@ export type Event =
   | ModelSwitchedEvent
   | MemoryWriteEvent
   | UsageEvent
-  | ErrorEvent
+  | SessionErrorEvent
 
-// ---- Decoding ----
-
-export class ProtocolError extends Error {}
-
-export interface Shape<T> {
-  required: readonly (keyof T & string)[]
-  optional?: readonly (keyof T & string)[]
-}
-
-/**
- * Checks a decoded object's top-level keys against its shape: every required
- * key present, none outside required + optional.
- */
-export function checkKeys(raw: Record<string, unknown>, what: string, required: readonly string[], optional: readonly string[] = []): void {
-  for (const k of required) {
-    if (!(k in raw)) throw new ProtocolError(`${what}: missing key ${k}`)
-  }
-  const allowed = new Set([...required, ...optional])
-  for (const k of Object.keys(raw)) {
-    if (!allowed.has(k)) throw new ProtocolError(`${what}: unexpected key ${k}`)
-  }
-}
-
-export function asObject(raw: unknown, what: string): Record<string, unknown> {
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
-    throw new ProtocolError(`${what}: not an object`)
-  }
-  return raw as Record<string, unknown>
-}
-
-type ClientEventOf<K extends ClientEvent['type']> = Extract<ClientEvent, { type: K }>
-type EventOf<K extends Event['type']> = Extract<Event, { type: K }>
-
-const CLIENT_EVENT_SHAPES = {
-  'user.message': { required: ['client_id', 'content', 'attachment_ids'] },
-  'user.interrupt': { required: [] },
-} satisfies { [K in ClientEvent['type']]: Shape<ClientEventOf<K>> }
-
-const EVENT_SHAPES = {
-  'session.status': { required: ['status'] },
-  'message.user': { required: ['message'] },
-  'message.started': { required: ['message_id', 'model'] },
-  'message.text_delta': { required: ['message_id', 'text'] },
-  'tool.started': { required: ['message_id', 'tool_use_id', 'name', 'summary'] },
-  'tool.finished': { required: ['message_id', 'tool_use_id', 'is_error', 'summary'] },
-  'message.completed': { required: ['message'] },
-  'model.switched': { required: ['message_id', 'from', 'to'] },
-  'memory.write': { required: ['write'] },
-  usage: { required: ['turn_id', 'cost_usd'] },
-  error: { required: ['code', 'retryable'] },
-} satisfies { [K in Event['type']]: Shape<EventOf<K>> }
-
-const EVENT_HEADER = ['id', 'session_id', 'type', 'created_at'] as const
-
-function has<T extends object>(table: T, key: string): key is Extract<keyof T, string> {
-  return Object.hasOwn(table, key)
-}
-
-/** Validates the envelope and top-level keys of a ClientEvent; unknown types throw. */
-export function decodeClientEvent(raw: unknown): ClientEvent {
-  const o = asObject(raw, 'client event')
-  const type = o['type']
-  if (typeof type !== 'string' || !has(CLIENT_EVENT_SHAPES, type)) {
-    throw new ProtocolError(`unknown client event type ${String(type)}`)
-  }
-  checkKeys(o, type, ['type', ...CLIENT_EVENT_SHAPES[type].required])
-  return o as unknown as ClientEvent
-}
-
-/** Validates the envelope and top-level keys of an Event; unknown types throw. */
-export function decodeEvent(raw: unknown): Event {
-  const o = asObject(raw, 'event')
-  const type = o['type']
-  if (typeof type !== 'string' || !has(EVENT_SHAPES, type)) {
-    throw new ProtocolError(`unknown event type ${String(type)}`)
-  }
-  checkKeys(o, type, [...EVENT_HEADER, ...EVENT_SHAPES[type].required])
-  return o as unknown as Event
-}
