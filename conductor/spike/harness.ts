@@ -716,9 +716,9 @@ export class Host {
   }
 
   /**
-   * This host's CLI processes, found by the LUMA_SPIKE_HOST marker in their
-   * environment. Neither HOME nor CLAUDE_CONFIG_DIR would do: the hosts of one
-   * tree share HOME, and for a store resume the SDK replaces
+   * This host's CLI and whatever it has spawned, found by the LUMA_SPIKE_HOST
+   * marker in their environment. Neither HOME nor CLAUDE_CONFIG_DIR would do:
+   * the hosts of one tree share HOME, and for a store resume the SDK replaces
    * CLAUDE_CONFIG_DIR with a temp dir of its own (claude-resume-<uuid>).
    */
   cliPids(): number[] {
@@ -735,9 +735,23 @@ export class Host {
     return pids
   }
 
-  /** The argv and environment of this host's own CLI process. */
+  /**
+   * The argv and environment of this host's CLI itself: of the marked
+   * processes, the stream-json one this process spawned. The CLI's own
+   * children (a short-lived git, say, where git is on PATH) carry the marker
+   * too.
+   */
   cliProcess(): { argv: string[]; env: Record<string, string> } {
-    const pids = this.cliPids()
+    const own = (p: number) => {
+      try {
+        const stat = readFileSync(`/proc/${p}/stat`, 'utf8')
+        const argv = readFileSync(`/proc/${p}/cmdline`, 'utf8').split('\0')
+        return Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1]) === process.pid && argv.includes('--input-format') && argv.includes('stream-json')
+      } catch {
+        return false
+      }
+    }
+    const pids = this.cliPids().filter(own)
     if (pids.length !== 1) throw new Error(`want this host's one CLI process, found ${pids.length}`)
     const argv = readFileSync(`/proc/${pids[0]}/cmdline`, 'utf8').split('\0').slice(0, -1)
     const env = Object.fromEntries(
