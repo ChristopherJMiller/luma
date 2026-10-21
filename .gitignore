@@ -1,0 +1,40 @@
+# Build output
+/bin/
+/build/
+/dist/
+cover.out
+*.test
+coverage/
+
+# Node
+node_modules/
+*.tsbuildinfo
+
+# e2e: kind kubeconfig, kubectl cache, logs, scratch (never commit a kubeconfig)
+/.e2e/
+
+# Secrets and key material of any kind (the repo is public)
+*.secret*
+*.pem
+*.key
+*.p12
+.env
+.env.*
+
+# Archives and raw images never land here
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.bin
+*.img
+
+# Nix
+result
+result-*
+/.direnv/
+
+# Editors
+.idea/
+.vscode/
+*.swp

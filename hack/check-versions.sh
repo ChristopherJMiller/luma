@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# check-versions: the toolchain minors and the agent pins must agree.
+# Run inside the flake's shell (`nix develop -c make check-versions`); the
+# shell's `go` and `node` ARE the flake's versions. Fails unless:
+#   1. go.mod's `go` directive has the flake's Go minor;
+#   2. the Dockerfile's `golang:` and `node:` base images have the flake's
+#      Go and Node minors (skipped while there is no Dockerfile);
+#   3. the Agent SDK is 0.3.N and the Claude Code CLI 2.1.N, with the same N
+#      (skipped while there is no conductor/package.json).
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+problems=0
+report() {
+	echo "check-versions: $*" >&2
+	problems=$((problems + 1))
+}
+
+# minor <version>: "1.26.8" -> "1.26"
+minor() { sed -E 's/^v?([0-9]+\.[0-9]+).*/\1/' <<<"$1"; }
+
+flake_go=$(minor "$(go env GOVERSION | sed 's/^go//')")
+flake_node=$(minor "$(node --version)")
+
+# 1. go.mod
+mod_go=$(awk '$1 == "go" { print $2; exit }' go.mod)
+if [[ -z $mod_go ]]; then
+	report "go.mod has no go directive"
+elif [[ $(minor "$mod_go") != "$flake_go" ]]; then
+	report "go.mod says go $mod_go but the flake's Go is $flake_go"
+fi
+
+# 2. Dockerfile(s)
+shopt -s nullglob
+dockerfiles=(Dockerfile Dockerfile.* */Dockerfile)
+for df in "${dockerfiles[@]}"; do
+	[[ -f $df ]] || continue
+	while read -r image; do
+		tag=${image#*:}
+		case $image in
+		golang:*) want=$flake_go name=Go ;;
+		node:*) want=$flake_node name=Node ;;
+		esac
+		if [[ $(minor "$tag") != "$want" ]]; then
+			report "$df uses $image but the flake's $name is $want"
+		fi
+	done < <(grep -Eio '(^|[[:space:]])(golang|node):[0-9][^[:space:]@]*' "$df" | tr -d ' \t' | sort -u)
+done
+
+# 3. SDK and CLI pins
+pkg=conductor/package.json
+if [[ -f $pkg ]]; then
+	sdk=$(jq -r '[.dependencies, .devDependencies] | map(select(. != null) | .["@anthropic-ai/claude-agent-sdk"]) | map(select(. != null)) | first // empty' "$pkg")
+	cli=$(jq -r '[.dependencies, .devDependencies] | map(select(. != null) | .["@anthropic-ai/claude-code"]) | map(select(. != null)) | first // empty' "$pkg")
+	if [[ ! $sdk =~ ^0\.3\.([0-9]+)$ ]]; then
+		report "$pkg: @anthropic-ai/claude-agent-sdk must be pinned exactly as 0.3.N (got '${sdk}')"
+	else
+		sdk_n=${BASH_REMATCH[1]}
+		if [[ ! $cli =~ ^2\.1\.([0-9]+)$ ]]; then
+			report "$pkg: @anthropic-ai/claude-code must be pinned exactly as 2.1.N (got '${cli}')"
+		elif [[ ${BASH_REMATCH[1]} != "$sdk_n" ]]; then
+			report "$pkg: SDK 0.3.$sdk_n and CLI $cli must share the same N"
+		fi
+	fi
+fi
+
+if ((problems > 0)); then
+	echo "check-versions: $problems problem(s)" >&2
+	exit 1
+fi
+echo "check-versions: ok (go $flake_go, node $flake_node)"

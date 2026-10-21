@@ -1,0 +1,36 @@
+# A broken renovate.json makes Renovate stop for the whole repository (it
+# opens a "Fix Renovate Configuration" issue and proposes nothing), so check
+# it before it lands. renovate-config-validator comes from the flake's pinned
+# nixpkgs, like every other tool. Not a required check: it runs only when
+# the config changes.
+name: Renovate config
+
+on:
+  push:
+    branches: [main]
+    paths: [renovate.json, .github/workflows/renovate-config.yml]
+  pull_request:
+    paths: [renovate.json, .github/workflows/renovate-config.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: renovate-config-validator
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      # No file argument: it then validates the repository config files it
+      # finds (with a path it would check the file as global config).
+      - name: Validate
+        run: nix shell --inputs-from . nixpkgs#renovate -c renovate-config-validator --strict

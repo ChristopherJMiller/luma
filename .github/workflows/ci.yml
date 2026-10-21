@@ -1,0 +1,101 @@
+# CI: everything runs inside the repo's flake (`nix develop -c …`), so a job
+# here runs exactly the toolchain `nix develop` gives you locally. To reproduce
+# a red job, run the same `make` target in the same shell.
+#
+# Actions are pinned by full commit SHA with the release as a comment;
+# Renovate (renovate.json) keeps both up to date.
+#   - cachix/install-nix-action: upstream Nix, multi-user, flakes enabled.
+#   - nix-community/cache-nix-action: caches /nix in the GitHub Actions cache.
+#
+# `ci-ok` is the one check the main ruleset requires: it passes only when
+# every job in its `needs` passed, so Renovate's PRs auto-merge on it and
+# nothing else. Publish and release jobs are never in `ci-ok` (Task 29).
+name: CI
+
+on:
+  push:
+    # Renovate branches always have a PR; don't run them twice.
+    branches-ignore: ["renovate/**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+  # Weekly on main, with no change of ours: new vulnerability reports,
+  # pinned images or digests that disappeared, a runner image that moved.
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Superseded runs on a branch or PR are cancelled. Every commit on main
+  # still gets a full result.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  check:
+    name: lint, test, hygiene
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The whole history: check-hygiene runs gitleaks over every commit.
+          fetch-depth: 0
+
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      # The dev shell closure is keyed on the flake. Only an exact key match
+      # is restored. This job saves the cache and the others only restore it.
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.nix', 'flake.lock') }}
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+            ~/.cache/golangci-lint
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'flake.lock') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Workflows (actionlint)
+        run: nix develop -c actionlint
+
+      - name: Check
+        run: >-
+          nix develop -c bash -c
+          'pnpm install --frozen-lockfile
+          && go mod verify
+          && make tools-versions check-hygiene check-versions lint test vulncheck'
+
+  # Added by later tasks, and then listed in ci-ok's needs:
+  #   gateway-spike  Task 3
+  #   sdk-spike      Task 4
+  #   image          Task 25
+  #   e2e            Task 28a
+
+  # The single required check (main ruleset). `needs` skips a job whose
+  # dependency failed, so this runs always() and passes only if every
+  # needed job succeeded: a failure, cancellation or skip anywhere is red.
+  ci-ok:
+    name: ci-ok
+    if: always()
+    # Final: [check, gateway-spike, sdk-spike, image, e2e]. A needs on a job
+    # that does not exist is an actionlint error, so each is added by the task
+    # that adds the job (see the list above).
+    needs: [check]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Every required job passed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$RESULTS"
+          jq -e 'all(.[]; .result == "success")' <<<"$RESULTS" >/dev/null

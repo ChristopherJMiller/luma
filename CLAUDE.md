@@ -1,0 +1,103 @@
+# CLAUDE.md: Luma operating guide
+
+Luma is a household agent platform, shipped as one Helm chart: a Go **Core**
+(sessions, auth, memory, cost ledger), a TypeScript **conductor** that hosts the
+Claude Agent SDK, and an assistant-ui **PWA**. Product name in the UI: "Luma,
+powered by Claude", never "Claude Code". The design is `docs/design.md`; the
+phase-1 plan is `docs/plans/phase-1-lean-chat.md` (read a task there before
+changing the code it covers). This repo is public and Apache-2.0.
+
+## Architecture
+
+```
+browser (PWA, cookie session)
+   -> Core (Go, :8080)     the ONLY owner of state: conversations, events,
+                           memory, taint, cost ledger, retention. Postgres.
+        internal callers authenticate with projected ServiceAccount tokens
+        (TokenReview): conductor, evals, reconcile (P20)
+   <-> conductor (TS)      one long-lived link to Core (newest link wins, P30);
+                           a pool of Agent SDK query()s, one CLI per active
+                           conversation (cap 4, evicted after 10 min idle).
+                           Executes; never decides, never stores.
+   -> agent gateway        agentgateway in front of Anthropic: sees every
+                           request, alerts on main-class 400s
+   -> smokescreen          egress proxy for WebFetch (HTTPS_PROXY)
+```
+
+Layout: `core/` (Go), `conductor/` and `packages/` and `web/` (pnpm workspace),
+`agents/` (AGENT.md files, `models.yaml`), `charts/luma/`, `test/`, `hack/`.
+Product code from here on follows the plan's "Repository layout".
+
+## Commands
+
+Everything runs inside the flake: `nix develop -c make <target>`.
+
+| Target | What it does |
+|---|---|
+| `tools-versions` | print every tool's version |
+| `fmt`, `vet`, `lint` | gofmt/goimports, go vet, golangci-lint + `helm lint --strict` over `charts/luma/ci/*-values.yaml` |
+| `test`, `test-go`, `test-ts` | `go test -race -count=1 ./...`; `pnpm -r test` (never runs spike files) |
+| `check-hygiene`, `check-versions`, `check-chart-sync` | repo hygiene; toolchain and SDK/CLI pin agreement; chart copies of `agents/` |
+| `vulncheck` | govulncheck |
+| `build`, `images`, `chart-test` | build, images, chart render tests |
+| `e2e`, `e2e-up`, `e2e-down` | the kind suite and its cluster |
+| `gateway-spike`, `sdk-spike`, `transcript-fixture` | Spike G, Spike S, the synthetic CLI transcript |
+
+Targets that later tasks fill print "not yet implemented (Task N)" and succeed.
+CI (`.github/workflows/ci.yml`) runs `make` targets in the same shell; `ci-ok`
+is the one required check. Publish and release are never in `ci-ok`.
+
+## Deviations from the design
+
+Decided in the phase-1 plan; the design doc does not describe them.
+
+- **P17.** AGENT.md gains `builtin_tools` (a subset of `WebSearch`,
+  `WebFetch`), `kind: agent|subagent` and optional `effort`. The spec's
+  frontmatter has no place for built-in tools.
+- **P19.** Evals use the real WebSearch tool name, stubbed by the eval
+  recorder. WebFetch is denied in golden tasks; the `guard` suite drives
+  scripted WebFetch uses at forbidden targets at no Anthropic spend. The
+  large-session and previous-CLI resume tests run offline in CI against
+  fakeanthropic. No Anthropic key exists in GitHub (D30).
+- **P20.** Internal callers authenticate with projected ServiceAccount tokens
+  and TokenReview; principals are `conductor`, `evals`, `reconcile`. No static
+  Core bearer exists. Pulled forward from phase 2.
+- **P25.** Core, the conductor, the gateway and smokescreen run at priority 0
+  (no class); the evals and reconcile Jobs use `luma-batch` (-5,
+  `preemptionPolicy: Never`). A deviation from section 7.3's -5 for the control
+  plane: shedding is explicit (`shed`), so serving is not first to go.
+- **P28.** Phase 1 ships no mid-session effort control. Escalation is
+  `deep-think` or a new chat on Smart. Live spike L4 and Spike S15 record
+  whether a per-message effort change preserves the cache, for phase 2.
+
+## Hard rules
+
+1. **Toolchain from the flake only.** Bump nixpkgs with `nix flake update
+   nixpkgs`, then run `make tools-versions` and `make test` before committing
+   the lock. Keep the Go and Node minors in step across `flake.nix`, `go.mod`
+   and the Dockerfile (`make check-versions` fails otherwise).
+2. **Kubeconfig isolation.** Never read or write `~/.kube/config`, and never
+   touch any cluster other than the e2e kind cluster. Its kubeconfig lives only
+   at `.e2e/kubeconfig` (gitignored; `$LUMA_E2E_KUBECONFIG` in the shell), made
+   with `kind create cluster --name luma-e2e --kubeconfig .e2e/kubeconfig`.
+   Pass that file explicitly to every kubectl, helm and client-go call. At most
+   one kind cluster exists, named `luma-e2e`; delete it when done.
+3. **No secrets, no real family data, no Anthropic key in the repo, ever,
+   encrypted or not.** It is public. Fixtures are synthetic. `.gitignore`
+   blocks secret, key and archive types; do not work around it (`git add -f`).
+   `make check-hygiene` (CI runs it) fails on a tracked binary, a file over 512
+   KiB, a forbidden type, or a secret anywhere in the history (gitleaks).
+4. **Pinned images.** Every image, test images included, is pinned by tag plus
+   digest (`golang:1.26.8-trixie@sha256:...`).
+5. **Git hygiene.** Small, logical commits. Stage explicit paths, never `git add
+   -A` or `git add .`. Never bypass hooks (`--no-verify`) or signing; if a hook
+   fails, fix the cause.
+6. **Evidence before claims.** Never say something works without running it.
+   Report failures and deviations from the plan plainly.
+7. **Metadata-only logging.** Core and the conductor log ids, tool names,
+   durations and decisions. Never message content, memory content or tool
+   arguments. CLI stderr is not forwarded. WebFetch appears in logs and metrics
+   as host only. Session ids never become metric labels.
+8. **Hand-written test expectations.** No snapshot files, no `-update` flags,
+   no golden output generated by the code under test: a test whose expected
+   value comes from the code under test proves nothing.

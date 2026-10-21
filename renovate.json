@@ -1,0 +1,119 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "docker:pinDigests",
+    "helpers:pinGitHubActionDigests",
+    ":semanticCommitsDisabled"
+  ],
+  "commitMessagePrefix": "deps:",
+  "labels": ["dependencies"],
+  "automerge": true,
+  "automergeType": "pr",
+  "platformAutomerge": true,
+  "vulnerabilityAlerts": {
+    "description": "Fixes for a known vulnerability are proposed at once (no minimumReleaseAge) and merge themselves once ci-ok passes.",
+    "labels": ["dependencies", "security"],
+    "automerge": true
+  },
+  "osvVulnerabilityAlerts": true,
+  "ignorePaths": ["**/node_modules/**", "**/vendor/**"],
+  "postUpdateOptions": ["gomodTidy", "pnpmDedupe"],
+  "nix": {
+    "enabled": true,
+    "lockFileMaintenance": {
+      "enabled": true,
+      "automerge": true,
+      "schedule": ["* 0-3 1 * *"],
+      "commitMessageAction": "Update nixpkgs (flake.lock)"
+    }
+  },
+  "helm-values": {
+    "description": "Chart images are digest-pinned, so the customManager below owns them. helm-values cannot update a digest; it would move the tag and leave the digest stale.",
+    "enabled": false
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Digest-pinned images in the chart and the e2e harness. The forms are `<repo/name>:<tag>@sha256:<digest>`, or the keys `repository:`, `tag:` and `digest:` in that order, or `repository:` then `tag: <tag>@sha256:<digest>`. Official images need a namespace, as in `docker.io/library/<name>`. test/ is scanned because ignorePaths above replaces the preset list, which skips **/test/**. Dockerfiles are left to the dockerfile manager, so no image is extracted twice.",
+      "managerFilePatterns": ["/^charts/.+\\.ya?ml$/", "/^test/.+\\.(ya?ml|go|ts)$/", "/(^|/)Makefile$/", "/^\\.github/workflows/.+\\.ya?ml$/"],
+      "matchStrings": [
+        "(?<depName>[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)+):(?<currentValue>[A-Za-z0-9_][A-Za-z0-9_.-]*)@(?<currentDigest>sha256:[a-f0-9]{64})",
+        "repository:[ \\t]*[\"']?(?<depName>[^\\s\"'#]+)[\"']?[ \\t]*(?:#[^\\n]*)?\\n(?:[ \\t]*#[^\\n]*\\n)*[ \\t]*tag:[ \\t]*[\"']?(?<currentValue>[^\\s\"'@#]+)@(?<currentDigest>sha256:[a-f0-9]{64})",
+        "repository:[ \\t]*[\"']?(?<depName>[^\\s\"'#]+)[\"']?[ \\t]*(?:#[^\\n]*)?\\n(?:[ \\t]*#[^\\n]*\\n)*[ \\t]*tag:[ \\t]*[\"']?(?<currentValue>[^\\s\"'@#]+)[\"']?[ \\t]*(?:#[^\\n]*)?\\n(?:[ \\t]*#[^\\n]*\\n)*[ \\t]*digest:[ \\t]*[\"']?(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Wait 3 days after a release before proposing it, so a bad release can be yanked first.",
+      "matchManagers": ["gomod", "github-actions"],
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "npm packages are pinned exactly and wait 3 days like everything else.",
+      "matchManagers": ["npm"],
+      "rangeStrategy": "pin",
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Images wait 3 days too, a re-pushed tag (a new digest) as much as a new tag. A registry that gives no timestamp is not held back for ever.",
+      "matchDatasources": ["docker"],
+      "minimumReleaseAge": "3 days",
+      "minimumReleaseAgeBehaviour": "timestamp-optional"
+    },
+    {
+      "description": "The Go minor comes from the flake (go_1_26 and GOTOOLCHAIN=local). The builder image follows patches only; a new Go minor changes flake.nix, go.mod and the Dockerfile together, by hand (hack/check-versions.sh).",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["golang", "docker.io/library/golang"],
+      "matchUpdateTypes": ["major", "minor"],
+      "enabled": false
+    },
+    {
+      "description": "Likewise the Node minor (nodejs_24 in the flake).",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["node", "docker.io/library/node"],
+      "matchUpdateTypes": ["major", "minor"],
+      "enabled": false
+    },
+    {
+      "description": "The Agent SDK and the Claude Code CLI move together, weekly, behind the eval gate: a person runs the evals before this merges (docs/releasing.md). hack/check-versions.sh holds the SDK 0.3.N and CLI 2.1.N to the same N.",
+      "matchPackageNames": ["@anthropic-ai/claude-agent-sdk", "@anthropic-ai/claude-code*"],
+      "groupName": "agent-sdk",
+      "schedule": ["before 6am on monday"],
+      "automerge": false,
+      "addLabels": ["eval-gate"]
+    },
+    {
+      "description": "assistant-ui moves in a weekly group that a person reads: its runtime API is what the chat UI is built on.",
+      "matchPackageNames": ["@assistant-ui/**"],
+      "groupName": "assistant-ui",
+      "schedule": ["before 6am on monday"],
+      "automerge": false
+    },
+    {
+      "description": "agentgateway sits on the request path to Anthropic (Spike G): weekly, and a person reads the release notes.",
+      "matchPackageNames": ["agentgateway/**", "ghcr.io/agentgateway/**", "cr.agentgateway.dev/**"],
+      "groupName": "agentgateway",
+      "schedule": ["before 6am on monday"],
+      "automerge": false
+    },
+    {
+      "description": "Not Renovate's to move: our own images (released by CI; the chart pins their digests at release).",
+      "matchPackageNames": ["ghcr.io/christopherjmiller/luma-*"],
+      "enabled": false
+    },
+    {
+      "description": "kind node images must match the kind from the flake.",
+      "matchPackageNames": ["kindest/node", "docker.io/kindest/node"],
+      "enabled": false
+    },
+    {
+      "description": "A major update waits for a human. Everything else merges itself once ci-ok passes: GitHub does the merge (platformAutomerge), so the main ruleset decides what passing means.",
+      "matchUpdateTypes": ["major"],
+      "automerge": false,
+      "addLabels": ["major"]
+    }
+  ]
+}

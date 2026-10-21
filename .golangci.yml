@@ -1,0 +1,69 @@
+# golangci-lint v2 config (the major version the nix shell pins).
+# Run with `nix develop -c make lint`; `make fmt` applies the formatters.
+version: "2"
+
+run:
+  # The flake pins Go; never lint against a different language version.
+  go: "1.26"
+  tests: true
+  build-tags:
+    - e2e
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - exhaustive
+    - bodyclose
+    - copyloopvar
+    - errorlint
+    - gocritic
+    - gosec
+    - intrange
+    - misspell
+    - nilerr
+    - noctx
+    - nolintlint
+    - unconvert
+    - unparam
+    - usestdlibvars
+  settings:
+    exhaustive:
+      # A `default:` does not excuse a missing case: list every state.
+      default-signifies-exhaustive: false
+      check:
+        - switch
+        - mapliteral
+    gosec:
+      excludes:
+        # G115 (integer overflow on conversion) is noise for small counters.
+        - G115
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+  exclusions:
+    generated: strict
+    presets:
+      - comments
+      - std-error-handling
+    rules:
+      # Tests may use plain http.Get and ignore some errors.
+      - path: _test\.go
+        linters:
+          - noctx
+          - gosec
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/ChristopherJMiller/luma
+  exclusions:
+    generated: strict
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

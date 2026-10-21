@@ -1,0 +1,10 @@
+{
+  "name": "luma-workspace",
+  "private": true,
+  "description": "Luma workspace root. Packages (packages/*, conductor, web) arrive with later tasks.",
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@10.34.5",
+  "engines": {
+    "node": ">=24 <25"
+  }
+}
