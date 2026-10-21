@@ -36,7 +36,7 @@ results.
 | Route | Answer |
 |---|---|
 | `POST /v1/messages` (any query, e.g. `?beta=true`) | a scripted reply: SSE when `"stream": true`, otherwise one JSON message |
-| `POST /v1/messages/count_tokens` | `{"input_tokens": n}`, n = `len(Canonical(body)) / 4`; runs the binding check, uses no script step |
+| `POST /v1/messages/count_tokens` | `{"input_tokens": n}`, n = `len(Canonical(body)) / 4`; runs validation and the binding check, uses no script step |
 | anything else | 404 `not_found_error`, still recorded |
 
 Every response carries `request-id: req_fake_<seq>`.
@@ -54,6 +54,13 @@ that started the turn. Messages with other roles, such as the CLI's trailing
 - A request without a marker gets `DefaultText` and `DefaultUsage`.
 - A marker naming a missing script, or a script with no steps left, is a 400
   `invalid_request_error`: `fakeanthropic: script "x" has no step N (it has M)`.
+- **A rejected request uses no step.** A request that fails parsing,
+  validation (the tool_use rule) or the binding check is answered before any
+  step is taken, so the CLI's strip-and-retry after a binding 400 gets the
+  step.
+- **Concurrent marked requests** on one script take its steps in lock order:
+  the order they reach the step, after their bodies are read and checked.
+  That need not be `Seq` order.
 
 Any helper request that quotes the user's text carries the marker too, and
 uses up a step.
@@ -142,11 +149,17 @@ message being generated.
   signature)`, and the previous signature is that of the last thinking block
   in the request.
 
-On every `/v1/messages` and `count_tokens` request, each `thinking` and
-`redacted_thinking` block in an assistant message is checked:
+On every `/v1/messages` and `count_tokens` request, every block whose
+`type` is `thinking` or `redacted_thinking`, in an assistant message's
+content array, is checked. The check reads the parse tree, so it fails
+closed: malformed neighbours cannot hide a block.
 
-1. Its MAC must match the canonical prefix of **its own message**.
-2. **The chain rule:** the replayed blocks must be a contiguous window of
+1. **As minted.** A `thinking` block must carry `thinking: ""` (the fake
+   mints no text, so any other value, or none, is an edit) and a string
+   `signature`. A `redacted_thinking` block must carry a string `data`. The
+   value must be base64 of 32 or 48 bytes.
+2. Its MAC must match the canonical prefix of **its own message**.
+3. **The chain rule:** the replayed blocks must be a contiguous window of
    the sequence they were generated in. Every block after the first one
    replayed must chain to the replayed block just before it.
    - Dropping blocks from the front, from the back, or from both is fine.
@@ -155,18 +168,27 @@ On every `/v1/messages` and `count_tokens` request, each `thinking` and
    - So does restoring a block that was stripped before a later block was
      generated.
 
-A failure is a 400 `invalid_request_error` whose message is
-`messages.<i>.content.<j>: ` + `BindingErrorText`. That is the error-mode
-form in the preserved-thinking docs, and the CLI reacts to it as it does to
-the real one: it strips thinking and retries. `BindingErrorText` must always
-contain the one hand-written substring in
-`protocol/fixtures/binding-error.txt` (S9). Tests and the conductor match on
-that file and never re-type the text. Deploy spike L5 replaces the constant
-with the live text.
+The first failing block gets a 400 `invalid_request_error`:
+
+- **Rule 1 (tampered):** ``messages.<i>.content.<j>: Invalid `signature` in
+  `thinking` block.`` For a redacted block, ``Invalid `data` in
+  `redacted_thinking` block.`` It never contains the binding substring, so
+  S16 does not count it as a binding break.
+- **Rules 2 and 3 (bound elsewhere):** `messages.<i>.content.<j>: ` +
+  `BindingErrorText`. That is the error-mode form in the preserved-thinking
+  docs, and the CLI reacts to it as it does to the real one: it strips
+  thinking and retries.
+  - `BindingErrorText` must always contain the one hand-written substring in
+    `protocol/fixtures/binding-error.txt` (S9). Tests and the conductor
+    match on that file and never re-type the text.
+  - Deploy spike L5 replaces the constant with the live text.
+
+A well-formed signature over some other prefix cannot be told apart from
+random bytes of the right length, so both get the binding text.
 
 The check is always on. With no key, the empty key signs.
-`Recorded.BindingOK` is true when a request reached the check and every
-block passed.
+`Recorded.BindingOK` is true when a request reached the check (it parsed
+and passed validation) and every block passed.
 
 ## Canonicalisation
 
@@ -196,29 +218,81 @@ has its own test in `fake_test.go`.
    prefix. The chain rule above checks them instead.
 
 Everything else counts, byte for byte as sent: interior white space,
-`tool_use.input` (numbers keep their spelling: `1.0` is not `1`),
-tool-result text, image and document bytes, and string escapes. A
-`\uXXXX` escape and the raw character it stands for are different strings
-here; the CLI never varies them. Input that is not a JSON object gets
-rules 1 and 5 only. Invalid JSON gives nil.
+`tool_use.input`, tool-result text, and image and document bytes, as at the
+API. Input that is not a JSON object gets rules 1 and 5 only. Invalid JSON
+gives nil.
 
-**Deliberately not modelled: the fake is stricter than the API here.**
+### Stricter than the API
 
-- `defer_loading` tools that nothing has named yet. The API leaves them out
-  of the comparison; the fake compares them like any other tool.
-- Server-side compaction blocks. The API restarts the comparison at the last
-  one; the fake compares the whole history.
-- The model check: a block is not bound to the model that produced it.
-- `prefix_mismatch_behavior: "drop_block"`: every mismatch is a 400, never a
-  `thinking_dropped` entry.
+The fake tells apart these forms, which the API treats as the same
+(`prefix_diff.py` in the preserved-thinking guide).
+`TestCanonicalIsStricterThanTheAPI` pins each one. None of them varies in
+the CLI's traffic; if a spike shows one does, model it.
+
+- **Numbers keep their spelling:** `1.0` is not `1`. The API collapses
+  integral floats.
+- **A null-valued key** is not an absent key.
+- **Tool-entry defaults** spelled out: `type: "custom"`, `description: ""`,
+  `strict: false`, `eager_input_streaming: false`,
+  `allowed_callers: ["direct"]`.
+- **`citations: []` or `null`** on a block. Such a text block also does not
+  become its string (rule 2).
+- **`tool_result.is_error: false`.**
+- **URL-sourced images and documents:** the URL string counts. The API
+  compares the bytes behind it, so a rotated URL to the same bytes matches
+  there.
+- **String escapes:** a `\uXXXX` escape and the raw character it stands for
+  are different strings.
+- **`defer_loading` tools** that nothing has named yet: the API leaves them
+  out of the comparison; the fake compares them like any other tool.
+- **Server-side compaction blocks:** the API restarts the comparison at the
+  last one; the fake compares the whole history.
+
+### Looser than the API, or not modelled
+
+- **The model check.** A block is not bound to the model that produced it.
+  The API drops a block the current model cannot read and answers 200, with
+  a `model_binding_mismatch` entry in `input_transformations`. The fake keeps
+  the block.
+- **`prefix_mismatch_behavior: "drop_block"`.** Every mismatch is a 400,
+  never a `thinking_dropped` entry.
+- **Validation.** The fake checks only that the body is a JSON object with a
+  `messages` array of objects, plus one structural rule: every `tool_use` of
+  an assistant message is answered by a `tool_result` in the next message.
+  The rule uses the API's wording: ``messages.<i>: `tool_use` ids were found
+  without `tool_result` blocks immediately after: <ids>. Each `tool_use` block
+  must have a corresponding `tool_result` block in the next message.`` It does
+  not check:
+  - `model` or `max_tokens` (presence, values, limits);
+  - empty `messages`, role order and alternation, or where a
+    `role: "system"` message may sit;
+  - block shapes;
+  - `anthropic-beta` values, or `block_binding` without its beta;
+  - a `tool_result` with no matching `tool_use`;
+  - media limits.
+- **Wire behaviour not produced:**
+  - a mid-stream `event: error` after a 200;
+  - `pause_turn`, unless a step scripts it as its `stop_reason`;
+  - `web_search_tool_result_error` and citations in search answers;
+  - rate-limit headers (`anthropic-ratelimit-*`) and `x-should-retry`;
+  - `thinking_delta` text and multi-delta blocks;
+  - keep-alive pings during a long `StepDelay`;
+  - usage derived from the prefix (usage is always scripted).
 
 ## Recording
 
-`Requests()` returns every request in `Seq` order: method, path with query,
-headers and body exactly as received, and `BindingOK`. With `RecordDir`
-(`--record-dir`), each request is also written as `<seq>.body`, the raw
-bytes, and `<seq>.meta.json`, the rest, with `seq` zero-padded to six
-digits.
+`Requests()` returns every request in `Seq` order with:
+
+- method;
+- path with query;
+- headers as net/http parsed them: names canonicalised (`Anthropic-Beta`),
+  values verbatim, and `Host` moved out of the map into `Recorded.Host`;
+- the body exactly as received;
+- `BindingOK`.
+
+With `RecordDir` (`--record-dir`), each request is also written as
+`<seq>.body` (the raw bytes) and `<seq>.meta.json` (`seq`, `method`, `path`,
+`header`, `binding_ok`, `host`), with `seq` zero-padded to six digits.
 
 Recordings hold headers verbatim, credentials included, so use only fake
 keys and never commit a recording.

@@ -50,17 +50,22 @@ type Options struct {
 
 // Recorded is one request as the fake received it.
 type Recorded struct {
-	// Seq numbers requests from 1 in arrival order; ids derive from it.
+	// Seq numbers requests from 1 in the order their bodies were read;
+	// ids derive from it.
 	Seq    int
 	Method string
 	// Path is the request URI: the path and any query, as sent.
-	Path   string
+	Path string
+	// Header is as net/http parsed it: names canonicalised (Anthropic-Beta),
+	// values verbatim, and no Host, which is in Host.
 	Header http.Header
 	Body   []byte
 	// BindingOK reports that the request reached the binding check (a
-	// messages or count_tokens request with a parseable body) and every
-	// replayed thinking block in it passed.
+	// messages or count_tokens request that parsed and passed validation)
+	// and every replayed thinking block in it passed.
 	BindingOK bool
+	// Host is the request's Host header (net/http moves it out of Header).
+	Host string
 }
 
 // Server is the fake. It is an http.Handler and safe for concurrent use.
@@ -104,7 +109,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	requestID := fmt.Sprintf("req_fake_%d", seq)
 	w.Header().Set("request-id", requestID)
-	rec := Recorded{Seq: seq, Method: r.Method, Path: r.URL.RequestURI(), Header: r.Header.Clone(), Body: body}
+	rec := Recorded{Seq: seq, Method: r.Method, Path: r.URL.RequestURI(), Header: r.Header.Clone(), Body: body, Host: r.Host}
 
 	if readErr != nil {
 		if s.record(w, rec, requestID) {
@@ -199,7 +204,8 @@ func (s *Server) writeRecord(rec Recorded) error {
 		Path      string      `json:"path"`
 		Header    http.Header `json:"header"`
 		BindingOK bool        `json:"binding_ok"`
-	}{rec.Seq, rec.Method, rec.Path, rec.Header, rec.BindingOK}
+		Host      string      `json:"host"`
+	}{rec.Seq, rec.Method, rec.Path, rec.Header, rec.BindingOK, rec.Host}
 	return os.WriteFile(base+".meta.json", marshal(meta), 0o600)
 }
 
@@ -245,7 +251,59 @@ func parseRequest(body []byte) (*request, error) {
 	if s := root.get("stream"); s != nil && s.kind == '0' && string(s.raw) == "true" {
 		r.stream = true
 	}
+	if err := checkToolResults(msgs.elems); err != nil {
+		return nil, err
+	}
 	return &r, nil
+}
+
+// invalidRequest is a validation failure, answered as a 400
+// invalid_request_error with the API's own wording.
+type invalidRequest string
+
+func (e invalidRequest) Error() string { return string(e) }
+
+// checkToolResults enforces the API's rule that every tool_use of an
+// assistant message is answered by a tool_result in the next message, a
+// user message. It is the one structural validation the fake models
+// (README "Looser than the API").
+func checkToolResults(msgs []*node) error {
+	for i, m := range msgs {
+		c := m.get("content")
+		if m.get("role").str() != "assistant" || c == nil || c.kind != '[' {
+			continue
+		}
+		var uses []string
+		for _, b := range c.elems {
+			if b.get("type").str() == "tool_use" {
+				uses = append(uses, b.get("id").str())
+			}
+		}
+		if len(uses) == 0 {
+			continue
+		}
+		answered := map[string]bool{}
+		if i+1 < len(msgs) && msgs[i+1].get("role").str() == "user" {
+			if nc := msgs[i+1].get("content"); nc != nil && nc.kind == '[' {
+				for _, b := range nc.elems {
+					if b.get("type").str() == "tool_result" {
+						answered[b.get("tool_use_id").str()] = true
+					}
+				}
+			}
+		}
+		var missing []string
+		for _, id := range uses {
+			if !answered[id] {
+				missing = append(missing, id)
+			}
+		}
+		if len(missing) > 0 {
+			return invalidRequest(fmt.Sprintf("messages.%d: `tool_use` ids were found without `tool_result` blocks immediately after: %s. "+
+				"Each `tool_use` block must have a corresponding `tool_result` block in the next message.", i, strings.Join(missing, ", ")))
+		}
+	}
+	return nil
 }
 
 // step picks the reply for a request: the next step of the marked script,

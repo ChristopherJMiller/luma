@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"maps"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/ChristopherJMiller/luma/test/fakeanthropic"
@@ -315,6 +317,10 @@ func TestRecordsBodyBytesExactly(t *testing.T) {
 	}
 	if rec.Seq != 1 || rec.Method != http.MethodPost || rec.Path != "/v1/messages?beta=true" || !rec.BindingOK {
 		t.Errorf("record %+v", rec)
+	}
+	// net/http moves Host out of the header map; the record keeps it.
+	if want := strings.TrimPrefix(base, "http://"); rec.Host != want || rec.Header.Get("Host") != "" {
+		t.Errorf("Host %q (header %q), want %q", rec.Host, rec.Header.Get("Host"), want)
 	}
 }
 
@@ -791,7 +797,8 @@ func TestRecordDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := decode(t, meta)
-	if m["seq"] != 1.0 || m["method"] != "POST" || m["path"] != "/v1/messages?beta=true" || m["binding_ok"] != true {
+	if m["seq"] != 1.0 || m["method"] != "POST" || m["path"] != "/v1/messages?beta=true" || m["binding_ok"] != true ||
+		m["host"] != strings.TrimPrefix(base, "http://") {
 		t.Errorf("meta %v", m)
 	}
 	if h := m["header"].(map[string]any)["X-Luma-Agent"]; !reflect.DeepEqual(h, []any{"luma"}) {
@@ -835,10 +842,12 @@ func TestCanonicalRule2StringEqualsSingleTextBlock(t *testing.T) {
 			`{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"out"}]}]},`+
 			`{"role":"system","content":[{"type":"text","text":"env","cache_control":{"type":"ephemeral"}}]}]}`,
 	)
-	// A text block with more than its text, and two text blocks, stay blocks.
+	// Two text blocks stay blocks. (A text block carrying `citations: []`
+	// also stays a block, which is stricter than the API:
+	// TestCanonicalIsStricterThanTheAPI.)
 	canonicalCase(t,
-		`{"messages":[{"content":[{"citations":[],"text":"x","type":"text"}],"role":"assistant"},{"content":[{"text":"a","type":"text"},{"text":"b","type":"text"}],"role":"user"}]}`,
-		`{"messages":[{"role":"assistant","content":[{"type":"text","text":"x","citations":[]}]},{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}]}`,
+		`{"messages":[{"content":[{"text":"a","type":"text"},{"text":"b","type":"text"}],"role":"user"}]}`,
+		`{"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}]}`,
 	)
 }
 
@@ -909,13 +918,50 @@ func TestCanonicalCountsEverythingElse(t *testing.T) {
 	want := string(fakeanthropic.Canonical(json.RawMessage(base)))
 	for name, edit := range map[string][2]string{
 		"interior whitespace": {`"a b"`, `"a  b"`},
-		"tool_use.input":      {`{"k":1.0}`, `{"k":1}`},
+		"tool_use.input":      {`{"k":1.0}`, `{"k":2.0}`},
 		"tool-result text":    {`"out"`, `"out!"`},
 		"image bytes":         {`"AAAA"`, `"AAAB"`},
 	} {
 		edited := strings.Replace(base, edit[0], edit[1], 1)
 		if got := string(fakeanthropic.Canonical(json.RawMessage(edited))); got == want {
 			t.Errorf("%s: an edit did not change the canonical form", name)
+		}
+	}
+}
+
+// TestCanonicalIsStricterThanTheAPI pins the documented places where the
+// fake tells apart two forms the API treats as the same (README
+// "Canonicalisation", "Stricter than the API"). Each pair is equal at the
+// API and different here.
+func TestCanonicalIsStricterThanTheAPI(t *testing.T) {
+	esc := func(hex string) string { return `\` + "u" + hex } // a JSON escape, built from parts
+	msg := func(content string) string { return `{"messages":[{"role":"user","content":[` + content + `]}]}` }
+	tool := func(extra string) string {
+		return `{"messages":[],"tools":[{"name":"t","input_schema":{"type":"object"}` + extra + `}]}`
+	}
+	for name, pair := range map[string][2]string{
+		"integral float": {
+			`{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"n","input":{"k":1.0}}]}]}`,
+			`{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"n","input":{"k":1}}]}]}`,
+		},
+		"null-valued key":            {msg(`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA"},"title":null}`), msg(`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA"}}`)},
+		"citations []":               {msg(`{"type":"text","text":"x","citations":[]}`), msg(`{"type":"text","text":"x"}`)},
+		"citations null":             {msg(`{"type":"text","text":"x","citations":null}`), msg(`{"type":"text","text":"x"}`)},
+		"tool_result is_error false": {msg(`{"type":"tool_result","tool_use_id":"t","content":"out","is_error":false}`), msg(`{"type":"tool_result","tool_use_id":"t","content":"out"}`)},
+		"tool type custom":           {tool(`,"type":"custom"`), tool(``)},
+		"tool description empty":     {tool(`,"description":""`), tool(``)},
+		"tool strict false":          {tool(`,"strict":false`), tool(``)},
+		"tool eager_input_streaming": {tool(`,"eager_input_streaming":false`), tool(``)},
+		"tool allowed_callers":       {tool(`,"allowed_callers":["direct"]`), tool(``)},
+		"rotated media URL": {
+			msg(`{"type":"image","source":{"type":"url","url":"https://media.test/a.png?sig=1"}}`),
+			msg(`{"type":"image","source":{"type":"url","url":"https://media.test/a.png?sig=2"}}`),
+		},
+		"escape vs raw character": {msg(`{"type":"text","text":"caf` + esc("00e9") + `"}`), msg(`{"type":"text","text":"caf` + string(rune(0xe9)) + `"}`)},
+	} {
+		a, b := fakeanthropic.Canonical(json.RawMessage(pair[0])), fakeanthropic.Canonical(json.RawMessage(pair[1]))
+		if bytes.Equal(a, b) {
+			t.Errorf("%s: the two forms are equal, but the README documents them as different here", name)
 		}
 	}
 }
@@ -1147,5 +1193,224 @@ func TestScriptsFileFormat(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("decoded\n got %+v\nwant %+v", got, want)
+	}
+}
+
+// withBlock returns msgs with the assistant message at index i's first
+// content block replaced by edit's result.
+func withBlock(msgs []any, i int, edit func(map[string]any) any) []any {
+	out := slices.Clone(msgs)
+	c := slices.Clone(out[i].(map[string]any)["content"].([]any))
+	c[0] = edit(maps.Clone(c[0].(map[string]any)))
+	out[i] = map[string]any{"role": "assistant", "content": c}
+	return out
+}
+
+func TestBindingRejectsTamperedBlocks(t *testing.T) {
+	s, base := start(t, fakeanthropic.Options{DefaultText: "ok", Scripts: map[string][]fakeanthropic.Step{"r": {{RedactedThinking: true}}}})
+	u1, a1 := honestTurn(t, base)
+	honest := []any{u1, map[string]any{"role": "assistant", "content": a1}, userText("More?")}
+	sig := a1[0].(map[string]any)["signature"].(string)
+	raw, _ := base64.StdEncoding.DecodeString(sig)
+	tamper := "messages.1.content.0: Invalid `signature` in `thinking` block."
+	set := func(k string, v any) func(map[string]any) any {
+		return func(b map[string]any) any { b[k] = v; return b }
+	}
+	del := func(k string) func(map[string]any) any {
+		return func(b map[string]any) any { delete(b, k); return b }
+	}
+	for name, tc := range map[string]struct {
+		edit func(map[string]any) any
+		want string
+	}{
+		"thinking text edited":   {set("thinking", "x"), tamper},
+		"thinking key missing":   {del("thinking"), tamper},
+		"thinking not a string":  {set("thinking", 1), tamper},
+		"signature missing":      {del("signature"), tamper},
+		"signature not a string": {set("signature", 5), tamper},
+		"signature not base64":   {set("signature", "%%%"), tamper},
+		"signature too short":    {set("signature", base64.StdEncoding.EncodeToString(raw[:31])), tamper},
+		// Well formed but over another prefix: the binding text.
+		"signature of another prefix": {
+			set("signature", base64.StdEncoding.EncodeToString(append(slices.Clone(raw[:31]), raw[31]^1))),
+			"messages.1.content.0: " + fakeanthropic.BindingErrorText,
+		},
+	} {
+		resp, b := post(t, base, "/v1/messages", mustJSON(t, baseReq(withBlock(honest, 1, tc.edit)...)))
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s: status %d: %s", name, resp.StatusCode, b)
+			continue
+		}
+		e := decode(t, b)["error"].(map[string]any)
+		if e["type"] != "invalid_request_error" || e["message"] != tc.want {
+			t.Errorf("%s: error %v, want %q", name, e, tc.want)
+		}
+		if tc.want == tamper && strings.Contains(string(b), readFixture(t)) {
+			t.Errorf("%s: a tampered block must not read as a binding break: %s", name, b)
+		}
+	}
+
+	// The check fails closed: a malformed sibling (here a bare string in
+	// the content array) does not hide the thinking block next to it.
+	odd := withBlock(honest, 1, set("thinking", "x"))
+	am := odd[1].(map[string]any)
+	am["content"] = append([]any{"not a block"}, am["content"].([]any)...)
+	resp, b := post(t, base, "/v1/messages", mustJSON(t, baseReq(odd...)))
+	if e := decode(t, b)["error"].(map[string]any); resp.StatusCode != http.StatusBadRequest ||
+		e["message"] != "messages.1.content.1: Invalid `signature` in `thinking` block." {
+		t.Errorf("malformed sibling: status %d: %v", resp.StatusCode, e)
+	}
+
+	// redacted_thinking: an edited data field is tampering too.
+	ur := map[string]any{"role": "user", "content": "[[fake:r]]"}
+	ar := assemble(t, stream(t, base, baseReq(ur)))
+	red := []any{ur, map[string]any{"role": "assistant", "content": ar}, userText("next")}
+	resp, b = post(t, base, "/v1/messages", mustJSON(t, baseReq(withBlock(red, 1, set("data", "%%%"))...)))
+	if e := decode(t, b)["error"].(map[string]any); resp.StatusCode != http.StatusBadRequest ||
+		e["message"] != "messages.1.content.0: Invalid `data` in `redacted_thinking` block." {
+		t.Errorf("redacted data: status %d: %v", resp.StatusCode, e)
+	}
+	for _, r := range s.Requests() {
+		if r.BindingOK != (r.Seq == 1 || r.Seq == 11) { // the two honest mints
+			t.Errorf("request %d: BindingOK %v", r.Seq, r.BindingOK)
+		}
+	}
+}
+
+func TestToolUseNeedsAToolResult(t *testing.T) {
+	_, base := start(t, fakeanthropic.Options{Scripts: map[string][]fakeanthropic.Step{"t": {
+		{ToolUses: []fakeanthropic.ToolUse{{Name: "Read", Input: map[string]any{"path": "/a"}}, {Name: "Read", Input: map[string]any{"path": "/b"}}}},
+	}}})
+	u1 := userText("[[fake:t]] read two files")
+	a1 := assemble(t, stream(t, base, baseReq(u1)))
+	result := func(ids ...string) map[string]any {
+		var c []any
+		for _, id := range ids {
+			c = append(c, map[string]any{"type": "tool_result", "tool_use_id": id, "content": "data"})
+		}
+		return map[string]any{"role": "user", "content": c}
+	}
+	want := "messages.1: `tool_use` ids were found without `tool_result` blocks immediately after: %s. " +
+		"Each `tool_use` block must have a corresponding `tool_result` block in the next message."
+	for name, tc := range map[string]struct {
+		next    any
+		missing string
+	}{
+		"no tool_result at all":   {userText("never mind"), "toolu_fake_1_0, toolu_fake_1_1"},
+		"one of two answered":     {result("toolu_fake_1_1"), "toolu_fake_1_0"},
+		"answered for another id": {result("toolu_other", "toolu_fake_1_1"), "toolu_fake_1_0"},
+	} {
+		for _, path := range []string{"/v1/messages", "/v1/messages/count_tokens"} {
+			resp, b := post(t, base, path, mustJSON(t, baseReq(u1, map[string]any{"role": "assistant", "content": a1}, tc.next)))
+			if e := decode(t, b)["error"].(map[string]any); resp.StatusCode != http.StatusBadRequest ||
+				e["type"] != "invalid_request_error" || e["message"] != fmt.Sprintf(want, tc.missing) {
+				t.Errorf("%s %s: status %d: %v", name, path, resp.StatusCode, e)
+			}
+		}
+	}
+	// A trailing tool_use with no next message is unanswered too.
+	resp, b := post(t, base, "/v1/messages", mustJSON(t, baseReq(u1, map[string]any{"role": "assistant", "content": a1})))
+	if e := decode(t, b)["error"].(map[string]any); resp.StatusCode != http.StatusBadRequest ||
+		e["message"] != fmt.Sprintf(want, "toolu_fake_1_0, toolu_fake_1_1") {
+		t.Errorf("trailing tool_use: status %d: %v", resp.StatusCode, e)
+	}
+	// Both answered: accepted (the marker's script has no step 2, so the
+	// reply is that error, after validation and the binding check pass).
+	resp, b = post(t, base, "/v1/messages", mustJSON(t, baseReq(u1, map[string]any{"role": "assistant", "content": a1}, result("toolu_fake_1_0", "toolu_fake_1_1"))))
+	if e := decode(t, b)["error"].(map[string]any); resp.StatusCode != http.StatusBadRequest ||
+		e["message"] != `fakeanthropic: script "t" has no step 2 (it has 1)` {
+		t.Errorf("answered: status %d: %v", resp.StatusCode, e)
+	}
+}
+
+func TestRejectedRequestsUseNoStep(t *testing.T) {
+	s, base := start(t, fakeanthropic.Options{DefaultText: "ok", Scripts: map[string][]fakeanthropic.Step{"s": {{Text: "first"}, {Text: "second"}}}})
+	u1, a1 := honestTurn(t, base)
+	edited := userText("[[fake:s]] edited history")
+	// A binding failure and a validation failure, both marked.
+	if resp, _ := post(t, base, "/v1/messages", mustJSON(t, baseReq(userText("Tell me about otters!"), map[string]any{"role": "assistant", "content": a1}, edited))); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("binding failure: status %d", resp.StatusCode)
+	}
+	if resp, _ := post(t, base, "/v1/messages", mustJSON(t, baseReq(edited, map[string]any{"role": "assistant", "content": []any{
+		map[string]any{"type": "tool_use", "id": "toolu_x", "name": "Read", "input": map[string]any{}},
+	}}))); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("validation failure: status %d", resp.StatusCode)
+	}
+	// The script's first step is still there.
+	a := assemble(t, stream(t, base, baseReq(u1, map[string]any{"role": "assistant", "content": a1}, userText("[[fake:s]] go"))))
+	if got := a[len(a)-1].(map[string]any)["text"]; got != "first" {
+		t.Errorf("reply %q, want the script's first step", got)
+	}
+	if recs := s.Requests(); recs[1].BindingOK || recs[2].BindingOK || !recs[3].BindingOK {
+		t.Errorf("BindingOK: %v %v %v", recs[1].BindingOK, recs[2].BindingOK, recs[3].BindingOK)
+	}
+}
+
+func TestConcurrentRequests(t *testing.T) {
+	const n = 32
+	steps := make([]fakeanthropic.Step, n/2)
+	for i := range steps {
+		steps[i] = fakeanthropic.Step{Text: fmt.Sprintf("step %d", i+1)}
+	}
+	s, base := start(t, fakeanthropic.Options{DefaultText: "ok", Scripts: map[string][]fakeanthropic.Step{"c": steps}})
+	type result struct {
+		status int
+		body   []byte
+		err    error
+	}
+	bodies := make([]string, n)
+	for i := range bodies {
+		marker := ""
+		if i%2 == 0 {
+			marker = "[[fake:c]] "
+		}
+		req := baseReq(userText(marker + "hello"))
+		delete(req, "stream")
+		bodies[i] = mustJSON(t, req)
+	}
+	results := make(chan result, n)
+	var wg sync.WaitGroup
+	for _, body := range bodies {
+		wg.Go(func() {
+			resp, err := http.Post(base+"/v1/messages", "application/json", strings.NewReader(body))
+			if err != nil {
+				results <- result{err: err}
+				return
+			}
+			defer resp.Body.Close()
+			b, err := io.ReadAll(resp.Body)
+			results <- result{resp.StatusCode, b, err}
+		})
+	}
+	wg.Wait()
+	close(results)
+
+	got := map[string]int{}
+	for r := range results {
+		if r.err != nil || r.status != http.StatusOK {
+			t.Errorf("status %d, err %v: %s", r.status, r.err, r.body)
+			continue
+		}
+		c := decode(t, r.body)["content"].([]any)
+		got[c[len(c)-1].(map[string]any)["text"].(string)]++
+	}
+
+	recs := s.Requests()
+	if len(recs) != n {
+		t.Fatalf("%d records, want %d", len(recs), n)
+	}
+	for i, r := range recs {
+		if r.Seq != i+1 {
+			t.Errorf("record %d has Seq %d: Seqs must be distinct, 1..%d", i, r.Seq, n)
+		}
+	}
+	// Each step went to exactly one marked request (in lock order, not Seq
+	// order); the unmarked half got the default.
+	want := map[string]int{"ok": n / 2}
+	for i := range n / 2 {
+		want[fmt.Sprintf("step %d", i+1)] = 1
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("replies %v, want %v", got, want)
 	}
 }

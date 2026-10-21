@@ -471,7 +471,7 @@ func decodeKey(raw []byte) string {
 type boundRequest struct {
 	system, tools *node // nil when absent
 	messages      []*node
-	decoded       []apiMessage
+	decoded       []apiMessage // for the script marker only; the check reads the nodes
 }
 
 // prefixSigner computes HMAC-SHA256(key, Canonical(prefix)) for the prefix
@@ -572,43 +572,81 @@ func validBlock(key, sig, mac, prev []byte) bool {
 }
 
 // bindingFailure locates the first replayed block that fails the check.
-type bindingFailure struct{ msg, block int }
+// A tampered block (one the fake cannot have minted) gets the API's
+// invalid-signature text; a well-formed block replayed against another
+// prefix or out of its chain gets BindingErrorText.
+type bindingFailure struct {
+	msg, block int
+	tampered   bool
+	typ        string // thinking or redacted_thinking
+}
 
 func (f bindingFailure) message() string {
+	if f.tampered {
+		field := "signature"
+		if f.typ == "redacted_thinking" {
+			field = "data"
+		}
+		return fmt.Sprintf("messages.%d.content.%d: Invalid `%s` in `%s` block.", f.msg, f.block, field, f.typ)
+	}
 	return fmt.Sprintf("messages.%d.content.%d: %s", f.msg, f.block, BindingErrorText)
+}
+
+// replayedSignature reads a thinking or redacted_thinking block the way it
+// was minted: a thinking block carries `thinking: ""` (the fake mints no
+// text, so any other value is an edit) and a base64 `signature`, a
+// redacted_thinking block a base64 `data`, each of a signature's length.
+// Anything else is tampering.
+func replayedSignature(b *node, typ string) ([]byte, bool) {
+	field := "data"
+	if typ == "thinking" {
+		field = "signature"
+		if t := b.get("thinking"); t == nil || t.kind != '"' || t.str() != "" {
+			return nil, false
+		}
+	}
+	s := b.get(field)
+	if s == nil || s.kind != '"' {
+		return nil, false
+	}
+	sig, err := base64.StdEncoding.DecodeString(s.str())
+	if err != nil || (len(sig) != macLen && len(sig) != macLen+chainLen) {
+		return nil, false
+	}
+	return sig, true
 }
 
 // checkBinding re-verifies every thinking and redacted_thinking block of
 // every assistant message, and returns the signature for a reply to this
-// request. Each block must match its own message's prefix (Canonical, which
-// leaves thinking out), and the replayed blocks must be a contiguous window
-// of the sequence they were generated in: every block after the first
-// replayed one must chain to the replayed block just before it. Dropping
-// blocks from the front, the back or both passes; a block missing from the
-// middle, a reorder, or a block put back after a later one was generated
-// without it fails the block after the gap.
+// request. It reads the parse tree, so it fails closed: every block whose
+// type is thinking or redacted_thinking is checked, whatever surrounds it.
+// Each block must be as minted (replayedSignature), match its own
+// message's prefix (Canonical, which leaves thinking out), and the replayed
+// blocks must be a contiguous window of the sequence they were generated
+// in: every block after the first replayed one must chain to the replayed
+// block just before it. Dropping blocks from the front, the back or both
+// passes; a block missing from the middle, a reorder, or a block put back
+// after a later one was generated without it fails the block after the gap.
 func checkBinding(key []byte, r *boundRequest) (replySig string, fail *bindingFailure) {
 	p := newPrefixSigner(key, r)
 	var prev []byte // the previous replayed block's signature
 	for i, m := range r.messages {
-		if r.decoded[i].Role == "assistant" {
+		if c := m.get("content"); m.get("role").str() == "assistant" && c != nil && c.kind == '[' {
 			var mac []byte
-			for j, b := range r.decoded[i].blocks() {
-				var got string
-				switch b.Type {
-				case "thinking":
-					got = b.Signature
-				case "redacted_thinking":
-					got = b.Data
-				default:
+			for j, b := range c.elems {
+				typ := b.get("type").str()
+				if typ != "thinking" && typ != "redacted_thinking" {
 					continue
+				}
+				sig, ok := replayedSignature(b, typ)
+				if !ok {
+					return "", &bindingFailure{msg: i, block: j, tampered: true, typ: typ}
 				}
 				if mac == nil {
 					mac = p.sum()
 				}
-				sig, err := base64.StdEncoding.DecodeString(got)
-				if err != nil || !validBlock(key, sig, mac, prev) {
-					return "", &bindingFailure{msg: i, block: j}
+				if !validBlock(key, sig, mac, prev) {
+					return "", &bindingFailure{msg: i, block: j, typ: typ}
 				}
 				prev = sig
 			}
