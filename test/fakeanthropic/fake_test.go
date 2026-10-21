@@ -656,6 +656,55 @@ func TestServerToolAutoAnswered(t *testing.T) {
 	}
 }
 
+// TestServerToolOnePairPerSearch: a reply that reports N web searches holds
+// N server_tool_use / web_search_tool_result pairs, as the API's does (the
+// CLI counts searches from those blocks; Spike S17).
+func TestServerToolOnePairPerSearch(t *testing.T) {
+	results := []fakeanthropic.SearchResult{{Title: "Otter facts", URL: "https://example.test/otters", Snippet: "Otters hold hands while sleeping."}}
+	_, base := start(t, fakeanthropic.Options{
+		SearchResults: results,
+		Scripts:       map[string][]fakeanthropic.Step{"ws": {{Text: "Found it.", Usage: &fakeanthropic.Usage{WebSearchRequests: 3}}}},
+	})
+	evs := stream(t, base, webSearchReq(userText("[[fake:ws]] otters")))
+	want := []string{
+		"message_start", "ping",
+		"content_block_start", "content_block_delta", "content_block_stop", // thinking
+		"content_block_start", "content_block_delta", "content_block_stop", // server_tool_use 0
+		"content_block_start", "content_block_stop", // web_search_tool_result 0
+		"content_block_start", "content_block_delta", "content_block_stop", // server_tool_use 1
+		"content_block_start", "content_block_stop", // web_search_tool_result 1
+		"content_block_start", "content_block_delta", "content_block_stop", // server_tool_use 2
+		"content_block_start", "content_block_stop", // web_search_tool_result 2
+		"content_block_start", "content_block_delta", "content_block_stop", // text
+		"message_delta", "message_stop",
+	}
+	if got := names(evs); !reflect.DeepEqual(got, want) {
+		t.Fatalf("events\n got %v\nwant %v", got, want)
+	}
+	c := assemble(t, evs)
+	if len(c) != 8 {
+		t.Fatalf("%d content blocks, want 8: %v", len(c), c)
+	}
+	result := []any{map[string]any{"type": "web_search_result", "title": "Otter facts", "url": "https://example.test/otters", "encrypted_content": "Otters hold hands while sleeping.", "page_age": nil}}
+	for i, id := range []string{"srvtoolu_fake_1_0", "srvtoolu_fake_1_1", "srvtoolu_fake_1_2"} {
+		wantUse := map[string]any{"type": "server_tool_use", "id": id, "name": "web_search", "input": map[string]any{"query": "[[fake:ws]] otters"}}
+		if !reflect.DeepEqual(c[1+2*i], wantUse) {
+			t.Errorf("block %d\n got %v\nwant %v", 1+2*i, c[1+2*i], wantUse)
+		}
+		wantResult := map[string]any{"type": "web_search_tool_result", "tool_use_id": id, "content": result}
+		if !reflect.DeepEqual(c[2+2*i], wantResult) {
+			t.Errorf("block %d\n got %v\nwant %v", 2+2*i, c[2+2*i], wantResult)
+		}
+	}
+	if c[7].(map[string]any)["text"] != "Found it." {
+		t.Errorf("text %v", c[7])
+	}
+	stu := evs[len(evs)-2].Data["usage"].(map[string]any)["server_tool_use"].(map[string]any)
+	if stu["web_search_requests"] != 3.0 {
+		t.Errorf("web_search_requests %v, want 3", stu["web_search_requests"])
+	}
+}
+
 func TestRefusalStep(t *testing.T) {
 	_, base := start(t, fakeanthropic.Options{Scripts: map[string][]fakeanthropic.Step{"no": {{
 		StopReason: "refusal", Model: "claude-fallback-test", Text: "I can't help with that.",

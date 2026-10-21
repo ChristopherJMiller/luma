@@ -344,13 +344,16 @@ func (s *Server) build(seq int, req *request, st Step, sig string, hdr http.Head
 	}
 	rep.stopReason = "end_turn"
 	if req.webSearch != "" {
-		// Auto-answer the server tool. A step's ToolUses do not apply.
-		id := fmt.Sprintf("srvtoolu_fake_%d_0", seq)
-		rep.blocks = append(rep.blocks,
-			toolUse("server_tool_use", id, req.webSearch, map[string]any{"query": lastUserText(req.bound.decoded)}),
-			webSearchToolResult(id, s.o.SearchResults),
-			text(st.Text))
+		// Auto-answer the server tool: one server_tool_use and
+		// web_search_tool_result pair per search the usage reports, as the
+		// API sends them. A step's ToolUses do not apply.
 		rep.webSearches = max(rep.usage.WebSearchRequests, 1)
+		query := map[string]any{"query": lastUserText(req.bound.decoded)}
+		for i := range rep.webSearches {
+			id := fmt.Sprintf("srvtoolu_fake_%d_%d", seq, i)
+			rep.blocks = append(rep.blocks, toolUse("server_tool_use", id, req.webSearch, query), webSearchToolResult(id, s.o.SearchResults))
+		}
+		rep.blocks = append(rep.blocks, text(st.Text))
 	} else {
 		if st.Text != "" || len(st.ToolUses) == 0 {
 			rep.blocks = append(rep.blocks, text(st.Text))

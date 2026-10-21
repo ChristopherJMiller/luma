@@ -119,15 +119,16 @@ fields are an error. Every field is optional:
   - `message_start` reports `output_tokens: 0`. `message_delta` carries the
     cumulative usage, with `output_tokens` = `Output`.
 - **Web search:** a request whose `tools` include a `web_search_*` server
-  tool is answered with:
-  - a `server_tool_use` (id `srvtoolu_fake_<seq>_0`, `input.query` = the last
-    user text);
-  - a `web_search_tool_result` built from `SearchResults`. Each result's
-    snippet goes where the API puts its opaque `encrypted_content`;
-  - the text block.
+  tool is answered with, for each search (`Usage.WebSearchRequests`, where 0
+  counts as 1), one pair, as the API answers:
+  - a `server_tool_use` (id `srvtoolu_fake_<seq>_<i>`, `input.query` = the
+    last user text);
+  - a `web_search_tool_result` for it, built from `SearchResults`. Each
+    result's snippet goes where the API puts its opaque `encrypted_content`;
 
-  `usage.server_tool_use.web_search_requests` is `Usage.WebSearchRequests`,
-  where 0 counts as 1. A step's `ToolUses` do not apply here.
+  and then the text block. `usage.server_tool_use.web_search_requests` is the
+  same count; the CLI counts a call's searches from the pairs (Spike S17). A
+  step's `ToolUses` do not apply here.
 - **`input_transformations`:** the step's list when it sets one. Otherwise
   `[]` when the request's `anthropic-beta` includes
   `thinking-binding-controls-2026-08-01`, and absent without that beta, as the
