@@ -3,7 +3,8 @@
 Luma is a household agent platform, shipped as one Helm chart: a Go **Core**
 (sessions, auth, memory, cost ledger), a TypeScript **conductor** that hosts the
 Claude Agent SDK, and an assistant-ui **PWA**. Product name in the UI: "Luma,
-powered by Claude", never "Claude Code". The design is `docs/design.md`; the
+powered by Claude", never "Claude Code". The short public design is
+[`docs/design.md`](docs/design.md), which links the full spec; the
 phase-1 plan is `docs/plans/phase-1-lean-chat.md` (read a task there before
 changing the code it covers). This repo is public and Apache-2.0.
 
