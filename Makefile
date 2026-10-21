@@ -47,6 +47,7 @@ tools-versions: ## Print the version of every tool in the dev shell.
 	@kubectl version --client | sed -n 1p
 	@echo "helm $$(helm version --short)"
 	@docker --version
+	@docker buildx version
 	@jq --version
 	@yq --version
 	@echo "actionlint $$(actionlint -version | sed -n 1p)"

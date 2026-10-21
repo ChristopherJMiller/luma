@@ -41,6 +41,11 @@
             kubectl
             kubernetes-helm
             docker-client
+            # `docker buildx`: `imagetools inspect` for pinned digests (Task 3)
+            # and multi-arch image builds (Task 25). docker-client already loads
+            # this same package as its CLI plugin; it is listed so the dependency
+            # is explicit, and `make tools-versions` fails if the plugin goes.
+            docker-buildx
 
             # Plumbing
             gnumake
