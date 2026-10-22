@@ -43,6 +43,7 @@ type Core struct {
 	// Errors and memory.
 	ThinkingBindingErrorsTotal prometheus.Counter     // luma_thinking_binding_errors_total
 	MemoryWritesTotal          *prometheus.CounterVec // luma_memory_writes_total{op,status}
+	AgentsReloadTotal          *prometheus.CounterVec // luma_agents_reload_total{result=ok|error}
 
 	// Evals.
 	EvalLastRunTimestampSeconds *prometheus.GaugeVec   // luma_eval_last_run_timestamp_seconds{suite}
@@ -99,6 +100,7 @@ func NewCore(reg prometheus.Registerer) *Core {
 		ThinkingBindingErrorsTotal: f.counter("luma_thinking_binding_errors_total",
 			"Thinking-block binding errors reported by the conductor."),
 		MemoryWritesTotal: f.counterVec("luma_memory_writes_total", "Memory writes by op and status.", "op", "status"),
+		AgentsReloadTotal: f.counterVec("luma_agents_reload_total", "Agent catalog reloads by result (ok or error).", "result"),
 
 		EvalLastRunTimestampSeconds: f.gaugeVec("luma_eval_last_run_timestamp_seconds",
 			"Unix time of the last eval run, by suite.", "suite"),

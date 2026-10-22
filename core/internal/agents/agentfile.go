@@ -21,11 +21,12 @@ import (
 // Phase-1 vocabulary. Each limit says "phase 1" in its error, so a later
 // phase relaxes one line rather than hunting for it.
 var (
-	validKinds    = []string{"agent", "subagent"}
-	validTiers    = []string{"fast", "smart", "deep"}
-	validEfforts  = []string{"low", "medium", "high"}
-	phase1MCP     = []string{"memory.remember", "memory.forget"}
-	phase1Builtin = []string{"WebSearch", "WebFetch"}
+	validKinds     = []string{"agent", "subagent"}
+	validTiers     = []string{"fast", "smart", "deep"}
+	validEfforts   = []string{"low", "medium", "high"}
+	validAudiences = []string{"admin", "family"}
+	phase1MCP      = []string{"memory.remember", "memory.forget"}
+	phase1Builtin  = []string{"WebSearch", "WebFetch"}
 )
 
 var nameRE = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
@@ -150,6 +151,9 @@ func ParseAgent(b []byte) (AgentFile, error) {
 		return AgentFile{}, fmt.Errorf("agent %s: memory %q is not available in phase 1 (only person or none)", f.Name, memory)
 	default:
 		return AgentFile{}, fmt.Errorf("agent %s: memory %q must be person or none", f.Name, memory)
+	}
+	if f.Audience.Tier != "" && !slices.Contains(validAudiences, f.Audience.Tier) {
+		return AgentFile{}, fmt.Errorf("agent %s: audience tier %q must be admin or family", f.Name, f.Audience.Tier)
 	}
 	if f.Effort != "" && !slices.Contains(validEfforts, f.Effort) {
 		return AgentFile{}, fmt.Errorf("agent %s: effort %q must be low, medium or high", f.Name, f.Effort)

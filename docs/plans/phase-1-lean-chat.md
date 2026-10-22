@@ -511,7 +511,7 @@ The registries are created **before their first users** (S3): every Core descrip
 - **Anomalies:** `luma_usage_anomalies_total{reason}`, `luma_unbound_model_requests_total{model}`, `luma_cost_basis_unexpected_total`.
 - **Turns:** `luma_turns_total{agent,tier,source,outcome}`, `luma_turn_duration_seconds{agent,tier}`.
 - **Conductor link:** `luma_conductor_connected`, `luma_open_hosts`, `luma_link_rejected_total{reason}`.
-- **Errors and memory:** `luma_thinking_binding_errors_total`, `luma_memory_writes_total{op,status}`.
+- **Errors and memory:** `luma_thinking_binding_errors_total`, `luma_memory_writes_total{op,status}`, `luma_agents_reload_total{result=ok|error}` (Task 6 hardening).
 - **Evals:** `luma_eval_last_run_timestamp_seconds{suite}`, `luma_eval_last_run_success{suite}`, `luma_eval_cost_usd_total{suite}`.
 - **Maintenance:** `luma_maintenance_enabled`.
 

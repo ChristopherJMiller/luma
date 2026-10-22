@@ -3,6 +3,7 @@ package agents
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -89,24 +90,38 @@ func LoadCatalog(dir string) (*Catalog, error) {
 	return c, nil
 }
 
-// Agent returns one agent by id.
-func (c *Catalog) Agent(id string) (AgentFile, bool) {
-	a, ok := c.agents[id]
-	return a, ok
+// clone copies the slices, so a caller cannot mutate a shared snapshot.
+func (a AgentFile) clone() AgentFile {
+	a.Tiers = slices.Clone(a.Tiers)
+	a.BuiltinTools = slices.Clone(a.BuiltinTools)
+	a.MCP = slices.Clone(a.MCP)
+	a.UntrustedInputs = slices.Clone(a.UntrustedInputs)
+	a.Subagents = slices.Clone(a.Subagents)
+	return a
 }
 
-// List returns every agent, sorted by name.
+// Agent returns a copy of one agent by id.
+func (c *Catalog) Agent(id string) (AgentFile, bool) {
+	a, ok := c.agents[id]
+	return a.clone(), ok
+}
+
+// List returns a copy of every agent, sorted by name.
 func (c *Catalog) List() []AgentFile {
 	out := make([]AgentFile, 0, len(c.agents))
 	for _, a := range c.agents {
-		out = append(out, a)
+		out = append(out, a.clone())
 	}
 	slices.SortFunc(out, func(x, y AgentFile) int { return strings.Compare(x.Name, y.Name) })
 	return out
 }
 
-// Models returns the catalog's models.yaml.
-func (c *Catalog) Models() Models { return c.models }
+// Models returns a copy of the catalog's models.yaml.
+func (c *Catalog) Models() Models {
+	m := c.models
+	m.Tiers = maps.Clone(m.Tiers)
+	return m
+}
 
 // Compile compiles one agent of the catalog for a tier.
 func (c *Catalog) Compile(id, tier string) (protocol.AgentSpec, error) {

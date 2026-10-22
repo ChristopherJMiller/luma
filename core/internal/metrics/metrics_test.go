@@ -38,6 +38,7 @@ var c7Core = []struct {
 	{"luma_link_rejected_total", []string{"reason"}, "LinkRejectedTotal"},
 	{"luma_thinking_binding_errors_total", nil, "ThinkingBindingErrorsTotal"},
 	{"luma_memory_writes_total", []string{"op", "status"}, "MemoryWritesTotal"},
+	{"luma_agents_reload_total", []string{"result"}, "AgentsReloadTotal"},
 	{"luma_eval_last_run_timestamp_seconds", []string{"suite"}, "EvalLastRunTimestampSeconds"},
 	{"luma_eval_last_run_success", []string{"suite"}, "EvalLastRunSuccess"},
 	{"luma_eval_cost_usd_total", []string{"suite"}, "EvalCostUSDTotal"},
