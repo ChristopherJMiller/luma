@@ -48,10 +48,7 @@ func TestAppendEventsSerialisedPerSession(t *testing.T) {
 	}()
 
 	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if count(t, su, `select count(*) from pg_locks where locktype = 'advisory' and not granted`) > 0 {
-			break
-		}
+	for count(t, su, `select count(*) from pg_locks where locktype = 'advisory' and not granted`) == 0 {
 		if time.Now().After(deadline) {
 			close(release)
 			t.Fatal("the second append to ses_a never waited on the advisory lock")
