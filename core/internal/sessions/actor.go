@@ -51,6 +51,10 @@ type turn struct {
 	started   time.Time
 	capStop   func() bool // the wall-clock cap's timer (S48)
 	graceStop func() bool // the wait for a turn_result after an error or the cap's interrupt (S48)
+	// sent is the turn's turn.send, kept so an idle eviction that raced it
+	// can be answered by resending it (once: resent).
+	sent   *protocol.TurnSend
+	resent bool
 }
 
 // deadline is a turn backstop that fired (S48).
@@ -307,22 +311,9 @@ func (a *actor) startTurn(ctx context.Context, um protocol.UserMessage) error {
 	return a.setStatus(ctx, "running")
 }
 
-// deliver opens a host if the session has none on this link (lazily, with
-// resume once the SDK has seen the session; S2), then sends the turn. A
-// failure fails the turn: the message is already safe.
+// deliver builds the turn's turn.send and transmits it; the wall-clock cap
+// starts once it is out.
 func (a *actor) deliver(ctx context.Context, um protocol.UserMessage, blocks []protocol.ContentBlock) {
-	if !a.hostOpen {
-		spec, err := a.hostSpec(ctx)
-		if err == nil {
-			err = a.s.cond.Open(ctx, spec)
-		}
-		if err != nil {
-			a.warn("host.open failed", err)
-			a.failTurn(ctx, protocol.CodeConductorRestarted)
-			return
-		}
-		a.hostOpen = true
-	}
 	content := make([]protocol.ContentBlock, 0, len(um.Content)+len(blocks)+1)
 	for _, b := range um.Content {
 		if b.Text != "" {
@@ -331,13 +322,44 @@ func (a *actor) deliver(ctx context.Context, um protocol.UserMessage, blocks []p
 	}
 	content = append(content, blocks...)
 	content = append(content, protocol.ContentBlock{Type: "text", Text: NowContext(a.s.clock(), a.s.cfg.Location)})
-	ts := protocol.TurnSend{SessionID: a.id, TurnID: a.turn.id, Content: content, Untrusted: a.tainted()}
-	if err := a.s.cond.SendTurn(ctx, ts); err != nil {
+	a.turn.sent = &protocol.TurnSend{SessionID: a.id, TurnID: a.turn.id, Content: content, Untrusted: a.tainted()}
+	if a.transmit(ctx) {
+		a.turn.capStop = a.arm(a.s.cfg.TurnMax, deadlineCap)
+	}
+}
+
+// transmit opens a host if the session has none on this link (lazily, with
+// resume once the SDK has seen the session; S2), then sends the turn's
+// turn.send. A failure fails the turn: the message is already safe.
+func (a *actor) transmit(ctx context.Context) bool {
+	if !a.hostOpen {
+		spec, err := a.hostSpec(ctx)
+		if err == nil {
+			err = a.s.cond.Open(ctx, spec)
+		}
+		if err != nil {
+			a.warn("host.open failed", err)
+			a.failTurn(ctx, protocol.CodeConductorRestarted)
+			return false
+		}
+		a.hostOpen = true
+	}
+	if err := a.s.cond.SendTurn(ctx, *a.turn.sent); err != nil {
 		a.warn("turn.send failed", err)
 		a.failTurn(ctx, protocol.CodeConductorRestarted)
-		return
+		return false
 	}
-	a.turn.capStop = a.arm(a.s.cfg.TurnMax, deadlineCap)
+	return true
+}
+
+// evictedBeforeStart reports the idle-eviction race: the conductor closed an
+// idle host (idle, or evicted to make room) as this turn's turn.send went out
+// on it, and the CLI never started the turn (no message_started, no error).
+// The turn can be resent to a reopened host, once.
+func (a *actor) evictedBeforeStart(reason string) bool {
+	t := a.turn
+	return (reason == "idle" || reason == "evicted") &&
+		t.sent != nil && !t.resent && t.asst == nil && t.errCode == nil && !t.unstored
 }
 
 // ---- turn backstops (S48) ----
@@ -716,10 +738,17 @@ func (a *actor) onHostState(ctx context.Context, hs protocol.HostState) {
 		a.hostOpen = true
 	case "closed":
 		a.hostOpen = false
-		if a.turn != nil {
-			slog.Info("sessions: host closed under a turn", "session", a.id, "turn", a.turn.id, "reason", hs.Reason)
-			a.failTurn(ctx, closedCode(hs.Reason))
+		if a.turn == nil {
+			return
 		}
+		if a.evictedBeforeStart(hs.Reason) {
+			slog.Info("sessions: host evicted as its turn went out; reopening and resending", "session", a.id, "turn", a.turn.id, "reason", hs.Reason)
+			a.turn.resent = true
+			a.transmit(ctx)
+			return
+		}
+		slog.Info("sessions: host closed under a turn", "session", a.id, "turn", a.turn.id, "reason", hs.Reason)
+		a.failTurn(ctx, closedCode(hs.Reason))
 	}
 }
 

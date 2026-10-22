@@ -617,6 +617,90 @@ func TestSweepOnStartContinuesPastABadSession(t *testing.T) {
 	}
 }
 
+// The idle-eviction race (carry to Task 10): a send that found the host open
+// while the conductor evicted it gets host.state{closed, idle|evicted} under
+// a turn the CLI never started. Core reopens the host (with resume) and
+// resends the same turn, once; the turn then runs normally.
+func TestIdleEvictionRaceResendsTheTurn(t *testing.T) {
+	for _, reason := range []string{"idle", "evicted"} {
+		t.Run(reason, func(t *testing.T) {
+			h := newHarness(t)
+			ses := h.newSession(family)
+			h.send(family, ses.ID, "one")
+			h.hostState(protocol.HostState{SessionID: ses.ID, State: "ready", SDKSessionID: "s1"})
+			r1 := result("sdk-u1", "hello", 0.02)
+			h.link(ses.ID, protocol.LinkMessageStarted{Model: haiku}, r1)
+
+			h.send(family, ses.ID, "two")
+			sent := h.lastSend()
+			h.hostState(protocol.HostState{SessionID: ses.ID, State: "closed", Reason: reason})
+
+			opens := h.cond.Opens()
+			if len(opens) != 2 {
+				t.Fatalf("host.open sent %d times, want a reopen", len(opens))
+			}
+			if want := (&protocol.Resume{SDKSessionID: "s1", BaselineTotals: &r1.Totals}); !reflect.DeepEqual(opens[1].Resume, want) {
+				t.Fatalf("reopen resume = %+v, want %+v", opens[1].Resume, want)
+			}
+			sends := h.cond.Sends()
+			if len(sends) != 3 || !reflect.DeepEqual(sends[2], sent) {
+				t.Fatalf("turn.sends = %d (last %+v), want the same turn resent", len(sends), sends[len(sends)-1])
+			}
+			if turn, running := h.svc.RunningTurn(ses.ID); !running || turn != sent.TurnID {
+				t.Fatalf("running turn = %q %v, want %s still running", turn, running, sent.TurnID)
+			}
+			if errs := h.events(ses.ID, "error"); len(errs) != 0 {
+				t.Fatalf("error events = %+v, want none", errs)
+			}
+
+			h.link(ses.ID, protocol.LinkMessageStarted{Model: haiku}, result("sdk-u2", "again", 0.01))
+			asst := h.messages(ses.ID, "assistant")
+			if len(asst) != 2 || asst[1].Status != "complete" || asst[1].TurnID != sent.TurnID {
+				t.Fatalf("assistant messages = %+v, want the resent turn complete", asst)
+			}
+			if h.row(ses.ID).Status != "idle" || len(h.events(ses.ID, "error")) != 0 {
+				t.Fatal("the resent turn did not end cleanly")
+			}
+		})
+	}
+}
+
+// A close after message_started is not the race: the CLI ran the turn, so
+// it fails as before. A turn evicted twice before it started is resent only
+// once, then failed.
+func TestEvictionOfAStartedTurnFailsIt(t *testing.T) {
+	h := newHarness(t)
+	ses := h.newSession(family)
+	h.send(family, ses.ID, "one")
+	h.link(ses.ID, protocol.LinkMessageStarted{Model: haiku})
+	h.hostState(protocol.HostState{SessionID: ses.ID, State: "closed", Reason: "idle"})
+	if _, running := h.svc.RunningTurn(ses.ID); running {
+		t.Fatal("a started turn survived its host's close")
+	}
+	if n, m := len(h.cond.Opens()), len(h.cond.Sends()); n != 1 || m != 1 {
+		t.Fatalf("opens %d, sends %d; want no resend of a started turn", n, m)
+	}
+	if errs := h.events(ses.ID, "error"); len(errs) != 1 || errs[0].Body != (protocol.ErrorEvent{Code: protocol.CodeUpstreamError, Retryable: true}) {
+		t.Fatalf("error events = %+v", errs)
+	}
+
+	h.send(family, ses.ID, "two") // reopens: the host closed
+	h.hostState(protocol.HostState{SessionID: ses.ID, State: "closed", Reason: "idle"})
+	if n, m := len(h.cond.Opens()), len(h.cond.Sends()); n != 3 || m != 3 {
+		t.Fatalf("opens %d, sends %d after the first eviction; want one resend", n, m)
+	}
+	h.hostState(protocol.HostState{SessionID: ses.ID, State: "closed", Reason: "evicted"})
+	if _, running := h.svc.RunningTurn(ses.ID); running {
+		t.Fatal("a turn evicted twice is still running")
+	}
+	if n, m := len(h.cond.Opens()), len(h.cond.Sends()); n != 3 || m != 3 {
+		t.Fatalf("opens %d, sends %d after the second eviction; want no second resend", n, m)
+	}
+	if errs := h.events(ses.ID, "error"); len(errs) != 2 {
+		t.Fatalf("error events = %d, want the second turn failed too", len(errs))
+	}
+}
+
 func TestCapacityClosedFailsTurn(t *testing.T) {
 	h := newHarness(t)
 	ses := h.newSession(family)
