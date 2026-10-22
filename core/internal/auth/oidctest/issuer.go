@@ -54,12 +54,17 @@ type Issuer struct {
 	srv *httptest.Server
 	key *rsa.PrivateKey
 
-	mu            sync.Mutex
-	identity      Identity
-	nonceOverride *string
-	codes         map[string]grant
-	authRequests  []url.Values
-	tokenRequests []TokenRequest
+	mu             sync.Mutex
+	identity       Identity
+	nonceOverride  *string
+	claimsOverride func(map[string]any)
+	foreignKey     *rsa.PrivateKey // signs tokens instead of key when set
+	down           bool
+	hold           chan struct{} // non-nil: every request waits for it to close
+	discoveries    int
+	codes          map[string]grant
+	authRequests   []url.Values
+	tokenRequests  []TokenRequest
 }
 
 type grant struct {
@@ -86,10 +91,82 @@ func New(t testing.TB, clientID, clientSecret, redirectURI string) *Issuer {
 	mux.HandleFunc("GET /keys", i.keys)
 	mux.HandleFunc("GET /auth", i.auth)
 	mux.HandleFunc("POST /token", i.token)
-	i.srv = httptest.NewServer(mux)
+	i.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		i.mu.Lock()
+		if r.URL.Path == "/.well-known/openid-configuration" {
+			i.discoveries++
+		}
+		down, hold := i.down, i.hold
+		i.mu.Unlock()
+		if hold != nil {
+			select {
+			case <-hold:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		if down {
+			http.Error(w, "oidctest: down", http.StatusServiceUnavailable)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	}))
 	i.URL = i.srv.URL
 	t.Cleanup(i.srv.Close)
 	return i
+}
+
+// SetDown makes every endpoint answer 503 (an outage) until SetDown(false).
+func (i *Issuer) SetDown(down bool) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.down = down
+}
+
+// Hold makes every later request wait until release is called (or the
+// client gives up). release is idempotent; call it before the test ends.
+func (i *Issuer) Hold() (release func()) {
+	ch := make(chan struct{})
+	i.mu.Lock()
+	i.hold = ch
+	i.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			i.mu.Lock()
+			i.hold = nil
+			i.mu.Unlock()
+			close(ch)
+		})
+	}
+}
+
+// DiscoveryRequests counts the discovery requests that have arrived.
+func (i *Issuer) DiscoveryRequests() int {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return i.discoveries
+}
+
+// OverrideClaims lets f rewrite the claims of every later ID token just
+// before it is signed (a wrong aud or iss, an expired exp, ...).
+func (i *Issuer) OverrideClaims(f func(claims map[string]any)) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.claimsOverride = f
+}
+
+// SignWithForeignKey signs every later ID token with a key that is not in
+// the JWKS, under the published key id: a bad signature.
+func (i *Issuer) SignWithForeignKey(t testing.TB) {
+	t.Helper()
+	k, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.foreignKey = k
 }
 
 // SetIdentity sets who the next /auth request signs in as.
@@ -197,7 +274,10 @@ func (i *Issuer) token(w http.ResponseWriter, r *http.Request) {
 	i.tokenRequests = append(i.tokenRequests, tr)
 	g, found := i.codes[r.PostForm.Get("code")]
 	delete(i.codes, r.PostForm.Get("code")) // single use
-	nonceOverride := i.nonceOverride
+	nonceOverride, claimsOverride, signer := i.nonceOverride, i.claimsOverride, i.key
+	if i.foreignKey != nil {
+		signer = i.foreignKey
+	}
 	i.mu.Unlock()
 
 	if !tr.HasBasic || tr.BasicUser != i.ClientID ||
@@ -225,19 +305,22 @@ func (i *Issuer) token(w http.ResponseWriter, r *http.Request) {
 	if g.identity.ConnectorID != "" {
 		claims["federated_claims"] = map[string]string{"connector_id": g.identity.ConnectorID, "user_id": g.identity.Subject}
 	}
+	if claimsOverride != nil {
+		claimsOverride(claims)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token": b64(random(16)), "token_type": "bearer", "expires_in": 3600,
-		"id_token": i.sign(claims),
+		"id_token": sign(signer, claims),
 	})
 }
 
-// sign makes an RS256 JWS compact serialisation.
-func (i *Issuer) sign(claims map[string]any) string {
+// sign makes an RS256 JWS compact serialisation under the published key id.
+func sign(key *rsa.PrivateKey, claims map[string]any) string {
 	header, _ := json.Marshal(map[string]string{"alg": "RS256", "kid": keyID, "typ": "JWT"})
 	payload, _ := json.Marshal(claims)
 	input := b64(header) + "." + b64(payload)
 	sum := sha256.Sum256([]byte(input))
-	sig, err := rsa.SignPKCS1v15(rand.Reader, i.key, crypto.SHA256, sum[:])
+	sig, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, sum[:])
 	if err != nil {
 		panic(err)
 	}

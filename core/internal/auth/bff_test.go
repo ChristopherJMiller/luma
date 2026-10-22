@@ -109,16 +109,25 @@ func newHarness(t *testing.T, publicURL string) *harness {
 
 func (h *harness) newBFF(key []byte, reg *auth.Registry) *auth.BFF {
 	h.t.Helper()
-	b, err := auth.NewBFF(h.t.Context(), auth.BFFConfig{
+	b, err := auth.NewBFFWithClock(h.t.Context(), auth.BFFConfig{
 		PublicURL: h.publicURL, Issuer: h.iss.URL, ClientID: clientID, ClientSecret: clientSecret,
 		SigningKey: key, AbsoluteTTL: 30 * 24 * time.Hour, IdleTTL: 14 * 24 * time.Hour,
 		AllowedOrigins: []string{h.publicURL},
-	}, h.st, reg)
+	}, h.st, reg, h.clock.now)
 	if err != nil {
 		h.t.Fatalf("NewBFF: %v", err)
 	}
-	auth.SetClock(b, h.clock.now)
 	return b
+}
+
+// serveWith serves one request with another BFF's routes, guarded as the
+// harness's are.
+func (h *harness) serveWith(b *auth.BFF, req *http.Request) *httptest.ResponseRecorder {
+	mux := http.NewServeMux()
+	b.Routes(mux)
+	rec := httptest.NewRecorder()
+	auth.UnsafeRequestGuard([]string{h.publicURL})(mux).ServeHTTP(rec, req)
+	return rec
 }
 
 func whoami(w http.ResponseWriter, r *http.Request) {
@@ -432,6 +441,61 @@ func TestNonceMismatchRejected(t *testing.T) {
 	}
 }
 
+// The ID token itself must verify: audience, issuer, expiry, signature.
+func TestIDTokenRejected(t *testing.T) {
+	t.Parallel()
+	cases := map[string]func(h *harness){
+		"wrong audience": func(h *harness) {
+			h.iss.OverrideClaims(func(c map[string]any) { c["aud"] = "another-client" })
+		},
+		"wrong issuer": func(h *harness) {
+			h.iss.OverrideClaims(func(c map[string]any) { c["iss"] = foreign })
+		},
+		"expired": func(h *harness) {
+			h.iss.OverrideClaims(func(c map[string]any) {
+				c["iat"] = time.Now().Add(-2 * time.Hour).Unix()
+				c["exp"] = time.Now().Add(-time.Hour).Unix()
+			})
+		},
+		"bad signature": func(h *harness) { h.iss.SignWithForeignKey(h.t) },
+	}
+	for name, tamper := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t, publicHTTPS)
+			tamper(h)
+			rec := h.login(viaGoogle, "")
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("callback = %d, want 400", rec.Code)
+			}
+			if cookieNamed(t, rec, "__Host-luma") != nil || len(h.rows()) != 0 {
+				t.Fatal("a session was created from a bad ID token")
+			}
+			if n := len(h.iss.TokenRequests()); n != 1 {
+				t.Fatalf("%d token requests, want 1 (the token was fetched, then refused)", n)
+			}
+		})
+	}
+}
+
+// An issuer error (the person declined consent) with the right state is a
+// 400, and no code is exchanged.
+func TestCallbackIssuerError400(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, publicHTTPS)
+	h.iss.SetIdentity(viaGoogle)
+	lc, authURL, _ := h.startLogin("")
+	cb := h.authorize(authURL)
+	cb.RawQuery = url.Values{"state": {cb.Query().Get("state")}, "error": {"access_denied"}}.Encode()
+	rec := h.callback(cb, lc)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("error=access_denied callback = %d, want 400", rec.Code)
+	}
+	if cookieNamed(t, rec, "__Host-luma") != nil || len(h.rows()) != 0 || len(h.iss.TokenRequests()) != 0 {
+		t.Fatal("an issuer error led to an exchange or a session")
+	}
+}
+
 func TestCallbackRotatesSessionID(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t, publicHTTPS)
@@ -707,6 +771,84 @@ func TestNewBFFToleratesIssuerDown(t *testing.T) {
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, publicHTTPS+"/auth/login", nil))
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("/auth/login with the issuer down = %d, want 503", rec.Code)
+	}
+}
+
+func (h *harness) loginReq() *http.Request {
+	return httptest.NewRequest(http.MethodGet, h.publicURL+"/auth/login", nil)
+}
+
+// After an outage the failure is remembered for DiscoveryRetry (sign-ins get
+// 503 at once, without asking the issuer again); then discovery runs again
+// and sign-in works end to end.
+func TestDiscoveryRecoversAfterIssuerOutage(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, publicHTTPS)
+	h.startLogin("") // the harness BFF's own discovery is done
+	h.iss.SetDown(true)
+	b := h.newBFF(signingKey, mustParseRegistry(t, registryYAML))
+	if rec := h.serveWith(b, h.loginReq()); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("login during the outage = %d, want 503", rec.Code)
+	}
+	n := h.iss.DiscoveryRequests()
+
+	h.iss.SetDown(false)
+	if rec := h.serveWith(b, h.loginReq()); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("login inside the retry window = %d, want 503", rec.Code)
+	}
+	if got := h.iss.DiscoveryRequests(); got != n {
+		t.Fatalf("a login inside the retry window asked the issuer again (%d → %d requests)", n, got)
+	}
+
+	h.clock.advance(auth.DiscoveryRetry + time.Second)
+	h.iss.SetIdentity(viaGoogle)
+	rec := h.serveWith(b, h.loginReq())
+	if rec.Code != http.StatusFound {
+		t.Fatalf("login after the issuer came back = %d, want 302", rec.Code)
+	}
+	lc := cookieNamed(t, rec, "__Host-luma-login")
+	loc, _ := url.Parse(rec.Header().Get("Location"))
+	cb := h.authorize(loc)
+	req := httptest.NewRequest(http.MethodGet, publicHTTPS+cb.Path+"?"+cb.RawQuery, nil)
+	req.AddCookie(&http.Cookie{Name: lc.Name, Value: lc.Value})
+	if rec := h.serveWith(b, req); rec.Code != http.StatusFound || cookieNamed(t, rec, "__Host-luma") == nil {
+		t.Fatalf("callback after recovery = %d, want 302 with a session", rec.Code)
+	}
+}
+
+// One discovery attempt is in flight at a time; a caller whose request is
+// cancelled stops waiting for it, and the others share its result.
+func TestDiscoverySingleFlightHonoursRequestContext(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, publicHTTPS)
+	h.startLogin("") // the harness BFF's own discovery is done
+	n := h.iss.DiscoveryRequests()
+	release := h.iss.Hold()
+	defer release()
+	b := h.newBFF(signingKey, mustParseRegistry(t, registryYAML)) // its discovery is now held
+
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if rec := h.serveWith(b, h.loginReq().WithContext(ctx)); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("a cancelled login while discovery hangs = %d, want 503", rec.Code)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("the cancelled login waited %v for the hung discovery", d)
+	}
+
+	codes := make(chan int, 5)
+	for range 5 {
+		go func() { codes <- h.serveWith(b, h.loginReq()).Code }()
+	}
+	release()
+	for range 5 {
+		if code := <-codes; code != http.StatusFound {
+			t.Errorf("a login sharing the discovery attempt = %d, want 302", code)
+		}
+	}
+	if got := h.iss.DiscoveryRequests(); got != n+1 {
+		t.Fatalf("%d discovery requests for the new BFF, want exactly 1", got-n)
 	}
 }
 

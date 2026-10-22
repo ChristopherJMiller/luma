@@ -65,8 +65,9 @@ var (
 
 // UnsafeRequestGuard refuses every unsafe method (POST, PUT, PATCH, DELETE,
 // and anything else that is not GET, HEAD or OPTIONS) unless it carries
-// exactly one allowed Origin (403 otherwise) and a JSON body type, or
-// multipart/form-data on POST /v1/attachments (415 otherwise). It sits
+// exactly one allowed Origin (403 otherwise) and, when it has a body, a JSON
+// body type, or multipart/form-data on POST /v1/attachments (415 otherwise).
+// Its 403 and 415 are status-only plain text, not ErrorInfo (S41). It sits
 // outside RequirePerson (S17), so a cross-origin request is refused before
 // authentication is looked at: 403, never 401. Task 15 wraps the whole
 // public mux in it once.
@@ -91,11 +92,17 @@ func UnsafeRequestGuard(allowedOrigins []string) func(http.Handler) http.Handler
 	}
 }
 
-// bodyTypeAllowed: application/json everywhere, multipart/form-data on POST
+// bodyTypeAllowed: an empty body needs no Content-Type (S42: the Origin
+// check is the CSRF control; a bodiless DELETE or archive carries nothing to
+// type). A body needs application/json, or multipart/form-data on POST
 // /v1/attachments only. A cross-site page cannot send JSON without a CORS
 // preflight, which Core never answers. A form can send multipart, so it is
 // accepted only on the one route that needs it, behind the Origin check.
+// A body of unknown length (chunked) counts as a body.
 func bodyTypeAllowed(r *http.Request) bool {
+	if r.ContentLength == 0 {
+		return true
+	}
 	mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil {
 		return false

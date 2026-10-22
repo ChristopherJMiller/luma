@@ -1,8 +1,10 @@
 package auth_test
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/ChristopherJMiller/luma/core/internal/auth"
@@ -10,8 +12,17 @@ import (
 
 var ok200 = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 
+// guarded sends one request with a body of `{}` through the guard.
 func guarded(method, path, origin, contentType string) int {
-	req := httptest.NewRequest(method, publicHTTPS+path, nil)
+	return guardedBody(method, path, origin, contentType, "{}")
+}
+
+func guardedBody(method, path, origin, contentType, body string) int {
+	var r io.Reader
+	if body != "" {
+		r = strings.NewReader(body)
+	}
+	req := httptest.NewRequest(method, publicHTTPS+path, r)
 	if origin != "" {
 		req.Header.Set("Origin", origin)
 	}
@@ -29,6 +40,10 @@ func TestUnsafeMethodNeedsAllowedOrigin(t *testing.T) {
 		for _, origin := range []string{"", foreign, "null", "https://other.example.test", "http://luma.example.test", publicHTTPS + ":8443", publicHTTPS + "/"} {
 			if got := guarded(m, "/v1/sessions", origin, "application/json"); got != http.StatusForbidden {
 				t.Errorf("%s with Origin %q = %d, want 403", m, origin, got)
+			}
+			// An empty body needs no Content-Type (S42), but still the Origin.
+			if got := guardedBody(m, "/v1/sessions", origin, "", ""); got != http.StatusForbidden {
+				t.Errorf("bodiless %s with Origin %q = %d, want 403", m, origin, got)
 			}
 		}
 		if got := guarded(m, "/v1/sessions", publicHTTPS, "application/json"); got != http.StatusOK {
@@ -75,7 +90,7 @@ func TestJSONContentTypeRequired(t *testing.T) {
 		{http.MethodPost, "/v1/sessions", "application/jsonx", http.StatusUnsupportedMediaType},
 		{http.MethodPost, "/v1/sessions", "application/json", http.StatusOK},
 		{http.MethodPost, "/v1/sessions", "Application/JSON; charset=utf-8", http.StatusOK},
-		{http.MethodDelete, "/v1/sessions/ses_x", "", http.StatusUnsupportedMediaType},
+		{http.MethodDelete, "/v1/sessions/ses_x", "", http.StatusUnsupportedMediaType}, // a DELETE with a body
 		{http.MethodDelete, "/v1/sessions/ses_x", "application/json", http.StatusOK},
 		{http.MethodPost, "/v1/attachments", "multipart/form-data; boundary=x", http.StatusOK},
 		{http.MethodPost, "/v1/attachments", "application/json", http.StatusUnsupportedMediaType},
@@ -87,6 +102,32 @@ func TestJSONContentTypeRequired(t *testing.T) {
 		if got := guarded(c.method, c.path, publicHTTPS, c.contentType); got != c.want {
 			t.Errorf("%s %s Content-Type %q = %d, want %d", c.method, c.path, c.contentType, got, c.want)
 		}
+	}
+}
+
+// S42: an unsafe request with an empty body needs no Content-Type (the
+// Origin check is the CSRF control). A body of unknown length still does.
+func TestEmptyBodyNeedsNoContentType(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct{ method, path, contentType string }{
+		{http.MethodPost, "/auth/logout", ""},
+		{http.MethodPost, "/v1/sessions/ses_x/archive", ""},
+		{http.MethodDelete, "/v1/sessions/ses_x", ""},
+		{http.MethodPost, "/v1/memory/writes/mem_x/accept", "text/plain"},
+		{http.MethodPost, "/v1/attachments", ""},
+	} {
+		if got := guardedBody(c.method, c.path, publicHTTPS, c.contentType, ""); got != http.StatusOK {
+			t.Errorf("bodiless %s %s (Content-Type %q) = %d, want 200", c.method, c.path, c.contentType, got)
+		}
+	}
+	// Chunked: the length is unknown, so it is a body and needs its type.
+	req := httptest.NewRequest(http.MethodPost, publicHTTPS+"/v1/sessions", strings.NewReader("{}"))
+	req.ContentLength = -1
+	req.Header.Set("Origin", publicHTTPS)
+	rec := httptest.NewRecorder()
+	auth.UnsafeRequestGuard([]string{publicHTTPS})(ok200).ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnsupportedMediaType {
+		t.Errorf("chunked POST without a Content-Type = %d, want 415", rec.Code)
 	}
 }
 

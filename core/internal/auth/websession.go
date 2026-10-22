@@ -69,6 +69,13 @@ func sessionHash(value string) ([]byte, bool) {
 	return sum[:], true
 }
 
+// anyWebSession reads a web session's row whether or not it has expired (the
+// store's zero-time cutoff admits every row), so every path that deletes a
+// row knows its person and fires OnSessionEnded; live judges expiry.
+func (b *BFF) anyWebSession(ctx context.Context, hash []byte) (store.WebSession, error) {
+	return b.st.WebSession(ctx, hash, time.Time{})
+}
+
 // presentedSession returns the hash of the request's session cookie, if it
 // has a well-formed one.
 func (b *BFF) presentedSession(r *http.Request) ([]byte, bool) {
@@ -81,7 +88,9 @@ func (b *BFF) presentedSession(r *http.Request) ([]byte, bool) {
 
 // OnSessionEnded registers f to be called after a web session ends: logout,
 // idle or absolute expiry, a new login replacing it, or a registry change
-// that no longer admits it. Task 9b closes that session's WebSockets. f runs
+// that no longer admits it. Every path that deletes a web_sessions row fires
+// it (the store's DeleteExpiredWebSessions does not; the janitor should call
+// Sweep). Task 9b closes that session's WebSockets. f runs
 // on the goroutine that ended the session and may be called more than once
 // for one session (a sweep racing a logout), so it must be idempotent.
 func (b *BFF) OnSessionEnded(f func(webSessionIDHash []byte, personID string)) {
@@ -136,7 +145,7 @@ func (b *BFF) RequirePerson(next http.Handler) http.Handler {
 		}
 		ctx := r.Context()
 		now := b.now()
-		ws, err := b.st.WebSession(ctx, hash, now)
+		ws, err := b.anyWebSession(ctx, hash)
 		if errors.Is(err, store.ErrNotFound) {
 			unauthorized(w)
 			return

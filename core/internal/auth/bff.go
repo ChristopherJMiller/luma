@@ -68,8 +68,13 @@ type BFF struct {
 
 	sessionCookie, loginCookie string
 
-	oidcMu sync.Mutex
-	oidc   *oidcClient // nil until discovery succeeds
+	// Discovery: at most one attempt in flight; a failure is remembered for
+	// discoveryRetry so sign-ins during an outage get 503 at once.
+	oidcMu       sync.Mutex
+	oidc         *oidcClient   // nil until discovery succeeds
+	discovering  chan struct{} // closed when the in-flight attempt ends
+	discErr      error
+	discFailedAt time.Time
 
 	endedMu sync.Mutex
 	ended   []func([]byte, string)
@@ -80,12 +85,19 @@ type oidcClient struct {
 	verifier *oidc.IDTokenVerifier
 }
 
+// discoveryRetry is how long a failed discovery is remembered.
+const discoveryRetry = 5 * time.Second
+
 // NewBFF validates cfg and builds the BFF. It keeps reg behind an atomic
-// pointer (S11). It tries OIDC discovery at once, but an unreachable issuer
-// is not fatal: existing sessions need only the database, so discovery is
-// retried at the next sign-in. ctx is the server's lifetime: discovery and
+// pointer (S11). It starts OIDC discovery in the background, and an
+// unreachable issuer is not fatal: existing sessions need only the database,
+// so a sign-in retries discovery. ctx is the server's lifetime: discovery and
 // SetRegistry's sweep run under it.
 func NewBFF(ctx context.Context, cfg BFFConfig, st *store.Store, reg *Registry) (*BFF, error) {
+	return newBFF(ctx, cfg, st, reg, time.Now)
+}
+
+func newBFF(ctx context.Context, cfg BFFConfig, st *store.Store, reg *Registry, now func() time.Time) (*BFF, error) {
 	if st == nil || reg == nil {
 		return nil, errors.New("auth: NewBFF needs a store and a registry")
 	}
@@ -127,7 +139,7 @@ func NewBFF(ctx context.Context, cfg BFFConfig, st *store.Store, reg *Registry) 
 		redirectURL: origin + "/auth/callback",
 		absoluteTTL: cfg.AbsoluteTTL, idleTTL: cfg.IdleTTL,
 		httpClient: &http.Client{Timeout: oidcTimeout},
-		now:        time.Now,
+		now:        now,
 	}
 	if b.absoluteTTL == 0 {
 		b.absoluteTTL = DefaultAbsoluteTTL
@@ -143,34 +155,82 @@ func NewBFF(ctx context.Context, cfg BFFConfig, st *store.Store, reg *Registry) 
 		b.sessionCookie, b.loginCookie = "luma_dev", "luma_login_dev"
 	}
 	b.reg.Store(reg)
-	if _, err := b.client(); err != nil {
-		slog.Warn("auth: OIDC discovery failed; retrying at the next sign-in", "err", err)
-	}
+	b.oidcMu.Lock()
+	b.startDiscoveryLocked()
+	b.oidcMu.Unlock()
 	return b, nil
 }
 
-// client returns the OIDC client, running discovery if it has not yet
-// succeeded.
-func (b *BFF) client() (*oidcClient, error) {
+// client returns the OIDC client. Until discovery has succeeded, a caller
+// joins the one attempt in flight (starting it if none is), or gets the last
+// failure at once if it is less than discoveryRetry old. A caller stops
+// waiting when ctx ends; the attempt itself runs on under the BFF's context.
+func (b *BFF) client(ctx context.Context) (*oidcClient, error) {
+	b.oidcMu.Lock()
+	if b.oidc != nil {
+		c := b.oidc
+		b.oidcMu.Unlock()
+		return c, nil
+	}
+	if b.discovering == nil && b.discErr != nil && b.now().Sub(b.discFailedAt) < discoveryRetry {
+		err := b.discErr
+		b.oidcMu.Unlock()
+		return nil, err
+	}
+	done := b.startDiscoveryLocked()
+	b.oidcMu.Unlock()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	b.oidcMu.Lock()
 	defer b.oidcMu.Unlock()
 	if b.oidc != nil {
 		return b.oidc, nil
 	}
+	return nil, b.discErr
+}
+
+// startDiscoveryLocked starts a discovery attempt unless one is in flight,
+// and returns the channel that closes when it ends. b.oidcMu must be held.
+func (b *BFF) startDiscoveryLocked() <-chan struct{} {
+	if b.discovering != nil {
+		return b.discovering
+	}
+	done := make(chan struct{})
+	b.discovering = done
+	go func() {
+		defer close(done)
+		c, err := b.discover()
+		b.oidcMu.Lock()
+		defer b.oidcMu.Unlock()
+		b.discovering = nil
+		if err != nil {
+			b.discErr, b.discFailedAt = err, b.now()
+			slog.Warn("auth: OIDC discovery failed; sign-in retries it", "err", err)
+			return
+		}
+		b.oidc, b.discErr = c, nil
+	}()
+	return done
+}
+
+// discover fetches the issuer's discovery document and builds the client.
+func (b *BFF) discover() (*oidcClient, error) {
 	p, err := oidc.NewProvider(oidc.ClientContext(b.ctx, b.httpClient), b.cfg.Issuer)
 	if err != nil {
 		return nil, err
 	}
 	ep := p.Endpoint()
 	ep.AuthStyle = oauth2.AuthStyleInHeader // client_secret_basic
-	b.oidc = &oidcClient{
+	return &oidcClient{
 		oauth: oauth2.Config{
 			ClientID: b.cfg.ClientID, ClientSecret: b.cfg.ClientSecret,
 			Endpoint: ep, RedirectURL: b.redirectURL, Scopes: scopes,
 		},
 		verifier: p.Verifier(&oidc.Config{ClientID: b.cfg.ClientID}),
-	}
-	return b.oidc, nil
+	}, nil
 }
 
 // Routes registers GET /auth/login, GET /auth/callback and POST /auth/logout.
@@ -223,7 +283,7 @@ func sanitizeReturnTo(s string) string {
 // the login cookie and redirects to the issuer.
 func (b *BFF) login(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	oc, err := b.client()
+	oc, err := b.client(r.Context())
 	if err != nil {
 		slog.Warn("auth: sign-in unavailable, OIDC discovery failed", "err", err)
 		http.Error(w, "Sign-in is unavailable right now. Try again in a minute.", http.StatusServiceUnavailable)
@@ -289,7 +349,7 @@ func (b *BFF) callback(w http.ResponseWriter, r *http.Request) {
 		badLogin(w, "issuer_error")
 		return
 	}
-	oc, err := b.client()
+	oc, err := b.client(r.Context())
 	if err != nil {
 		slog.Warn("auth: sign-in unavailable, OIDC discovery failed", "err", err)
 		http.Error(w, "Sign-in is unavailable right now. Try again in a minute.", http.StatusServiceUnavailable)
@@ -358,7 +418,7 @@ func (b *BFF) callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if old, ok := b.presentedSession(r); ok {
-		b.replaced(r.Context(), old, now)
+		b.replaced(r.Context(), old)
 	}
 	slog.Info("auth: signed in", "person", p.ID, "connector", connector)
 	http.SetCookie(w, b.cookie(b.sessionCookie, value, b.absoluteTTL))
@@ -366,25 +426,26 @@ func (b *BFF) callback(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusFound)
 }
 
-// replaced ends the session a new login replaces, if it was live, and
-// deletes its row either way.
-func (b *BFF) replaced(ctx context.Context, hash []byte, now time.Time) {
-	ws, err := b.st.WebSession(ctx, hash, now)
-	if err == nil {
+// replaced ends the session a new login replaces, expired or not, so its
+// row goes and OnSessionEnded fires. A presented id with no row (planted, or
+// long gone) has nothing to end.
+func (b *BFF) replaced(ctx context.Context, hash []byte) {
+	ws, err := b.anyWebSession(ctx, hash)
+	switch {
+	case err == nil:
 		_ = b.endSession(ctx, hash, ws.PersonID, "replaced")
-		return
-	}
-	if err := b.st.DeleteWebSession(ctx, hash); err != nil {
-		slog.Warn("auth: deleting a replaced web session failed", "err", err)
+	case errors.Is(err, store.ErrNotFound):
+	default:
+		slog.Warn("auth: reading a replaced web session failed", "err", err)
 	}
 }
 
-// logout deletes the web session (OnSessionEnded closes its WebSockets) and
-// clears the cookie. Without a live session it still answers 204.
+// logout ends the web session, expired or not (OnSessionEnded closes its
+// WebSockets), and clears the cookie. Without a session it still answers 204.
 func (b *BFF) logout(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	if hash, ok := b.presentedSession(r); ok {
-		ws, err := b.st.WebSession(r.Context(), hash, b.now())
+		ws, err := b.anyWebSession(r.Context(), hash)
 		switch {
 		case err == nil:
 			if err := b.endSession(r.Context(), hash, ws.PersonID, "logout"); err != nil {
@@ -392,7 +453,6 @@ func (b *BFF) logout(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		case errors.Is(err, store.ErrNotFound):
-			_ = b.st.DeleteWebSession(r.Context(), hash) // an expired row, if any
 		default:
 			slog.Error("auth: reading web session failed", "err", err)
 			http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
