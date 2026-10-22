@@ -137,6 +137,12 @@ type Service struct {
 	afterFunc func(d time.Duration, f func()) (stop func() bool)
 
 	hub hub
+	// streams indexes the open WebSockets by web session and person, so a
+	// session end closes them (Task 9b).
+	streams streams
+	// deletions are the roots whose tree is being deleted: Send and Fork on
+	// any of their sessions answer 404 (S39, Task 9b).
+	deletions deletions
 
 	mu      sync.Mutex
 	actors  map[string]*actor // live actors by session id

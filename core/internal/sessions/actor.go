@@ -181,7 +181,8 @@ func (a *actor) send(ctx context.Context, p auth.Person, um protocol.UserMessage
 	if err := a.reload(ctx); err != nil {
 		return protocol.Message{}, err
 	}
-	if a.sess.PersonID != p.ID {
+	// A tree being deleted takes no turn, so no host reopens mid-delete (S39).
+	if a.sess.PersonID != p.ID || a.s.deletions.has(a.sess.RootID) {
 		return protocol.Message{}, ErrNotFound
 	}
 	msgID := newID("msg_", a.s.clock())
@@ -414,7 +415,7 @@ func (a *actor) interrupt(ctx context.Context, p auth.Person) error {
 	if err := a.reload(ctx); err != nil {
 		return err
 	}
-	if a.sess.PersonID != p.ID {
+	if a.sess.PersonID != p.ID || a.s.deletions.has(a.sess.RootID) {
 		return ErrNotFound
 	}
 	if a.turn == nil {
