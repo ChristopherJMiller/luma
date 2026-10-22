@@ -141,26 +141,34 @@ func webpEXIF(data []byte) []byte {
 }
 
 // jpegSegments walks a JPEG's marker segments up to its first scan (SOS),
-// calling fn with each marker and payload until fn returns false. It stops
-// quietly at anything malformed; a caller treats what it did not see as
-// absent.
+// calling fn with each marker and payload until fn returns false. It finds
+// markers the way image/jpeg does (reader.go's marker loop), so it sees the
+// segments the decoder acts on: a byte that is not 0xFF, or an FF 00 pair,
+// is extraneous data the decoder slides past one byte at a time; 0xFF fill
+// bytes are skipped; an RST marker has no payload; every other marker has a
+// 16-bit length. It stops at the first scan, at EOI, or at a segment that
+// runs past the data (where the decoder fails too).
 func jpegSegments(data []byte, fn func(marker byte, payload []byte) bool) {
 	if len(data) < 2 || data[0] != 0xff || data[1] != 0xd8 {
 		return
 	}
-	for i := 2; i+4 <= len(data); {
-		if data[i] != 0xff {
-			return
+	for i := 2; i+1 < len(data); {
+		if data[i] != 0xff || data[i+1] == 0x00 { // extraneous data
+			i++
+			continue
 		}
 		m := data[i+1]
 		switch {
 		case m == 0xff: // a fill byte
 			i++
 			continue
-		case m == 0x01 || m == 0xd8 || (m >= 0xd0 && m <= 0xd7): // no payload
+		case m >= 0xd0 && m <= 0xd7: // RST: no payload
 			i += 2
 			continue
-		case m == 0xda || m == 0xd9: // the scan, or the end
+		case m == 0xda || m == 0xd9: // the first scan, or the end
+			return
+		}
+		if i+4 > len(data) {
 			return
 		}
 		n := int(binary.BigEndian.Uint16(data[i+2:]))
@@ -174,45 +182,15 @@ func jpegSegments(data []byte, fn func(marker byte, payload []byte) bool) {
 	}
 }
 
-// jpegScans counts a JPEG's scans (SOS segments), walking every segment by
-// its length and each scan's entropy-coded data to the next marker. Inside
-// that data a 0xFF byte is followed by 0x00 (stuffing) or an RST marker,
-// never by 0xDA, and a 0xDA inside another segment (an EXIF thumbnail, an
-// ICC profile) is skipped with that segment, so the count is exact.
+// jpegScans counts the FF DA pairs anywhere in a JPEG: an upper bound on
+// its scans. image/jpeg starts a scan only at an FF DA marker, and inside
+// entropy-coded data an 0xFF is followed only by 0x00 (stuffing) or an RST
+// marker, so no scan is missed however the segments around it are built
+// (S57c re-review: a walk that stopped at a junk byte saw none). An FF DA
+// inside a metadata segment (an EXIF thumbnail, an ICC profile) is counted
+// too: the safe direction.
 func jpegScans(data []byte) int {
-	if len(data) < 2 || data[0] != 0xff || data[1] != 0xd8 {
-		return 0
-	}
-	scans := 0
-	for i := 2; i+4 <= len(data); {
-		if data[i] != 0xff {
-			return scans // malformed: the decoder refuses it
-		}
-		m := data[i+1]
-		switch {
-		case m == 0xff:
-			i++
-			continue
-		case m == 0x01 || (m >= 0xd0 && m <= 0xd8):
-			i += 2
-			continue
-		case m == 0xd9:
-			return scans
-		}
-		n := int(binary.BigEndian.Uint16(data[i+2:]))
-		if n < 2 || i+2+n > len(data) {
-			return scans
-		}
-		i += 2 + n
-		if m != 0xda {
-			continue
-		}
-		scans++
-		for i+1 < len(data) && (data[i] != 0xff || data[i+1] == 0x00 || (data[i+1] >= 0xd0 && data[i+1] <= 0xd7)) {
-			i++
-		}
-	}
-	return scans
+	return bytes.Count(data, []byte{0xff, 0xda})
 }
 
 // jpegFrame is what a JPEG's SOF segment says about its decoding.

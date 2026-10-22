@@ -542,6 +542,42 @@ func jpegScanned(n int) []byte {
 	return append(b, 0xff, 0xd9)
 }
 
+// afterSOF inserts extra bytes right after a jpegSOF/jpegScanned frame
+// header (SOI at 0, the SOF segment at 2).
+func afterSOF(b, extra []byte) []byte {
+	end := 4 + int(b[4])<<8 | int(b[5])
+	out := append(append([]byte{}, b[:end]...), extra...)
+	return append(out, b[end:]...)
+}
+
+// The frame header is found the way image/jpeg finds it, past junk and
+// FF 00, so the decode estimate is the real one. A progressive CMYK
+// 3500x3500 file costs 281 MiB; with a junk byte before its frame it was
+// estimated at 16 B/px (187 MiB) and accepted (S57 re-review).
+func TestJPEGFrameFoundPastJunk(t *testing.T) {
+	cmyk := jpegSOF(0xc2, 3500, 3500, [][2]byte{{1, 1}, {1, 1}, {1, 1}, {1, 1}})
+	// A comment segment first keeps FF D8 FF, which the sniffer needs.
+	before := func(extra ...byte) []byte {
+		b := append([]byte{0xff, 0xd8, 0xff, 0xfe, 0x00, 0x04, 'h', 'i'}, extra...)
+		return append(b, cmyk[2:]...)
+	}
+	for name, data := range map[string][]byte{
+		"a clean file":               cmyk,
+		"a junk byte before the SOF": before(0x00),
+		"FF 00 before the SOF":       before(0xff, 0x00),
+	} {
+		var err error
+		n := bytesAllocated(func() { _, err = Normalize(bytes.NewReader(data), "cmyk.jpg") })
+		if codeOf(err) != protocol.CodeImageTooLarge || n > 1<<20 {
+			t.Fatalf("%s = %v after %d bytes, want image_too_large under 1 MiB", name, err, n)
+		}
+	}
+	// A JPEG whose frame the walk cannot find is not estimated at all.
+	if got := headerRefusal("image/jpeg", image.Config{Width: 10, Height: 10}, []byte{0xff, 0xd8, 0xff, 0xd9}); got != protocol.CodeUnsupportedAttachment {
+		t.Fatalf("a JPEG without a frame header = %q, want unsupported_attachment", got)
+	}
+}
+
 // A progressive JPEG's scans each revisit every coefficient; thousands of
 // tiny scans would hold a decode slot for an hour (S57c). Past 100 the file
 // is refused before decoding.
@@ -558,14 +594,32 @@ func TestJPEGScanCap(t *testing.T) {
 		t.Fatalf("100 scans = %v, want past the scan cap (then undecodable)", err)
 	}
 
-	// The count is exact: one scan in an encoder's JPEG; 0xFF 0xDA inside an
-	// APP1 is not a scan; stuffed bytes and RST markers stay in the scan.
+	// image/jpeg slides past bytes that are not a marker, and past FF 00,
+	// to the next marker. A counter that stopped there saw no scans while
+	// every one of them decoded (the S57c bypass, 1,501 hidden scans took
+	// 29.7 s). Every FF DA pair in the file counts.
+	for name, junk := range map[string][]byte{
+		"a junk byte after the frame header": {0x00},
+		"an FF 00 pseudo-segment":            {0xff, 0x00, 0x7f, 0xff},
+	} {
+		bomb := afterSOF(jpegScanned(5000), junk)
+		start := time.Now()
+		n := bytesAllocated(func() { _, err = Normalize(bytes.NewReader(bomb), "bomb.jpg") })
+		if codeOf(err) != protocol.CodeImageTooLarge || n > 1<<20 || time.Since(start) > 5*time.Second {
+			t.Fatalf("5,000 scans behind %s = %v after %d bytes and %v, want image_too_large at once", name, err, n, time.Since(start))
+		}
+		wantRefused(t, afterSOF(jpegScanned(101), junk), "x.jpg", protocol.CodeImageTooLarge)
+	}
+
+	// The count never misses a scan: one in an encoder's JPEG; stuffed bytes
+	// and RST markers stay in a scan. It may count an FF DA inside a
+	// metadata segment (an EXIF thumbnail, an ICC profile), the safe way.
 	if got := jpegScans(encodeJPEG(t, quadrants())); got != 1 {
 		t.Fatalf("an encoded baseline JPEG has %d scans, want 1", got)
 	}
 	inAPP1 := withAPP1(t, encodeJPEG(t, quadrants()), exifTIFF([]tiffTag{ascii(0x010e, "\xff\xda\xff\xda")}, nil))
-	if got := jpegScans(inAPP1); got != 1 {
-		t.Fatalf("0xFFDA inside an APP1 counted: %d scans, want 1", got)
+	if got := jpegScans(inAPP1); got != 3 {
+		t.Fatalf("two FF DA in an APP1 and one scan = %d, want 3", got)
 	}
 	sos := []byte{0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00}
 	entropy := []byte{0x01, 0xff, 0x00, 0x02, 0xff, 0xd0, 0x03, 0xff, 0xff}
@@ -581,17 +635,17 @@ func TestDecodeSemaphoreLimitsConcurrency(t *testing.T) {
 		t.Fatalf("decode slots = %d, want 2", cap(decodeSlots))
 	}
 	ctx := context.Background()
-	rel1, err := acquireDecode(ctx)
+	rel1, err := acquireDecode(ctx, "pers-a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	rel2, err := acquireDecode(ctx)
+	rel2, err := acquireDecode(ctx, "pers-b")
 	if err != nil {
 		t.Fatal(err)
 	}
 	short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer cancel()
-	if _, err := acquireDecode(short); err == nil {
+	if _, err := acquireDecode(short, "pers-c"); err == nil {
 		t.Fatal("a third decode got a slot")
 	}
 
@@ -638,6 +692,71 @@ func TestDecodeSemaphoreLimitsConcurrency(t *testing.T) {
 	}
 	if len(decodeSlots) != 0 {
 		t.Fatalf("%d slots still held", len(decodeSlots))
+	}
+}
+
+// One person's decodes take one slot at a time (S57 re-review): two slow
+// hostile files from one person never hold both process-wide slots, so
+// someone else's photo still decodes.
+func TestDecodeSlotsPerPerson(t *testing.T) {
+	ctx := context.Background()
+	relA, err := acquireDecode(ctx, "pers-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := make(chan func(), 1)
+	go func() {
+		rel, err := acquireDecode(ctx, "pers-a")
+		if err == nil {
+			second <- rel
+		}
+	}()
+	time.Sleep(100 * time.Millisecond)
+	if len(second) != 0 || len(decodeSlots) != 1 {
+		t.Fatalf("a's second decode got a slot (%d of the 2 taken)", len(decodeSlots))
+	}
+	soon, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	relB, err := acquireDecode(soon, "pers-b")
+	if err != nil {
+		t.Fatalf("b found no slot while a's second job waited: %v", err)
+	}
+	relB()
+	relA()
+	select {
+	case rel := <-second:
+		rel()
+	case <-time.After(10 * time.Second):
+		t.Fatal("a's second decode never got a's slot back")
+	}
+
+	// The same through normalize: with a's slot held, a's photo waits and
+	// b's goes through.
+	photo := encodePNG(t, gradient(30, 20))
+	relA, err = acquireDecode(ctx, "pers-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiting := make(chan error, 1)
+	go func() { _, err := normalize(ctx, "pers-a", bytes.NewReader(photo), 0); waiting <- err }()
+	if _, err := normalize(soon, "pers-b", bytes.NewReader(photo), 0); err != nil {
+		relA()
+		t.Fatalf("b's photo while a's waits: %v", err)
+	}
+	select {
+	case err := <-waiting:
+		relA()
+		t.Fatalf("a's photo decoded while a's slot was held (%v)", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	relA()
+	if err := <-waiting; err != nil {
+		t.Fatal(err)
+	}
+	personSlotsMu.Lock()
+	defer personSlotsMu.Unlock()
+	if len(personSlots) != 0 || len(decodeSlots) != 0 {
+		t.Fatalf("slots left: %d people, %d process-wide", len(personSlots), len(decodeSlots))
 	}
 }
 

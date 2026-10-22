@@ -98,7 +98,7 @@ func TestPdfChildFailuresAreUnsupported(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			withChild(t, mode)
 			start := time.Now()
-			_, err := pageCount(t.Context(), good)
+			_, err := pageCount(t.Context(), "pers-test", good)
 			if codeOf(err) != protocol.CodeUnsupportedAttachment {
 				t.Fatalf("a %s child = %v, want unsupported_attachment", mode, err)
 			}
@@ -111,7 +111,7 @@ func TestPdfChildFailuresAreUnsupported(t *testing.T) {
 	withChild(t, "hang")
 	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
 	defer cancel()
-	if _, err := pageCount(ctx, good); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := pageCount(ctx, "pers-test", good); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("a count whose client left = %v, want the context's error", err)
 	}
 }
@@ -142,7 +142,7 @@ func TestPdfChildMemoryLimit(t *testing.T) {
 		t.Fatalf("committing 320 MiB under the limit = %q, %v; want the child killed", out, err)
 	}
 	// The real counter still works under the limit.
-	if n, err := pageCount(t.Context(), pdfBytes(t, 3, 1<<20)); err != nil || n != 3 {
+	if n, err := pageCount(t.Context(), "pers-test", pdfBytes(t, 3, 1<<20)); err != nil || n != 3 {
 		t.Fatalf("pageCount under the limit = %d, %v", n, err)
 	}
 }

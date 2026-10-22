@@ -38,23 +38,25 @@ type Normalized struct {
 // normalises it. The type comes from the bytes alone; filename, like any
 // type the client declared, decides nothing. A refusal is a
 // *sessions.RefusedError carrying attachment_too_large, image_too_large or
-// unsupported_attachment.
+// unsupported_attachment. Its decodes share one person's decode slot (the
+// empty person id).
 func Normalize(r io.Reader, filename string) (Normalized, error) {
-	return normalize(context.Background(), r, 0)
+	return normalize(context.Background(), "", r, 0)
 }
 
-// normalize is Normalize with the request's context (a decode waits for a
-// slot until the client leaves) and a size hint for the read buffer.
-func normalize(ctx context.Context, r io.Reader, sizeHint int64) (Normalized, error) {
+// normalize is Normalize for a person (whose decode slot it waits for),
+// with the request's context (it waits until the client leaves) and a size
+// hint for the read buffer.
+func normalize(ctx context.Context, personID string, r io.Reader, sizeHint int64) (Normalized, error) {
 	data, err := readFile(r, sizeHint)
 	if err != nil {
 		return Normalized{}, err
 	}
 	switch mt := sniff(data); mt {
 	case "image/jpeg", "image/png", "image/gif", "image/webp":
-		return normalizeImage(ctx, mt, data)
+		return normalizeImage(ctx, personID, mt, data)
 	case "application/pdf":
-		pages, err := pageCount(ctx, data)
+		pages, err := pageCount(ctx, personID, data)
 		if err != nil {
 			return Normalized{}, err
 		}

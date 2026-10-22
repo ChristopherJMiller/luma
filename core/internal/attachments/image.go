@@ -9,6 +9,7 @@ import (
 	"image/gif"
 	"image/jpeg"
 	"image/png"
+	"sync"
 
 	xdraw "golang.org/x/image/draw"
 	"golang.org/x/image/webp"
@@ -33,42 +34,87 @@ const (
 	// ten; each scan revisits every coefficient, so thousands of tiny scans
 	// would hold a decode slot for an hour.
 	maxScans = 100
+	// worstJPEGBytesPerPixel is a progressive four-component JPEG: 4 bytes
+	// of planes, 16 of coefficients, 4 for the CMYK conversion, rounded up.
+	worstJPEGBytesPerPixel = 28
 	// scratchPixels bounds the scratch buffer of one CatmullRom call, which
 	// costs 32 bytes a pixel: 8 MiB.
 	scratchPixels = 1 << 18
 	jpegQuality   = 85
 )
 
-// decodeSlots is the process-wide decode semaphore: two decodes at a time.
+// decodeSlots is the process-wide decode semaphore: two decodes (image
+// decodes and PDF page counts) at a time.
 var decodeSlots = make(chan struct{}, 2)
 
-// acquireDecode takes a decode slot, waiting until one frees or ctx ends.
-func acquireDecode(ctx context.Context) (release func(), err error) {
-	select {
-	case decodeSlots <- struct{}{}:
-		return func() { <-decodeSlots }, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
+// personSlots holds each person's own decode slot, one at a time, so two
+// slow jobs from one person never hold both process-wide slots (S57
+// re-review). An entry lives while anyone holds or waits for it.
+var (
+	personSlotsMu sync.Mutex
+	personSlots   = map[string]*personSlot{}
+)
+
+type personSlot struct {
+	ch   chan struct{}
+	refs int
 }
 
-// normalizeImage checks the header before anything is decoded (pixels,
-// sides, the decoder's memory, a JPEG's scans), then decodes (one slot of
-// two), turns the picture upright, downscales it to the long-edge limit and
-// re-encodes it: PNG when it has transparency, otherwise JPEG at quality
-// 85. Nothing of the original file but its pixels survives: no EXIF, GPS,
-// ICC profile or text.
-func normalizeImage(ctx context.Context, mt string, data []byte) (Normalized, error) {
+// acquireDecode takes the person's decode slot and then one of the two
+// process-wide slots, waiting until both are free or ctx ends.
+func acquireDecode(ctx context.Context, personID string) (release func(), err error) {
+	personSlotsMu.Lock()
+	ps := personSlots[personID]
+	if ps == nil {
+		ps = &personSlot{ch: make(chan struct{}, 1)}
+		personSlots[personID] = ps
+	}
+	ps.refs++
+	personSlotsMu.Unlock()
+	drop := func() {
+		personSlotsMu.Lock()
+		defer personSlotsMu.Unlock()
+		if ps.refs--; ps.refs == 0 {
+			delete(personSlots, personID)
+		}
+	}
+	select {
+	case ps.ch <- struct{}{}:
+	case <-ctx.Done():
+		drop()
+		return nil, ctx.Err()
+	}
+	select {
+	case decodeSlots <- struct{}{}:
+	case <-ctx.Done():
+		<-ps.ch
+		drop()
+		return nil, ctx.Err()
+	}
+	return func() {
+		<-decodeSlots
+		<-ps.ch
+		drop()
+	}, nil
+}
+
+// normalizeImage checks the header before anything is decoded (the frame,
+// pixels, sides, the decoder's memory, a JPEG's scans), then decodes (in
+// the person's decode slot, one of two in all), turns the picture upright,
+// downscales it to the long-edge limit and re-encodes it: PNG when it has
+// transparency, otherwise JPEG at quality 85. Nothing of the original file
+// but its pixels survives: no EXIF, GPS, ICC profile or text.
+func normalizeImage(ctx context.Context, personID, mt string, data []byte) (Normalized, error) {
 	cfg, err := decodeConfig(mt, data)
 	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 {
 		return Normalized{}, refused(protocol.CodeUnsupportedAttachment)
 	}
-	if tooCostly(mt, cfg, data) {
-		return Normalized{}, refused(protocol.CodeImageTooLarge)
+	if code := headerRefusal(mt, cfg, data); code != "" {
+		return Normalized{}, refused(code)
 	}
 	orientation := imageOrientation(mt, data)
 
-	release, err := acquireDecode(ctx)
+	release, err := acquireDecode(ctx, personID)
 	if err != nil {
 		return Normalized{}, err
 	}
@@ -130,17 +176,27 @@ func recoverInto(err *error) {
 	}
 }
 
-// tooCostly reports, from the header alone, an image Core will not decode:
-// over 40 MP, a side over 20,000 px, more than the decoder may allocate, or
-// a JPEG of more than 100 scans. All of it is image_too_large (C3).
-func tooCostly(mt string, cfg image.Config, data []byte) bool {
+// headerRefusal is the code an image is refused with from its header alone,
+// or "". A JPEG whose frame header the segment walk cannot find is
+// unsupported_attachment: its decode cost cannot be estimated (and the
+// walk finds what image/jpeg finds, so the decoder would not read it
+// either). Over 40 MP, a side over 20,000 px, more than the decoder may
+// allocate, or a JPEG of more than 100 scans is image_too_large (C3).
+func headerRefusal(mt string, cfg image.Config, data []byte) protocol.ErrorCode {
+	if mt == "image/jpeg" {
+		if _, ok := readJPEGFrame(data); !ok {
+			return protocol.CodeUnsupportedAttachment
+		}
+	}
 	switch {
 	case int64(cfg.Width)*int64(cfg.Height) > maxPixels, cfg.Width > maxSide, cfg.Height > maxSide:
-		return true
+		return protocol.CodeImageTooLarge
 	case decodeCost(mt, cfg, data) > maxDecodeBytes:
-		return true
+		return protocol.CodeImageTooLarge
+	case mt == "image/jpeg" && jpegScans(data) > maxScans:
+		return protocol.CodeImageTooLarge
 	}
-	return mt == "image/jpeg" && jpegScans(data) > maxScans
+	return ""
 }
 
 // decodeCost estimates, from the header alone, the bytes the decoder will
@@ -215,8 +271,8 @@ func pngRowBytes(width int, data []byte) int64 {
 // four-component (CMYK) file is converted into a second, 4-byte image.
 func jpegCost(cfg image.Config, data []byte) int64 {
 	f, ok := readJPEGFrame(data)
-	if !ok {
-		return int64(cfg.Width) * int64(cfg.Height) * 16
+	if !ok { // headerRefusal refuses this first; the worst case otherwise
+		return int64(cfg.Width) * int64(cfg.Height) * worstJPEGBytesPerPixel
 	}
 	hmax, vmax := 1, 1
 	if len(f.comps) > 1 {

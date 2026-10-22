@@ -62,7 +62,7 @@ func FuzzImageHeaders(f *testing.F) {
 		_, _ = readJPEGFrame(data)
 		for _, mt := range []string{"image/jpeg", "image/png", "image/gif", "image/webp"} {
 			if cfg, err := decodeConfig(mt, data); err == nil {
-				_ = tooCostly(mt, cfg, data)
+				_ = headerRefusal(mt, cfg, data)
 			}
 		}
 	})

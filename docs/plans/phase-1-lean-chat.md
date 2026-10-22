@@ -421,10 +421,10 @@ A `turn_result` that arrives in time ends the turn normally and cancels both. Af
 | `capacity` | 4 busy hosts (`host.state{closed, reason:"capacity"}`) | "Luma is busy with other conversations. Try again in a minute." |
 | `busy` | 409 | "Luma is still answering in this conversation." |
 | `attachment_too_large` | > `MaxAttachmentBytes` (20 MiB) | "That file is over 20 MB." |
-| `image_too_large` | from the header, before decoding: > 40 MP decoded, a side > 20,000 px, an estimated decode > 192 MiB, or a JPEG of > 100 scans (S57) | "That image is too large. Photos up to 40 megapixels work." |
+| `image_too_large` | from the header, before decoding: > 40 MP decoded, a side > 20,000 px, an estimated decode > 192 MiB, or a JPEG with > 100 FF DA (scan) markers anywhere in the file (S57) | "That image is too large. Photos up to 40 megapixels work." |
 | `pdf_too_long` | pages > the tier's `pdf_max_pages` | "That PDF has more than {max} pages, the most Luma reads in this mode." |
 | `conversation_attachments_full` | > 20 MiB per tree, counting each message's attachments (one sent again counts again, S57) | "This conversation already holds 20 MB of files. Start a new chat to add more." |
-| `unsupported_attachment` | sniffed type not allowed, or unparseable: text that is not UTF-8, holds a C0 control other than tab/LF/CR, or is > 1 MiB; a PDF whose page counter fails, crashes or runs past 30 s (S57) | "Luma can read photos, PDFs and text files." |
+| `unsupported_attachment` | sniffed type not allowed, or unparseable: text that is not UTF-8, holds a C0 control other than tab/LF/CR, or is > 1 MiB; a JPEG whose frame header the segment walk cannot find; a PDF whose page counter fails, crashes or runs past 30 s (S57) | "Luma can read photos, PDFs and text files." |
 | `memory_full` | tool result text; 409 on accepting a held remember that no longer fits (Task 13) | "The profile is full. Ask the person to tidy it in Luma's profile page." |
 | `memory_disabled` | tool result text | "Memory is off in this conversation." |
 | `memory_pending_limit` | tool result text (4th pending write in a turn) | "Several memory changes are already waiting for the person's review. Don't save more in this turn." |

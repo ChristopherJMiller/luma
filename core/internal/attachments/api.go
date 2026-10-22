@@ -127,7 +127,7 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request, p auth.Pe
 			}
 			continue
 		}
-		n, err := normalize(r.Context(), part, r.ContentLength)
+		n, err := normalize(r.Context(), p.ID, part, r.ContentLength)
 		if err != nil {
 			uploadFailed(w, r, err)
 			return

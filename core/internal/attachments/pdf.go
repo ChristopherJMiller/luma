@@ -64,8 +64,8 @@ func init() {
 // count runs in a decode slot. A child that fails, crashes, is killed or
 // prints no count is unsupported_attachment (C3); one that cannot be
 // started is a server error.
-func pageCount(ctx context.Context, data []byte) (int, error) {
-	release, err := acquireDecode(ctx)
+func pageCount(ctx context.Context, personID string, data []byte) (int, error) {
+	release, err := acquireDecode(ctx, personID)
 	if err != nil {
 		return 0, err
 	}
