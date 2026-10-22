@@ -132,6 +132,9 @@ type Service struct {
 	// appendEvent is st.AppendEvent: every event of a session is written
 	// through it, by that session's actor (a test counts the writers).
 	appendEvent func(ctx context.Context, sessionID, typ string, payload any, d store.Durability) (int64, error)
+	// createSession is st.CreateSession: Fork inserts its row through it (a
+	// test injects the tree-delete races).
+	createSession func(ctx context.Context, in store.Session) (store.Session, error)
 	// afterFunc runs f once d has passed and returns its stop function: the
 	// turn backstops' timers (time.AfterFunc; tests inject a fake clock).
 	afterFunc func(d time.Duration, f func()) (stop func() bool)
@@ -140,8 +143,8 @@ type Service struct {
 	// streams indexes the open WebSockets by web session and person, so a
 	// session end closes them (Task 9b).
 	streams streams
-	// deletions are the roots whose tree is being deleted: Send and Fork on
-	// any of their sessions answer 404 (S39, Task 9b).
+	// deletions are the roots whose tree is being deleted: Send, Fork and
+	// Tree on any of their sessions answer 404 (S39, Task 9b, Task 11).
 	deletions deletions
 
 	mu      sync.Mutex
@@ -161,11 +164,12 @@ func NewService(st *store.Store, live *agents.Live, c Conductor, prof ProfileSou
 	cfg.WebFetchDenyDomains = append([]string{}, cfg.WebFetchDenyDomains...)
 	return &Service{
 		st: st, live: live, cond: c, prof: prof, att: att, gate: gate, led: led, m: m, clock: clock, cfg: cfg,
-		appendEvent: st.AppendEvent,
-		afterFunc:   func(d time.Duration, f func()) func() bool { return time.AfterFunc(d, f).Stop },
-		hub:         hub{subs: map[string]map[*liveSub]struct{}{}},
-		actors:      map[string]*actor{},
-		running:     map[string]string{},
+		appendEvent:   st.AppendEvent,
+		createSession: st.CreateSession,
+		afterFunc:     func(d time.Duration, f func()) func() bool { return time.AfterFunc(d, f).Stop },
+		hub:           hub{subs: map[string]map[*liveSub]struct{}{}},
+		actors:        map[string]*actor{},
+		running:       map[string]string{},
 	}
 }
 

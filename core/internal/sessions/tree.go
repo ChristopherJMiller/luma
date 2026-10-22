@@ -3,6 +3,7 @@ package sessions
 import (
 	"cmp"
 	"context"
+	"errors"
 	"slices"
 	"strings"
 
@@ -16,7 +17,9 @@ import (
 // the tree with its parent and session, oldest first; head_id, the newest
 // message of the most recently active session that has one; each session's
 // newest event id; and the pending memory writes of the tree's sessions.
-// rootID may name any session of the tree. Another person's is ErrNotFound.
+// rootID may name any session of the tree. Another person's tree, and one
+// being deleted or gone by the end of the reads, is ErrNotFound (S39): a
+// half-deleted tree is never returned.
 //
 // Each session's part is read through its actor, the single writer of its
 // messages and events, so a stream opened since its last_event_ids entry
@@ -28,9 +31,16 @@ func (s *Service) Tree(ctx context.Context, p auth.Person, rootID string) (proto
 	if err != nil {
 		return protocol.Tree{}, err
 	}
-	sessions, err := s.st.TreeSessions(ctx, row.RootID)
+	root := row.RootID
+	if s.deletions.has(root) {
+		return protocol.Tree{}, ErrNotFound
+	}
+	sessions, err := s.st.TreeSessions(ctx, root)
 	if err != nil {
 		return protocol.Tree{}, err
+	}
+	if len(sessions) == 0 {
+		return protocol.Tree{}, ErrNotFound
 	}
 	out := protocol.Tree{LastEventIDs: make(map[string]int64, len(sessions))}
 	var head *store.Session
@@ -61,15 +71,23 @@ func (s *Service) Tree(ctx context.Context, p auth.Person, rootID string) (proto
 	slices.SortFunc(out.Messages, func(x, y protocol.TreeMessage) int {
 		return cmp.Or(x.Message.CreatedAt.Compare(y.Message.CreatedAt), strings.Compare(x.Message.ID, y.Message.ID))
 	})
-	writes, err := s.st.PendingTreeWrites(ctx, row.RootID)
+	writes, err := s.st.PendingTreeWrites(ctx, root)
 	if err != nil {
 		return protocol.Tree{}, err
 	}
 	for _, w := range writes {
-		out.PendingWrites = append(out.PendingWrites, protocol.MemoryWrite{
-			ID: w.ID, SessionID: w.SessionID, TurnID: w.TurnID, Op: w.Op, Text: w.Text, Matched: w.Matched,
-			Untrusted: w.Untrusted, Status: w.Status, CreatedAt: w.CreatedAt, DecidedAt: w.DecidedAt,
-		})
+		out.PendingWrites = append(out.PendingWrites, w.Protocol())
+	}
+	// A delete that began during the reads, or finished (the root goes with
+	// every session of its tree), leaves nothing to show.
+	if s.deletions.has(root) {
+		return protocol.Tree{}, ErrNotFound
+	}
+	if _, err := s.st.Session(ctx, root); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return protocol.Tree{}, ErrNotFound
+		}
+		return protocol.Tree{}, err
 	}
 	return out, nil
 }

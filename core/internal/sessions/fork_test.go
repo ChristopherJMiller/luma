@@ -2,9 +2,11 @@ package sessions
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"reflect"
 	"slices"
@@ -683,5 +685,219 @@ func TestForkAndTreeRoutes(t *testing.T) {
 	wantError(t, st, body, http.StatusBadRequest, protocol.CodeInvalidRequest)
 	if sessions, err := h.st.TreeSessions(bg, r.ID); err != nil || len(sessions) != 2 {
 		t.Fatalf("tree has %d sessions (%v), want the root and the one fork", len(sessions), err)
+	}
+}
+
+// ---- fix round 1 ----
+
+// S53: a fork is a new session, so the Gate refuses it as it refuses Create:
+// 503 maintenance and 402 budget_exhausted, with the Gate's ErrorInfo, and
+// no session is written.
+func TestForkRefusedByGate(t *testing.T) {
+	h := newHarness(t)
+	w := newWeb(h)
+	c := w.login(family)
+	r := h.newSession(family)
+	u1, _ := h.exchange(family, r.ID, "one", "uuid-a1")
+	for _, tc := range []struct {
+		code   protocol.ErrorCode
+		status int
+	}{{protocol.CodeMaintenance, http.StatusServiceUnavailable}, {protocol.CodeBudgetExhausted, http.StatusPaymentRequired}} {
+		h.gate.set(tc.code)
+		var refused *RefusedError
+		if _, err := h.svc.Fork(bg, family, r.ID, u1.ID); !errors.As(err, &refused) || refused.Info.Code != tc.code {
+			t.Fatalf("Fork with a %s gate: err = %v, want a RefusedError with that code", tc.code, err)
+		}
+		st, body := w.do(http.MethodPost, "/v1/sessions/"+r.ID+"/fork", c, fmt.Sprintf(`{"at_message":%q}`, u1.ID))
+		wantErrorInfo(t, st, body, tc.status, tc.code, protocol.ErrorCopy[tc.code])
+	}
+	if sessions, err := h.st.TreeSessions(bg, r.ID); err != nil || len(sessions) != 1 {
+		t.Fatalf("refused forks left %d sessions (%v), want only the root", len(sessions), err)
+	}
+	h.gate.set("")
+	h.forkAt(family, r.ID, u1.ID)
+}
+
+// S54: a turn on a fork moves its conversation to the top of the history
+// list (roots by updated_at).
+func TestTurnOnForkMovesRootUp(t *testing.T) {
+	h := newHarness(t)
+	a := h.newSession(family)
+	u1, _ := h.exchange(family, a.ID, "one", "uuid-a1")
+	b := h.newSession(family)
+	roots := func() []string {
+		t.Helper()
+		rows, err := h.st.ListRoots(bg, family.ID, false, nil, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids := []string{}
+		for _, r := range rows {
+			ids = append(ids, r.ID)
+		}
+		return ids
+	}
+	if got := roots(); !slices.Equal(got, []string{b.ID, a.ID}) {
+		t.Fatalf("roots = %v, want the newer conversation first", got)
+	}
+	f := h.forkAt(family, a.ID, u1.ID)
+	h.send(family, f.ID, "one, edited")
+	if got := roots(); !slices.Equal(got, []string{a.ID, b.ID}) {
+		t.Fatalf("after a turn on a's fork: roots = %v, want a first", got)
+	}
+}
+
+// A tree delete that begins after Fork's checks: the row inserted under it
+// (which the delete removes with the tree) is answered 404, and so is an
+// insert that finds the root already gone; any other insert failure stays an
+// error, not a 404.
+func TestForkDeleteRaces404(t *testing.T) {
+	h := newHarness(t)
+	r := h.newSession(family)
+	u1, _ := h.exchange(family, r.ID, "one", "uuid-a1")
+
+	var inserted string
+	h.svc.createSession = func(ctx context.Context, in store.Session) (store.Session, error) {
+		h.svc.deletions.mark(in.RootID) // the delete starts between the check and the insert
+		row, err := h.st.CreateSession(ctx, in)
+		inserted = row.ID
+		return row, err
+	}
+	if _, err := h.svc.Fork(bg, family, r.ID, u1.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a fork inserted under a starting delete: err = %v, want ErrNotFound", err)
+	}
+	if inserted == "" || h.gone(inserted) {
+		t.Fatalf("the insert did not succeed (%q); this case needs the row in place for the delete to remove", inserted)
+	}
+	h.svc.deletions.unmark(r.ID)
+
+	injected := errors.New("injected insert failure")
+	h.svc.createSession = func(context.Context, store.Session) (store.Session, error) { return store.Session{}, injected }
+	if _, err := h.svc.Fork(bg, family, r.ID, u1.ID); !errors.Is(err, injected) {
+		t.Fatalf("an insert failure with the tree in place: err = %v, want the failure itself", err)
+	}
+
+	h.svc.createSession = func(ctx context.Context, in store.Session) (store.Session, error) {
+		if err := h.st.DeleteTree(ctx, family.ID, in.RootID); err != nil { // the delete finished first
+			t.Error(err)
+		}
+		return h.st.CreateSession(ctx, in)
+	}
+	if _, err := h.svc.Fork(bg, family, r.ID, u1.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a fork whose insert finds the root gone: err = %v, want ErrNotFound", err)
+	}
+	if !h.gone(r.ID) || !h.gone(inserted) {
+		t.Fatal("the tree is not gone")
+	}
+}
+
+// GET /tree answers 404 while the tree is being deleted, and when the tree
+// is gone by the end of its reads; it never returns a half-deleted tree.
+func TestTreeWhileTreeDeletes404(t *testing.T) {
+	h := newHarness(t)
+	r := h.newSession(family)
+	u1, _ := h.exchange(family, r.ID, "one", "uuid-a1")
+	f := h.forkAt(family, r.ID, u1.ID)
+
+	h.svc.deletions.mark(r.ID)
+	for _, id := range []string{r.ID, f.ID} {
+		if _, err := h.svc.Tree(bg, family, id); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("Tree(%s) while its tree is deleted: err = %v, want ErrNotFound", id, err)
+		}
+	}
+	h.svc.deletions.unmark(r.ID)
+	h.tree(family, r.ID)
+
+	// Hold the root's actor, so Tree waits at its first read; delete the rows
+	// there; then let it go on.
+	release := make(chan struct{})
+	h.svc.post(r.ID, func(context.Context, *actor) { <-release })
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.svc.Tree(bg, family, r.ID)
+		done <- err
+	}()
+	waitFor(t, "Tree queued on the root's actor", func() bool {
+		h.svc.mu.Lock()
+		defer h.svc.mu.Unlock()
+		a := h.svc.actors[r.ID]
+		return a != nil && a.pending >= 2
+	})
+	if err := h.st.DeleteTree(bg, family.ID, r.ID); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-done; !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Tree of a tree deleted during its reads: err = %v, want ErrNotFound", err)
+	}
+}
+
+// warnsNaming counts the warn-level records with message msg and attribute
+// key = value.
+func (l *recordLog) warnsNaming(msg, key, value string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, r := range l.recs {
+		if r.Level != slog.LevelWarn || r.Message != msg {
+			continue
+		}
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == key && a.Value.String() == value {
+				n++
+			}
+			return true
+		})
+	}
+	return n
+}
+
+// A fork point whose owner has no sdk_session_id (its write failed) cannot
+// be resumed: the lookup logs it and goes further back, to an earlier
+// owner's assistant message, or to a fresh session when there is none. Not
+// parallel: it replaces the default logger.
+func TestForkPointOwnerWithoutSdkSessionID(t *testing.T) {
+	logs := &recordLog{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(logs))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	h := buildHarness(t)
+	const warn = "sessions: a fork point's session has no sdk_session_id; looking further back"
+
+	r := h.newSession(family)
+	h.exchange(family, r.ID, "one", "r-1")
+	h.ready(r.ID, "sdk-r")
+	u2, _ := h.exchange(family, r.ID, "two", "r-2")
+	rTotals := h.row(r.ID).LastTotals
+	f1 := h.forkAt(family, r.ID, u2.ID)
+	_, a2e := h.exchange(family, f1.ID, "two, edited", "f1-2") // f1's host never reports its sdk session
+	u3, _ := h.exchange(family, f1.ID, "three", "f1-3")
+	if h.row(f1.ID).SDKSessionID != nil {
+		t.Fatal("f1 has an sdk_session_id; this case needs none")
+	}
+
+	f2 := h.forkAt(family, f1.ID, u3.ID)
+	h.send(family, f2.ID, "three, edited")
+	want := &protocol.Resume{SDKSessionID: "sdk-r", Fork: &protocol.ResumeFork{AtSDKUUID: "r-1"}, BaselineTotals: rTotals}
+	if got := h.openOf(f2.ID).Resume; !reflect.DeepEqual(got, want) {
+		t.Fatalf("resume = %+v, want the earlier owner's %+v", got, want)
+	}
+	if n := logs.warnsNaming(warn, "owner", f1.ID); n != 1 {
+		t.Fatalf("%d warnings naming owner %s, want 1", n, f1.ID)
+	}
+	if n := logs.warnsNaming(warn, "message", a2e.ID); n != 1 {
+		t.Fatalf("%d warnings naming the skipped message %s, want 1", n, a2e.ID)
+	}
+
+	lone := h.newSession(family) // no host ever reports its sdk session
+	h.exchange(family, lone.ID, "one", "l-1")
+	lu2, _ := h.exchange(family, lone.ID, "two", "l-2")
+	fl := h.forkAt(family, lone.ID, lu2.ID)
+	h.send(family, fl.ID, "two, edited")
+	if got := h.openOf(fl.ID).Resume; got != nil {
+		t.Fatalf("resume = %+v, want null: no owner before M can be resumed", got)
+	}
+	if n := logs.warnsNaming(warn, "owner", lone.ID); n != 1 {
+		t.Fatalf("%d warnings naming owner %s, want 1", n, lone.ID)
 	}
 }

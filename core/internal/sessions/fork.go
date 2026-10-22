@@ -21,10 +21,14 @@ import (
 // starts idle; nothing is sent to the conductor until its first message,
 // whose host.open resumes the fork point (forkResume).
 //
-// Another person's session, a tree being deleted, and an M that is not in
+// The Gate runs first, as for Create: a fork is a new session (S53). Then
+// another person's session, a tree being deleted, and an M that is not in
 // the session's history are ErrNotFound; an M that is not a user message is
 // ErrInvalid; M of the running turn is ErrBusy.
 func (s *Service) Fork(ctx context.Context, p auth.Person, sessionID, atMessageID string) (protocol.Session, error) {
+	if refusal := s.gate.CheckNewTurn(ctx); refusal != nil {
+		return protocol.Session{}, &RefusedError{Info: *refusal}
+	}
 	if atMessageID == "" {
 		return protocol.Session{}, fmt.Errorf("%w: at_message is required", ErrInvalid)
 	}
@@ -51,7 +55,7 @@ func (s *Service) Fork(ctx context.Context, p auth.Person, sessionID, atMessageI
 		now := s.clock()
 		taintedAt = &now
 	}
-	row, err := s.st.CreateSession(ctx, store.Session{
+	row, err := s.createSession(ctx, store.Session{
 		ID: newID("ses_", s.clock()), RootID: src.RootID, ParentID: &src.ID, ForkAtMessageID: &at.ID,
 		PersonID: src.PersonID, AgentID: src.AgentID, AgentVersion: src.AgentVersion, AgentSnapshot: src.AgentSnapshot,
 		Tier: src.Tier, Model: src.Model, HelperModel: src.HelperModel, Effort: src.Effort, CacheTTL: src.CacheTTL,
@@ -101,28 +105,23 @@ func (a *actor) forkPoint(ctx context.Context, p auth.Person, atID string) (prot
 }
 
 // historyMessage returns message id if it is in the session's history: its
-// own messages and, for a fork, everything before its fork point, found by
-// following parent_message_id back from the newest message. Anything else,
-// another branch's message or another person's, is ErrNotFound.
+// own messages and, for a fork, everything before its fork point, that is
+// the newest message and its ancestors (store.HistoryMessage, one query).
+// Anything else, another branch's message or another person's, is
+// ErrNotFound.
 func (a *actor) historyMessage(ctx context.Context, id string) (protocol.Message, error) {
-	next, err := a.newestMessage(ctx)
+	head, err := a.newestMessage(ctx)
 	if err != nil {
 		return protocol.Message{}, err
 	}
-	for next != nil {
-		m, err := a.s.st.Message(ctx, *next)
-		if errors.Is(err, store.ErrNotFound) {
-			return protocol.Message{}, ErrNotFound
-		}
-		if err != nil {
-			return protocol.Message{}, err
-		}
-		if m.ID == id {
-			return m, nil
-		}
-		next = m.ParentMessageID
+	if head == nil {
+		return protocol.Message{}, ErrNotFound
 	}
-	return protocol.Message{}, ErrNotFound
+	m, err := a.s.st.HistoryMessage(ctx, *head, id)
+	if errors.Is(err, store.ErrNotFound) {
+		return protocol.Message{}, ErrNotFound
+	}
+	return m, err
 }
 
 // forkParent is the parent of a fork's first message: the last message
