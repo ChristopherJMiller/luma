@@ -1,0 +1,10 @@
+{
+  "data": [
+    {"id": "wrkspc_01DefaultNotListed", "type": "workspace", "name": "Default", "created_at": "2026-01-02T03:04:05Z", "archived_at": null, "display_color": "#6C5BB9"},
+    {"id": "wrkspc_01LumaInteractive", "type": "workspace", "name": "luma-interactive", "created_at": "2026-10-01T00:00:00Z", "archived_at": null, "display_color": "#2E7D32"},
+    {"id": "wrkspc_01LumaCi", "type": "workspace", "name": "luma-ci", "created_at": "2026-10-01T00:00:01Z", "archived_at": null, "display_color": "#1565C0"}
+  ],
+  "has_more": false,
+  "first_id": "wrkspc_01DefaultNotListed",
+  "last_id": "wrkspc_01LumaCi"
+}

@@ -50,3 +50,23 @@ func (s *Store) LedgerUSDForDay(ctx context.Context, day time.Time, apiWorkspace
 	d := time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, time.UTC)
 	return s.SpendBetween(ctx, d, d.AddDate(0, 0, 1), apiWorkspace)
 }
+
+// LatestReconciliations returns, for each workspace, its row of the newest
+// day (S7: Core restores the reconcile gauges from these at start).
+func (s *Store) LatestReconciliations(ctx context.Context) ([]Reconciliation, error) {
+	rows, err := s.pool.Query(ctx, `select distinct on (workspace) day, workspace, api_usd::float8,
+		ledger_usd::float8, created_at from usage_reconciliations order by workspace, day desc`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Reconciliation
+	for rows.Next() {
+		var r Reconciliation
+		if err := rows.Scan(&r.Day, &r.Workspace, &r.APIUSD, &r.LedgerUSD, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}

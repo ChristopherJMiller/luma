@@ -1,0 +1,16 @@
+{
+  "data": [
+    {
+      "starting_at": "2026-10-14T00:00:00Z",
+      "ending_at": "2026-10-15T00:00:00Z",
+      "results": [
+        {"currency": "USD", "amount": "1234.5", "workspace_id": "wrkspc_01LumaInteractive", "description": null, "cost_type": null, "context_window": null, "model": null, "service_tier": null, "token_type": null, "inference_geo": null},
+        {"currency": "USD", "amount": "100", "workspace_id": "wrkspc_01LumaInteractive", "description": null, "cost_type": null, "context_window": null, "model": null, "service_tier": null, "token_type": null, "inference_geo": null},
+        {"currency": "USD", "amount": "99999", "workspace_id": "wrkspc_01SomeoneElse", "description": null, "cost_type": null, "context_window": null, "model": null, "service_tier": null, "token_type": null, "inference_geo": null},
+        {"currency": "USD", "amount": "7777", "workspace_id": null, "description": null, "cost_type": null, "context_window": null, "model": null, "service_tier": null, "token_type": null, "inference_geo": null}
+      ]
+    }
+  ],
+  "has_more": true,
+  "next_page": "page_abc123"
+}

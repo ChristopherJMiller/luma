@@ -1,0 +1,14 @@
+{
+  "data": [
+    {
+      "starting_at": "2026-10-14T00:00:00Z",
+      "ending_at": "2026-10-15T00:00:00Z",
+      "results": [
+        {"currency": "USD", "amount": "50.25", "workspace_id": "wrkspc_01LumaInteractive", "description": null, "cost_type": null, "context_window": null, "model": null, "service_tier": null, "token_type": null, "inference_geo": null},
+        {"currency": "USD", "amount": "250", "workspace_id": "wrkspc_01LumaCi", "description": null, "cost_type": null, "context_window": null, "model": null, "service_tier": null, "token_type": null, "inference_geo": null}
+      ]
+    }
+  ],
+  "has_more": false,
+  "next_page": null
+}

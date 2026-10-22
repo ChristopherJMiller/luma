@@ -30,6 +30,8 @@ commands:
                         refuse new turns, drain the running ones, close every CLI
   maintenance off       accept turns again; CLIs reopen lazily
   maintenance status    print enabled=<bool> running_turns=<n> open_hosts=<n>
+  usage-reconcile [--day YYYY-MM-DD]
+                        post Anthropic's daily cost per workspace to Core (default: yesterday, UTC)
 `
 
 const defaultAdminListen = "127.0.0.1:8082"
@@ -60,6 +62,17 @@ func run(ctx context.Context, args []string, env func(string) string, stdout, st
 			return 2
 		case err != nil:
 			fmt.Fprintf(stderr, "maintenance: %v\n", err)
+			return 1
+		}
+		return 0
+	case "usage-reconcile":
+		err := runUsageReconcile(ctx, args[1:], env, time.Now)
+		switch {
+		case errors.Is(err, errUsage):
+			fmt.Fprintf(stderr, "%sluma-core: %v\n", usage, err)
+			return 2
+		case err != nil:
+			fmt.Fprintf(stderr, "usage-reconcile: %v\n", err)
 			return 1
 		}
 		return 0

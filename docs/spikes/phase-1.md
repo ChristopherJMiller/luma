@@ -763,3 +763,16 @@ Not applied here; they need the plan's owner:
      WebFetch fails.
    - The check sends each fetched domain to Anthropic, which already sees the
      URL.
+
+## R. Usage reconcile: the Admin API (Task 14b, P22, S12)
+
+Read from the Usage and Cost Admin API documentation (platform.claude.com, manage-claude/usage-cost-api) on 2026-10-22. Offline: the tests use a fake with hand-written fixtures (`core/internal/reconcile/testdata/`); no real Admin key was used. The first live run (deploy plan) is the check that the shapes below hold.
+
+- **Auth:** an Admin API key (`sk-ant-admin01-...`) as `x-api-key`, plus `anthropic-version: 2023-06-01`. Workspace keys do not work. The key comes from `LUMA_ANTHROPIC_ADMIN_KEY_FILE`, is read per run, and appears in no log, error or request to Core.
+- **Workspaces:** `GET /v1/organizations/workspaces?limit=1000[&after_id=<last_id>]` returns `{data:[{id, name, archived_at, ...}], has_more, first_id, last_id}`. Names match exactly (`luma-interactive`, `luma-ci`); a missing name fails the run. Archived workspaces are not listed by default. The docs page names the endpoint but not its cursor; `after_id`/`last_id` is the Admin API list convention (verify on the first live run).
+- **Cost:** `GET /v1/organizations/cost_report?starting_at=<day>T00:00:00Z&ending_at=<day+1>T00:00:00Z&bucket_width=1d&group_by[]=workspace_id[&page=<next_page>]` returns `{data:[{starting_at, ending_at, results:[{currency:"USD", amount:"<decimal string>", workspace_id, description, ...}]}], has_more, next_page}`. Daily buckets are the only granularity.
+- **Unit:** `amount` is a decimal string **in cents** (docs: "USD, reported as decimal strings in lowest units (cents)"); the client sums a workspace's results and divides by 100. Any currency but USD fails the run. `workspace_id` is `null` for the default workspace (ignored). Priority Tier cost is not in this report; Luma does not use Priority Tier.
+- **Grouping:** by `workspace_id`, not the spec's `api_key_id` (S23): the cost report segments only by workspace.
+- **Freshness:** data appears within about 5 minutes; the CronJob runs at 07:30 UTC for the previous UTC day.
+- **Core side:** `POST /internal/v1/usage-reconciliations` (C10). `drift_usd = ledger_usd - api_usd`, `drift_ratio = drift_usd / max(api_usd, 0.01)`. Gauges `luma_usage_reconcile_drift_usd{workspace}` and `luma_usage_reconcile_drift_ratio{workspace}` follow the newest day stored per workspace; `luma_usage_reconcile_last_success_timestamp_seconds` is set on each accepted post. All three are restored from the DB at start (S7). The alert (ratio > 0.10 **and** |drift_usd| > 0.50 per workspace-day, Chris) lives in the deploy plan's Task 9.
+- **Exit and retries:** non-zero on any failure. Core's 503 (S43) is retried at 1, 2, 4, 8, 16 s (or a longer `Retry-After`), five retries; any other non-2xx fails at once.
