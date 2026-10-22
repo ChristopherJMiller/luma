@@ -33,8 +33,12 @@ var registryDebounce = 2 * time.Second
 // fields (C7 labels `person` with the registry id).
 var personIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 
-// quotedValue is a value yaml.v3 quotes in an error message.
-var quotedValue = regexp.MustCompile("`[^`]*`")
+// connectorIDPattern is the shape of a Dex connector id under `emails`
+// (google, microsoft, mock). Checked before an id appears in any message.
+var connectorIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+
+// yamlLine finds the line number in a yaml.v3 error message.
+var yamlLine = regexp.MustCompile(`line (\d+)`)
 
 // Person is one registry entry as the rest of Core sees it.
 type Person struct {
@@ -86,9 +90,7 @@ func parseRegistry(b []byte) (*Registry, error) {
 	dec := yaml.NewDecoder(bytes.NewReader(b))
 	dec.KnownFields(true)
 	if err := dec.Decode(&f); err != nil {
-		// yaml.v3 quotes the offending value in backticks, which here can be
-		// an address; the error is logged, so it keeps only the shape.
-		return nil, errors.New(quotedValue.ReplaceAllString(err.Error(), "`…`"))
+		return nil, yamlShape(err)
 	}
 	if len(f.People) == 0 {
 		return nil, errors.New("no people")
@@ -99,21 +101,24 @@ func parseRegistry(b []byte) (*Registry, error) {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids) // deterministic duplicate errors
+	// Messages name only values that passed their pattern (person and
+	// connector ids) and indexes: the file is a Secret holding addresses,
+	// and these errors are logged.
 	for _, id := range ids {
 		p := f.People[id]
 		if !personIDPattern.MatchString(id) {
-			return nil, fmt.Errorf("person id %q: want %s", id, personIDPattern)
+			return nil, fmt.Errorf("a person id does not match %s", personIDPattern)
 		}
 		if strings.TrimSpace(p.DisplayName) == "" {
 			return nil, fmt.Errorf("person %s: display_name is required", id)
 		}
 		if p.Tier != TierAdmin && p.Tier != TierFamily {
-			return nil, fmt.Errorf("person %s: tier %q: want admin or family", id, p.Tier)
+			return nil, fmt.Errorf("person %s: tier is not admin or family", id)
 		}
 		r.people[id] = Person{ID: id, DisplayName: p.DisplayName, Tier: p.Tier, Household: p.Household}
 		for connector, emails := range p.Emails {
-			if connector == "" || strings.TrimSpace(connector) != connector {
-				return nil, fmt.Errorf("person %s: connector id %q", id, connector)
+			if !connectorIDPattern.MatchString(connector) {
+				return nil, fmt.Errorf("person %s: a connector id under emails does not match %s", id, connectorIDPattern)
 			}
 			for i, e := range emails {
 				if !plausibleAddress(e) {
@@ -128,6 +133,38 @@ func parseRegistry(b []byte) (*Registry, error) {
 		}
 	}
 	return r, nil
+}
+
+// yamlShape reduces a yaml.v3 error to line numbers and a kind. yaml.v3
+// quotes values (`a@x.com`), names unknown keys (field a@x.com not found)
+// and duplicate keys ("a@x.com" already defined), and in this file any of
+// those can be an address.
+func yamlShape(err error) error {
+	var te *yaml.TypeError
+	if errors.As(err, &te) {
+		parts := make([]string, 0, len(te.Errors))
+		for _, e := range te.Errors {
+			parts = append(parts, yamlErrorShape(e))
+		}
+		return errors.New("yaml: " + strings.Join(parts, "; "))
+	}
+	return errors.New("yaml: " + yamlErrorShape(err.Error()))
+}
+
+func yamlErrorShape(msg string) string {
+	kind := "not valid YAML"
+	switch {
+	case strings.Contains(msg, "not found in type"):
+		kind = "unknown key"
+	case strings.Contains(msg, "cannot unmarshal"):
+		kind = "wrong type"
+	case strings.Contains(msg, "already defined"):
+		kind = "duplicate key"
+	}
+	if m := yamlLine.FindStringSubmatch(msg); m != nil {
+		return "line " + m[1] + ": " + kind
+	}
+	return kind
 }
 
 // plausibleAddress is a shape check, not validation: one @, both sides

@@ -105,11 +105,19 @@ func TestRegistryErrorsNeverQuoteAddresses(t *testing.T) {
 	t.Parallel()
 	// yaml.v3 quotes a value of up to 10 bytes whole, and the first 7 bytes
 	// of a longer one.
+	// Unknown keys and duplicate keys are named unquoted or %q-quoted.
 	for name, content := range map[string]string{
-		"short address where a list goes": "people:\n  p1: {display_name: One, tier: admin, emails: {google: me@ex.io}}\n",
-		"long address where a list goes":  "people:\n  p1: {display_name: One, tier: admin, emails: {google: secret.person@example.org}}\n",
-		"duplicate address":               "people:\n  p1: {display_name: One, tier: admin, emails: {google: [me@ex.io, ME@ex.io]}}\n",
-		"malformed address":               "people:\n  p1: {display_name: One, tier: admin, emails: {google: [\"me@ex.io x\"]}}\n",
+		"short address where a list goes":   "people:\n  p1: {display_name: One, tier: admin, emails: {google: me@ex.io}}\n",
+		"long address where a list goes":    "people:\n  p1: {display_name: One, tier: admin, emails: {google: secret.person@example.org}}\n",
+		"duplicate address":                 "people:\n  p1: {display_name: One, tier: admin, emails: {google: [me@ex.io, ME@ex.io]}}\n",
+		"malformed address":                 "people:\n  p1: {display_name: One, tier: admin, emails: {google: [\"me@ex.io x\"]}}\n",
+		"address as a person id":            "people:\n  me@ex.io: {display_name: One, tier: admin}\n",
+		"reversed emails map":               "people:\n  p1: {display_name: One, tier: admin, emails: {me@ex.io: [google]}}\n",
+		"unknown key named like an address": "people:\n  p1: {display_name: One, tier: admin, me@ex.io: 1}\n",
+		"unknown top key like an address":   "people:\n  p1: {display_name: One, tier: admin}\nme@ex.io: 1\n",
+		"duplicate person key, an address":  "people:\n  me@ex.io: {display_name: One, tier: admin}\n  me@ex.io: {display_name: Two, tier: admin}\n",
+		"address as the tier":               "people:\n  p1: {display_name: One, tier: me@ex.io}\n",
+		"address as a connector, mapped":    "people:\n  p1: {display_name: One, tier: admin, emails: {me@ex.io: {a: b}}}\n",
 	} {
 		path := filepath.Join(t.TempDir(), "registry.yaml")
 		writeFile(t, path, content)
@@ -118,9 +126,16 @@ func TestRegistryErrorsNeverQuoteAddresses(t *testing.T) {
 			t.Errorf("%s: accepted", name)
 			continue
 		}
-		if msg := strings.ToLower(err.Error()); strings.Contains(msg, "me@ex.io") || strings.Contains(msg, "secret.") {
+		msg := strings.TrimPrefix(err.Error(), "registry "+path+": ")
+		if strings.Contains(msg, "@") || strings.Contains(msg, "secret") || strings.Contains(msg, "ex.io") {
 			t.Errorf("%s: error quotes the address: %v", name, err)
 		}
+	}
+	// What is left still says where and what.
+	path := filepath.Join(t.TempDir(), "registry.yaml")
+	writeFile(t, path, "people:\n  p1: {display_name: One, tier: admin, me@ex.io: 1}\n")
+	if _, err := auth.LoadRegistry(path); err == nil || !strings.HasSuffix(err.Error(), ": yaml: line 2: unknown key") {
+		t.Errorf("unknown key error = %v, want it to end \": yaml: line 2: unknown key\"", err)
 	}
 }
 
