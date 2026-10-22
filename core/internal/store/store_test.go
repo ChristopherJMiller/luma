@@ -675,3 +675,35 @@ func TestWebSessions(t *testing.T) {
 		t.Fatalf("expired delete = %d, %v", n, err)
 	}
 }
+
+// ListWebSessions returns every row, expired ones included: the BFF's sweep
+// ends those (and the ones the registry no longer admits) itself.
+func TestListWebSessions(t *testing.T) {
+	s := storetest.New(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	if got, err := s.ListWebSessions(ctx); err != nil || len(got) != 0 {
+		t.Fatalf("empty table: %+v, %v", got, err)
+	}
+	for _, w := range []store.WebSession{
+		{IDHash: []byte("live"), PersonID: "chris", ConnectorID: "google", Email: "c@example.test", ExpiresAt: now.Add(time.Hour)},
+		{IDHash: []byte("expired"), PersonID: "chris", ConnectorID: "microsoft", Email: "m@example.test", ExpiresAt: now.Add(-time.Hour)},
+	} {
+		if err := s.CreateWebSession(ctx, w); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.ListWebSessions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byHash := map[string]store.WebSession{}
+	for _, w := range got {
+		byHash[string(w.IDHash)] = w
+	}
+	live, expired := byHash["live"], byHash["expired"]
+	if len(got) != 2 || live.ConnectorID != "google" || live.Email != "c@example.test" || !live.ExpiresAt.Equal(now.Add(time.Hour)) ||
+		expired.PersonID != "chris" || expired.ConnectorID != "microsoft" || !expired.ExpiresAt.Equal(now.Add(-time.Hour)) ||
+		live.LastSeenAt.IsZero() || live.CreatedAt.IsZero() {
+		t.Fatalf("ListWebSessions = %+v", got)
+	}
+}

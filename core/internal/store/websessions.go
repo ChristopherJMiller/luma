@@ -57,3 +57,23 @@ func (s *Store) DeleteExpiredWebSessions(ctx context.Context, now time.Time) (in
 	tag, err := s.pool.Exec(ctx, `delete from web_sessions where expires_at <= $1`, now)
 	return tag.RowsAffected(), err
 }
+
+// ListWebSessions returns every login session, expired ones included, for the
+// BFF's sweep (expiry, idle and registry checks happen in Go).
+func (s *Store) ListWebSessions(ctx context.Context) ([]WebSession, error) {
+	rows, err := s.pool.Query(ctx, `select id_hash, person_id, connector_id, email, created_at, last_seen_at, expires_at
+		from web_sessions order by created_at, id_hash`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []WebSession
+	for rows.Next() {
+		var w WebSession
+		if err := rows.Scan(&w.IDHash, &w.PersonID, &w.ConnectorID, &w.Email, &w.CreatedAt, &w.LastSeenAt, &w.ExpiresAt); err != nil {
+			return nil, err
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
