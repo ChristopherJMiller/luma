@@ -550,6 +550,96 @@ func afterSOF(b, extra []byte) []byte {
 	return append(out, b[end:]...)
 }
 
+// randomBytes is n seeded random bytes, like a video's.
+func randomBytes(n int) []byte {
+	rng := rand.New(rand.NewPCG(60, 61))
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte(rng.Uint32())
+	}
+	return b
+}
+
+// A Pixel or Samsung motion photo is a JPEG with an MP4 after its end of
+// image. image/jpeg never reads past EOI, so neither does Core: the video's
+// random bytes (about one FF DA in 70 KB) would otherwise count as scans
+// (S60). The output is the re-encoded still, without the video.
+func TestMotionPhotoTrailerIgnored(t *testing.T) {
+	still := encodeJPEG(t, gradient(400, 300))
+	video := randomBytes(8 << 20)
+	if n := bytes.Count(video, []byte{0xff, 0xda}); n <= maxScans {
+		t.Fatalf("the test video holds %d FF DA, want more than %d", n, maxScans)
+	}
+	n := normalizeOK(t, append(append([]byte{}, still...), video...), "PXL_20261022_MP.jpg")
+	if n.MediaType != "image/jpeg" || n.Width != 400 || n.Height != 300 || bytes.Contains(n.Data, video[:64]) {
+		t.Fatalf("a motion photo = %s %dx%d (%d bytes), want the 400x300 still alone", n.MediaType, n.Width, n.Height, len(n.Data))
+	}
+	// The bombs are still refused, with or without a trailer.
+	for name, junk := range map[string][]byte{"a junk byte": {0x00}, "an FF 00 pseudo-segment": {0xff, 0x00, 0x7f, 0xff}} {
+		bomb := append(afterSOF(jpegScanned(101), junk), video...)
+		wantRefused(t, bomb, name+".jpg", protocol.CodeImageTooLarge)
+	}
+}
+
+// The end of image is found by the decoder's walk, which skips payloads by
+// their length: an FF D9 inside an APP1 or a comment does not end the
+// file, so scans after it still count, and a photo carrying one decodes.
+func TestHiddenEOIDoesNotTruncate(t *testing.T) {
+	photo := withAPP1(t, encodeJPEG(t, quadrants()), exifTIFF([]tiffTag{ascii(0x010e, "\xff\xd9 not the end")}, nil))
+	if n := normalizeOK(t, photo, "eoi-in-exif.jpg"); n.Width != 40 || n.Height != 20 {
+		t.Fatalf("a photo with FF D9 in its EXIF = %dx%d", n.Width, n.Height)
+	}
+	com := []byte{0xff, 0xfe, 0x00, 0x06, 0xff, 0xd9, 0xff, 0xd9}
+	bomb := afterSOF(jpegScanned(101), com)
+	if end := jpegEnd(bomb); end != len(bomb) {
+		t.Fatalf("an FF D9 in a comment ended the file at %d of %d", end, len(bomb))
+	}
+	wantRefused(t, bomb, "x.jpg", protocol.CodeImageTooLarge)
+}
+
+// withAdobe inserts an APP14 "Adobe" segment with the given transform
+// before a jpegSOF file's final EOI: after its (empty) scan, where the
+// decoder still reads it.
+func withAdobe(b []byte, transform byte) []byte {
+	app14 := []byte{0xff, 0xee, 0x00, 0x0e, 'A', 'd', 'o', 'b', 'e', 0, 100, 0, 0, 0, 0, transform}
+	out := append(append([]byte{}, b[:len(b)-2]...), app14...)
+	return append(out, 0xff, 0xd9)
+}
+
+// image/jpeg decodes a three-component file named R, G, B, or one an Adobe
+// APP14 marks transform 0, as RGB: its planes and then a 4-byte RGBA copy
+// (S61). An 8000x5000 baseline RGB file is 120 MB of planes plus 160 MB of
+// RGBA, past the cap; the same frame as JFIF YCbCr is 120 MB, under it.
+func TestJPEGRGBCost(t *testing.T) {
+	ycbcr := jpegSOF(0xc0, 8000, 5000, [][2]byte{{1, 1}, {1, 1}, {1, 1}})
+	rgb := append([]byte{}, ycbcr...)
+	rgb[12], rgb[15], rgb[18] = 'R', 'G', 'B' // the SOF's component identifiers
+	jfif := append([]byte{0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0, 1, 2, 0, 0, 1, 0, 1, 0, 0}, ycbcr[2:]...)
+	for name, data := range map[string][]byte{
+		"components named R, G, B":            rgb,
+		"Adobe transform 0 after the scan":    withAdobe(ycbcr, 0),
+		"Adobe transform 0 in a JFIF file":    withAdobe(jfif, 0), // the decoder would not, but over is safe
+		"R, G, B with an Adobe transform 1":   withAdobe(rgb, 1),
+		"R, G, B behind a junk byte, Adobe 0": withAdobe(append([]byte{0xff, 0xd8, 0xff, 0xfe, 0x00, 0x02, 0x00}, rgb[2:]...), 0),
+	} {
+		var err error
+		n := bytesAllocated(func() { _, err = Normalize(bytes.NewReader(data), "rgb.jpg") })
+		if codeOf(err) != protocol.CodeImageTooLarge || n > 1<<20 {
+			t.Fatalf("%s = %v after %d bytes, want image_too_large under 1 MiB", name, err, n)
+		}
+	}
+	for name, data := range map[string][]byte{
+		"JFIF YCbCr":           jfif,
+		"YCbCr, Adobe 1":       withAdobe(ycbcr, 1),
+		"YCbCr, no APP14":      ycbcr,
+		"a short APP14 header": append(append(append([]byte{}, ycbcr[:len(ycbcr)-2]...), 0xff, 0xee, 0x00, 0x07, 'A', 'd', 'o', 'b', 'e'), 0xff, 0xd9),
+	} {
+		if _, err := Normalize(bytes.NewReader(data), "ycc.jpg"); codeOf(err) != protocol.CodeUnsupportedAttachment {
+			t.Fatalf("%s = %v, want it past the cost check (then undecodable)", name, err)
+		}
+	}
+}
+
 // The frame header is found the way image/jpeg finds it, past junk and
 // FF 00, so the decode estimate is the real one. A progressive CMYK
 // 3500x3500 file costs 281 MiB; with a junk byte before its frame it was

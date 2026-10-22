@@ -58,8 +58,13 @@ func FuzzImageHeaders(f *testing.F) {
 				t.Fatalf("orientation %d", o)
 			}
 		}
+		if end := jpegEnd(data); end < 0 || end > len(data) {
+			t.Fatalf("jpegEnd = %d of %d", end, len(data))
+		}
 		_ = jpegScans(data)
-		_, _ = readJPEGFrame(data)
+		if f, ok := readJPEGFrame(data); ok {
+			_ = jpegMayBeRGB(data, f)
+		}
 		for _, mt := range []string{"image/jpeg", "image/png", "image/gif", "image/webp"} {
 			if cfg, err := decodeConfig(mt, data); err == nil {
 				_ = headerRefusal(mt, cfg, data)

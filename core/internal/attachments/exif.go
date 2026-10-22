@@ -140,20 +140,23 @@ func webpEXIF(data []byte) []byte {
 	return nil
 }
 
-// jpegSegments walks a JPEG's marker segments up to its first scan (SOS),
-// calling fn with each marker and payload until fn returns false. It finds
-// markers the way image/jpeg does (reader.go's marker loop), so it sees the
-// segments the decoder acts on: a byte that is not 0xFF, or an FF 00 pair,
-// is extraneous data the decoder slides past one byte at a time; 0xFF fill
-// bytes are skipped; an RST marker has no payload; every other marker has a
-// 16-bit length. It stops at the first scan, at EOI, or at a segment that
-// runs past the data (where the decoder fails too).
-func jpegSegments(data []byte, fn func(marker byte, payload []byte) bool) {
+// jpegWalk walks a JPEG's markers the way image/jpeg's marker loop does
+// (reader.go), so it sees what the decoder acts on: a byte that is not
+// 0xFF, or an FF 00 pair, is extraneous data the decoder slides past one
+// byte at a time, and so is a scan's entropy-coded data (in which an 0xFF
+// is only ever followed by 0x00 or an RST marker); 0xFF fill bytes are
+// skipped; an RST marker has no payload; every other marker has a 16-bit
+// length, and its payload is skipped by it. fn sees each marker with a
+// payload (an SOS's payload is its header) until it returns false; fn may
+// be nil. It returns the offset just past the first EOI the decoder would
+// reach, where image/jpeg stops reading, or len(data) when there is none or
+// a segment runs past the data (where the decoder fails too).
+func jpegWalk(data []byte, fn func(marker byte, payload []byte) bool) int {
 	if len(data) < 2 || data[0] != 0xff || data[1] != 0xd8 {
-		return
+		return len(data)
 	}
 	for i := 2; i+1 < len(data); {
-		if data[i] != 0xff || data[i+1] == 0x00 { // extraneous data
+		if data[i] != 0xff || data[i+1] == 0x00 { // extraneous or entropy-coded data
 			i++
 			continue
 		}
@@ -165,37 +168,53 @@ func jpegSegments(data []byte, fn func(marker byte, payload []byte) bool) {
 		case m >= 0xd0 && m <= 0xd7: // RST: no payload
 			i += 2
 			continue
-		case m == 0xda || m == 0xd9: // the first scan, or the end
-			return
+		case m == 0xd9: // EOI
+			return i + 2
 		}
 		if i+4 > len(data) {
-			return
+			return len(data)
 		}
 		n := int(binary.BigEndian.Uint16(data[i+2:]))
 		if n < 2 || i+2+n > len(data) {
-			return
+			return len(data)
 		}
-		if !fn(m, data[i+4:i+2+n]) {
-			return
+		if fn != nil && !fn(m, data[i+4:i+2+n]) {
+			return len(data)
 		}
 		i += 2 + n
 	}
+	return len(data)
 }
 
-// jpegScans counts the FF DA pairs anywhere in a JPEG: an upper bound on
-// its scans. image/jpeg starts a scan only at an FF DA marker, and inside
-// entropy-coded data an 0xFF is followed only by 0x00 (stuffing) or an RST
-// marker, so no scan is missed however the segments around it are built
-// (S57c re-review: a walk that stopped at a junk byte saw none). An FF DA
-// inside a metadata segment (an EXIF thumbnail, an ICC profile) is counted
-// too: the safe direction.
+// jpegEnd is the offset just past a JPEG's end-of-image marker, as the
+// decoder finds it. A motion photo carries an MP4 after it, which
+// image/jpeg never reads; Core drops it before anything else looks at the
+// file (S60).
+func jpegEnd(data []byte) int { return jpegWalk(data, nil) }
+
+// jpegSegments is jpegWalk up to the first scan: the segments before it,
+// where the frame header and the APPn segments are.
+func jpegSegments(data []byte, fn func(marker byte, payload []byte) bool) {
+	jpegWalk(data, func(m byte, p []byte) bool { return m != 0xda && fn(m, p) })
+}
+
+// jpegScans counts the FF DA pairs before a JPEG's end of image: an upper
+// bound on its scans. image/jpeg starts a scan only at an FF DA marker, and
+// inside entropy-coded data an 0xFF is followed only by 0x00 (stuffing) or
+// an RST marker, so no scan is missed however the segments around it are
+// built (S57c re-review: a walk that stopped at a junk byte saw none). An FF
+// DA inside a metadata segment (an EXIF thumbnail, an ICC profile) is
+// counted too, the safe direction. Bytes after the end of image are not:
+// the decoder never reads them, and a motion photo's MP4 holds about one FF
+// DA in 70 KB (S60).
 func jpegScans(data []byte) int {
-	return bytes.Count(data, []byte{0xff, 0xda})
+	return bytes.Count(data[:jpegEnd(data)], []byte{0xff, 0xda})
 }
 
 // jpegFrame is what a JPEG's SOF segment says about its decoding.
 type jpegFrame struct {
 	progressive bool
+	ids         []byte   // the component identifiers
 	comps       [][2]int // each component's horizontal and vertical sampling
 }
 
@@ -209,6 +228,7 @@ func readJPEGFrame(data []byte) (f jpegFrame, ok bool) {
 			return false
 		}
 		for i := range int(p[5]) {
+			f.ids = append(f.ids, p[6+3*i])
 			hv := p[6+3*i+1]
 			f.comps = append(f.comps, [2]int{int(hv >> 4), int(hv & 0x0f)})
 		}
@@ -217,4 +237,26 @@ func readJPEGFrame(data []byte) (f jpegFrame, ok bool) {
 		return false
 	})
 	return f, ok
+}
+
+// jpegMayBeRGB reports a three-component JPEG that image/jpeg may decode as
+// RGB, converting its planes into a second, 4-byte RGBA image (isRGB, then
+// convertToRGB): its components are named R, G, B, or an Adobe APP14
+// segment says transform 0. The decoder reads APP14 wherever it is before
+// the end of image, after the scans too, so the whole walk is checked. A
+// JFIF segment makes the decoder treat the file as YCbCr regardless; that
+// is ignored here, which only ever overestimates (S61).
+func jpegMayBeRGB(data []byte, f jpegFrame) bool {
+	if len(f.ids) == 3 && f.ids[0] == 'R' && f.ids[1] == 'G' && f.ids[2] == 'B' {
+		return true
+	}
+	adobe0 := false
+	jpegWalk(data, func(m byte, p []byte) bool {
+		if m == 0xee && len(p) >= 12 && string(p[:5]) == "Adobe" && p[11] == 0 {
+			adobe0 = true
+			return false
+		}
+		return true
+	})
+	return adobe0
 }

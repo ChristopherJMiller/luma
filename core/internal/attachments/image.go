@@ -105,6 +105,11 @@ func acquireDecode(ctx context.Context, personID string) (release func(), err er
 // transparency, otherwise JPEG at quality 85. Nothing of the original file
 // but its pixels survives: no EXIF, GPS, ICC profile or text.
 func normalizeImage(ctx context.Context, personID, mt string, data []byte) (Normalized, error) {
+	if mt == "image/jpeg" {
+		// What follows the end of image (a motion photo's MP4) is never
+		// decoded; nothing looks at it, and re-encoding drops it (S60).
+		data = data[:jpegEnd(data)]
+	}
 	cfg, err := decodeConfig(mt, data)
 	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 {
 		return Normalized{}, refused(protocol.CodeUnsupportedAttachment)
@@ -268,7 +273,8 @@ func pngRowBytes(width int, data []byte) int64 {
 
 // jpegCost follows image/jpeg's allocations: a plane per component, padded
 // to whole blocks; a progressive file keeps every block's coefficients; a
-// four-component (CMYK) file is converted into a second, 4-byte image.
+// four-component (CMYK) file, or a three-component one the decoder may
+// treat as RGB (S61), is converted into a second, 4-byte image.
 func jpegCost(cfg image.Config, data []byte) int64 {
 	f, ok := readJPEGFrame(data)
 	if !ok { // headerRefusal refuses this first; the worst case otherwise
@@ -292,7 +298,7 @@ func jpegCost(cfg image.Config, data []byte) int64 {
 	if f.progressive {
 		n += blocks * 256
 	}
-	if len(f.comps) == 4 {
+	if len(f.comps) == 4 || (len(f.comps) == 3 && jpegMayBeRGB(data, f)) {
 		n += int64(cfg.Width) * int64(cfg.Height) * 4
 	}
 	return n
