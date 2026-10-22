@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"regexp"
 	"sync"
 	"testing"
@@ -922,5 +923,115 @@ func TestLastEventIDAndPendingTreeWrites(t *testing.T) {
 	}
 	if ws, err := s.PendingTreeWrites(ctx, "ses_none"); err != nil || len(ws) != 0 {
 		t.Fatalf("PendingTreeWrites of no tree = %v, %v; want none", ws, err)
+	}
+}
+
+// The client's MemoryWrite is the row without person_id (C1).
+func TestMemoryWriteProtocol(t *testing.T) {
+	sid := "ses_a"
+	created := time.Date(2026, 10, 20, 12, 0, 1, 0, time.UTC)
+	decided := created.Add(time.Minute)
+	w := store.MemoryWrite{ID: "mem_1", PersonID: "chris", SessionID: &sid, TurnID: "turn_1", Op: "forget",
+		Text: "kites", Matched: []string{"likes kites"}, Untrusted: true, Status: "rejected", CreatedAt: created, DecidedAt: &decided}
+	want := protocol.MemoryWrite{ID: "mem_1", SessionID: &sid, TurnID: "turn_1", Op: "forget",
+		Text: "kites", Matched: []string{"likes kites"}, Untrusted: true, Status: "rejected", CreatedAt: created, DecidedAt: &decided}
+	if got := w.Protocol(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Protocol() = %+v, want %+v", got, want)
+	}
+}
+
+// A turn's start (status running) on any session of a tree bumps the root's
+// updated_at, so ListRoots orders conversations by their last turn anywhere
+// in the tree; other statuses do not (S54).
+func TestTurnOnForkBumpsRootInListRoots(t *testing.T) {
+	s := storetest.New(t)
+	newSession(t, s, "ses_a")
+	newFork(t, s, "ses_a_fork", "ses_a", "ses_a")
+	newSession(t, s, "ses_b")
+	su := storetest.ConnAs(t, s, storetest.Superuser)
+	if _, err := su.Exec(ctx, `update sessions set updated_at = case id
+		when 'ses_b' then timestamptz '2026-10-20 12:00:02Z'
+		else timestamptz '2026-10-20 12:00:01Z' end`); err != nil {
+		t.Fatal(err)
+	}
+	order := func() string {
+		t.Helper()
+		roots, err := s.ListRoots(ctx, "chris", false, nil, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids := []string{}
+		for _, r := range roots {
+			ids = append(ids, r.ID)
+		}
+		return fmt.Sprint(ids)
+	}
+	if got := order(); got != "[ses_b ses_a]" {
+		t.Fatalf("roots = %s, want [ses_b ses_a]", got)
+	}
+	if err := s.SetSessionStatus(ctx, "ses_a_fork", "idle"); err != nil {
+		t.Fatal(err)
+	}
+	if got := order(); got != "[ses_b ses_a]" {
+		t.Fatalf("after the fork went idle: roots = %s, want [ses_b ses_a] (only a turn's start moves a root)", got)
+	}
+	if err := s.SetSessionStatus(ctx, "ses_a_fork", "running"); err != nil {
+		t.Fatal(err)
+	}
+	if got := order(); got != "[ses_a ses_b]" {
+		t.Fatalf("after a turn on the fork: roots = %s, want [ses_a ses_b]", got)
+	}
+	if f, err := s.Session(ctx, "ses_a_fork"); err != nil || f.Status != "running" {
+		t.Fatalf("fork = %+v, %v; want running", f, err)
+	}
+	if err := s.SetSessionStatus(ctx, "ses_b", "running"); err != nil {
+		t.Fatal(err)
+	}
+	if got := order(); got != "[ses_b ses_a]" {
+		t.Fatalf("after a turn on root b: roots = %s, want [ses_b ses_a]", got)
+	}
+	if err := s.SetSessionStatus(ctx, "ses_none", "running"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("SetSessionStatus of a missing session = %v, want ErrNotFound", err)
+	}
+}
+
+// HistoryMessage finds a message in the history that ends at head, across
+// sessions, and nothing outside it; a cycle ends the walk.
+func TestHistoryMessageFollowsParents(t *testing.T) {
+	s := storetest.New(t)
+	newSession(t, s, "ses_a")
+	newFork(t, s, "ses_f", "ses_a", "ses_a")
+	msg := func(id, session string, parent *string) {
+		t.Helper()
+		if _, err := s.InsertMessage(ctx, protocol.Message{ID: id, SessionID: session, ParentMessageID: parent,
+			TurnID: "turn_" + id, Role: "user", Status: "complete"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p := func(id string) *string { return &id }
+	msg("m1", "ses_a", nil)
+	msg("m2", "ses_a", p("m1"))
+	msg("m3", "ses_a", p("m2"))
+	msg("f1", "ses_f", p("m2"))
+	msg("f2", "ses_f", p("f1"))
+	for _, c := range []struct {
+		head, id string
+		found    bool
+	}{
+		{"f2", "m1", true}, {"f2", "m2", true}, {"f2", "f1", true}, {"f2", "f2", true}, {"m3", "m1", true},
+		{"f2", "m3", false}, {"m3", "f1", false}, {"f2", "msg_missing", false}, {"msg_missing", "m1", false},
+	} {
+		m, err := s.HistoryMessage(ctx, c.head, c.id)
+		switch {
+		case c.found && (err != nil || m.ID != c.id):
+			t.Errorf("HistoryMessage(%s, %s) = %+v, %v; want %s", c.head, c.id, m, err, c.id)
+		case !c.found && !errors.Is(err, store.ErrNotFound):
+			t.Errorf("HistoryMessage(%s, %s) = %+v, %v; want ErrNotFound", c.head, c.id, m, err)
+		}
+	}
+	msg("c1", "ses_a", p("c2"))
+	msg("c2", "ses_a", p("c1"))
+	if _, err := s.HistoryMessage(ctx, "c1", "m1"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("HistoryMessage over a cycle = %v, want ErrNotFound", err)
 	}
 }

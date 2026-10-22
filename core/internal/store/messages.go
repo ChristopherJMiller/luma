@@ -70,6 +70,22 @@ func (s *Store) Message(ctx context.Context, id string) (protocol.Message, error
 	return scanMessage(s.pool.QueryRow(ctx, `select `+messageCols+` from messages where id = $1`, id))
 }
 
+// HistoryMessage returns message id if it is in the history that ends at
+// message head: head itself or one of its ancestors, following
+// parent_message_id across the sessions of a tree, in one query. Anything
+// else, another branch's message or an unknown one, is ErrNotFound.
+func (s *Store) HistoryMessage(ctx context.Context, head, id string) (protocol.Message, error) {
+	// union, not union all: a cycle (which the writers never make) ends the
+	// walk instead of looping. The walk stops once it reaches id.
+	return scanMessage(s.pool.QueryRow(ctx, `
+		with recursive chain (id, parent) as (
+			select id, parent_message_id from messages where id = $1
+			union
+			select m.id, m.parent_message_id from messages m join chain c on m.id = c.parent where c.id <> $2
+		)
+		select `+messageCols+` from messages where id = $2 and id in (select id from chain)`, head, id))
+}
+
 // Messages returns a session's messages, oldest first.
 func (s *Store) Messages(ctx context.Context, sessionID string) ([]protocol.Message, error) {
 	rows, err := s.pool.Query(ctx, `select `+messageCols+` from messages where session_id = $1

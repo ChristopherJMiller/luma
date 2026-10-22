@@ -222,9 +222,22 @@ func setLastTotals(ctx context.Context, db execer, sessionID string, t protocol.
 }
 
 // SetSessionStatus sets the status (idle, running, requires_action, error).
-// A move to running also stamps last_activity_at.
+// A move to running, a turn's start, also stamps last_activity_at, and bumps
+// the tree root's updated_at in the same transaction: the history list
+// orders conversations by their last turn anywhere in the tree (S54).
 func (s *Store) SetSessionStatus(ctx context.Context, sessionID, status string) error {
-	return s.updateSession(ctx, sessionID, `status = $2, last_activity_at = case when $2 = 'running' then now() else last_activity_at end`, status)
+	const set = `status = $2, last_activity_at = case when $2 = 'running' then now() else last_activity_at end`
+	if status != "running" {
+		return s.updateSession(ctx, sessionID, set, status)
+	}
+	return s.inTx(ctx, func(tx pgx.Tx) error {
+		if err := updateSessionOn(ctx, tx, sessionID, set, status); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `update sessions set updated_at = now()
+			where id = (select root_id from sessions where id = $1) and id <> $1`, sessionID)
+		return err
+	})
 }
 
 // SetSessionTitle sets the title.

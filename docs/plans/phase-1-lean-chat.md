@@ -282,7 +282,7 @@ The tasks refer to these by name. Each is defined once, here. Task 4 Step 5 may 
 | `GET /v1/me` | `Me{person:{id,display_name,tier}, budget: BudgetStatus, maintenance: bool}` (Task 15) |
 | `GET /v1/agents`, `GET /v1/agents/{id}` | `{agents: AgentSummary[]}` / `AgentSummary{id,name,description,tiers,default_tier}` (Task 15). Only `kind: agent` agents whose audience admits the person; `tiers` lists only the tiers that person may use (`deep` for admins only); otherwise 404 |
 | `POST /v1/sessions` | `CreateSession{agent, params:{tier?,effort?,incognito?,workspace?:"none"}}` → `Session`; 503 `maintenance`, 402 `budget_exhausted` (the same Gate as a turn). **Core derives `source`** from the auth path (a cookie session → `web`) and ignores any client value |
-| `GET /v1/sessions?roots=true&archived=false&after=<cursor>` | `{sessions: Session[], next?: string}`, newest `updated_at` first |
+| `GET /v1/sessions?roots=true&archived=false&after=<cursor>` | `{sessions: Session[], next?: string}`, newest `updated_at` first. A turn's start on any session of a tree also bumps its root's `updated_at`, so a conversation carried on in a fork rises too (S54) |
 | `GET /v1/sessions/{id}` / `PATCH {title}` / `DELETE` | `Session` / `Session` / 204 (deletes the whole tree, P3) |
 | `POST /v1/sessions/{id}/archive` and `/unarchive` | `Session` |
 | `GET /v1/sessions/{root}/tree` | `{messages:[{message: Message, parent_id: string\|null, session_id}], head_id, last_event_ids:{[session_id]: number}, pending_writes: MemoryWrite[]}` |

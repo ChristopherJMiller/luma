@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/ChristopherJMiller/luma/core/internal/protocol"
 )
 
 // Profile is a person's memory profile.
@@ -63,6 +65,14 @@ type MemoryWrite struct {
 	Status    string // applied | pending | rejected
 	CreatedAt time.Time
 	DecidedAt *time.Time
+}
+
+// Protocol is the client's MemoryWrite (C1): the row without person_id.
+func (w MemoryWrite) Protocol() protocol.MemoryWrite {
+	return protocol.MemoryWrite{
+		ID: w.ID, SessionID: w.SessionID, TurnID: w.TurnID, Op: w.Op, Text: w.Text, Matched: w.Matched,
+		Untrusted: w.Untrusted, Status: w.Status, CreatedAt: w.CreatedAt, DecidedAt: w.DecidedAt,
+	}
 }
 
 const memoryWriteCols = `id, person_id, session_id, turn_id, op, text, matched, untrusted, status, created_at, decided_at`
