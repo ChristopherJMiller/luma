@@ -808,7 +808,16 @@ func TestOversizedFrameEndsTheLink(t *testing.T) {
 	c := h.connect(false)
 	h.open(c, "ses_A")
 	h.sess.setRunning("ses_A", "turn_1")
-	c.send(textDelta("ses_A", "turn_1", strings.Repeat("x", readLimit)))
+	// Core may close (1009) before it has read the whole frame, so the 8 MiB
+	// write may stall or fail, slowest under a loaded -race run; the close
+	// code is what this test is about.
+	b, err := protocol.EncodeLinkFrame(textDelta("ses_A", "turn_1", strings.Repeat("x", readLimit)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wctx, cancel := context.WithTimeout(bg, 30*time.Second)
+	_ = c.ws.Write(wctx, websocket.MessageText, b)
+	cancel()
 	c.expectClose(websocket.StatusMessageTooBig)
 	eventually(t, "the link's sessions are lost", func() bool { return len(h.sess.Lost()) == 1 })
 	if h.srv.Connected() || len(h.sess.Events()) != 0 {
