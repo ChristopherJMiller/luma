@@ -161,7 +161,7 @@ func TestPositiveCacheHitsApiserverOnce(t *testing.T) {
 	f, r := kubeRev(t)
 	f.allow("good", saConductor, testAudience)
 	h, _ := serve(t, r, PrincipalConductor)
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		if rec := do(h, "Bearer good"); rec.Code != 200 {
 			t.Fatal(rec.Code)
 		}

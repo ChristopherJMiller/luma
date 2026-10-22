@@ -63,7 +63,7 @@ type KubeReviewer struct {
 // must carry.
 func NewKubeReviewer(apiServer, caFile, ownTokenFile, audience string) *KubeReviewer {
 	pool := x509.NewCertPool()
-	if pem, err := os.ReadFile(caFile); err == nil {
+	if pem, err := os.ReadFile(caFile); err == nil { //nolint:gosec // G304: operator-mounted CA path
 		pool.AppendCertsFromPEM(pem)
 	}
 	// An unreadable CA leaves an empty pool: every review fails closed.
@@ -116,7 +116,7 @@ type reviewResponse struct {
 
 // Review implements Reviewer.
 func (k *KubeReviewer) Review(ctx context.Context, token string) (Identity, error) {
-	own, err := os.ReadFile(k.ownTokenFile)
+	own, err := os.ReadFile(k.ownTokenFile) //nolint:gosec // G304: operator-mounted token path
 	if err != nil || len(bytes.TrimSpace(own)) == 0 {
 		return Identity{}, fmt.Errorf("%w: own token unreadable", ErrReviewUnavailable)
 	}
@@ -128,7 +128,7 @@ func (k *KubeReviewer) Review(ctx context.Context, token string) (Identity, erro
 	if err != nil {
 		return Identity{}, fmt.Errorf("%w: encode", ErrReviewUnavailable)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, //nolint:gosec // G704: apiServer is operator config
 		k.apiServer+"/apis/authentication.k8s.io/v1/tokenreviews", bytes.NewReader(body))
 	if err != nil {
 		return Identity{}, fmt.Errorf("%w: request", ErrReviewUnavailable)
@@ -136,7 +136,7 @@ func (k *KubeReviewer) Review(ctx context.Context, token string) (Identity, erro
 	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(own)))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	resp, err := k.client.Do(req)
+	resp, err := k.client.Do(req) //nolint:gosec // G704: apiServer is operator config (in-cluster env)
 	if err != nil {
 		// Deliberately not wrapped: keep transport detail out of errors.
 		return Identity{}, fmt.Errorf("%w: apiserver unreachable", ErrReviewUnavailable)
