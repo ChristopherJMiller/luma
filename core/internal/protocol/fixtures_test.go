@@ -84,6 +84,7 @@ var clientFixtures = []fixture{
 	{"agent-summary.json", "", plain[protocol.AgentSummary]},
 	{"agent-list.json", "", plain[protocol.AgentList]},
 	{"error-info.json", "", plain[protocol.ErrorInfo]},
+	{"error-info-not-found.json", "", plain[protocol.ErrorInfo]},
 }
 
 var linkFixtures = []fixture{
@@ -377,6 +378,9 @@ func TestErrorCopyEqualsTheC3Table(t *testing.T) {
 		"memory_disabled":               "Memory is off in this conversation.",
 		"memory_pending_limit":          "Several memory changes are already waiting for the person's review. Don't save more in this turn.",
 		"forget_too_short":              "Say at least 3 characters of what to forget.",
+		"not_found":                     "Luma can't find that. It may have been deleted.",
+		"invalid_request":               "Luma didn't understand that request. Reload the page and try again.",
+		"request_too_large":             "That message is too long for Luma. Shorten it and try again.",
 		"upstream_error":                "Something went wrong talking to Claude. Try again.",
 		"not_invited":                   "This account isn't invited to Luma.",
 	}

@@ -163,7 +163,7 @@ func NewService(st *store.Store, live *agents.Live, c Conductor, prof ProfileSou
 		st: st, live: live, cond: c, prof: prof, att: att, gate: gate, led: led, m: m, clock: clock, cfg: cfg,
 		appendEvent: st.AppendEvent,
 		afterFunc:   func(d time.Duration, f func()) func() bool { return time.AfterFunc(d, f).Stop },
-		hub:         hub{subs: map[string]map[chan protocol.Event]struct{}{}},
+		hub:         hub{subs: map[string]map[*liveSub]struct{}{}},
 		actors:      map[string]*actor{},
 		running:     map[string]string{},
 	}
@@ -461,45 +461,76 @@ func (k sink) Emit(ctx context.Context, sessionID, typ string, payload any) (int
 // channel closed) and catches up with since=<id> (Task 9b).
 type hub struct {
 	mu   sync.Mutex
-	subs map[string]map[chan protocol.Event]struct{}
+	subs map[string]map[*liveSub]struct{}
 }
 
-func (h *hub) subscribe(sessionID string, buf int) (<-chan protocol.Event, func()) {
-	ch := make(chan protocol.Event, buf)
+// liveSub is one live subscription. end says why ch closed; it is written,
+// under hub.mu, before the close, so a receiver that sees ch closed reads it.
+type liveSub struct {
+	ch  chan protocol.Event
+	end subEnd
+}
+
+// subEnd is why a subscription ended.
+type subEnd int
+
+const (
+	endClosed    subEnd = iota // the subscriber cancelled it, or its context ended
+	endBehind                  // it fell more than its buffer behind
+	endDeleted                 // the session's tree was deleted
+	endTransient               // the log could not be read (the database, a timeout)
+	endPermanent               // a stored event cannot be decoded
+)
+
+func (h *hub) subscribe(sessionID string, buf int) (*liveSub, func()) {
+	sub := &liveSub{ch: make(chan protocol.Event, buf)}
 	h.mu.Lock()
 	if h.subs[sessionID] == nil {
-		h.subs[sessionID] = map[chan protocol.Event]struct{}{}
+		h.subs[sessionID] = map[*liveSub]struct{}{}
 	}
-	h.subs[sessionID][ch] = struct{}{}
+	h.subs[sessionID][sub] = struct{}{}
 	h.mu.Unlock()
-	return ch, func() {
+	return sub, func() {
 		h.mu.Lock()
 		defer h.mu.Unlock()
-		h.drop(sessionID, ch)
+		h.drop(sessionID, sub, endClosed)
 	}
 }
 
-// drop unregisters and closes ch if it is still registered; h.mu is held.
-func (h *hub) drop(sessionID string, ch chan protocol.Event) {
+// drop unregisters and closes sub, recording why, if it is still
+// registered; h.mu is held.
+func (h *hub) drop(sessionID string, sub *liveSub, why subEnd) {
 	set := h.subs[sessionID]
-	if _, ok := set[ch]; !ok {
+	if _, ok := set[sub]; !ok {
 		return
 	}
-	delete(set, ch)
-	close(ch)
+	delete(set, sub)
+	sub.end = why
+	close(sub.ch)
 	if len(set) == 0 {
 		delete(h.subs, sessionID)
+	}
+}
+
+// dropSessions drops every subscriber of the sessions, for why.
+func (h *hub) dropSessions(sessionIDs []string, why subEnd) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, id := range sessionIDs {
+		for sub := range h.subs[id] {
+			h.drop(id, sub, why)
+		}
 	}
 }
 
 func (h *hub) publish(ev protocol.Event) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	for ch := range h.subs[ev.SessionID] {
+	for sub := range h.subs[ev.SessionID] {
 		select {
-		case ch <- ev:
+		case sub.ch <- ev:
 		default:
-			h.drop(ev.SessionID, ch)
+			h.drop(ev.SessionID, sub, endBehind)
 		}
 	}
 }

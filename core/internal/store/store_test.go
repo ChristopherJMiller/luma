@@ -154,6 +154,32 @@ func TestEventBodyRoundTrips(t *testing.T) {
 	}
 }
 
+// A stored event this build cannot decode (an unknown type after a
+// rollback) is a typed error naming the event, so a replay can tell it from a
+// database failure; the events before it come back with the error.
+func TestEventsSinceUndecodableEventIsTyped(t *testing.T) {
+	s := storetest.New(t)
+	newSession(t, s, "ses_a")
+	ok := protocol.SessionStatus{Status: "idle"}
+	first, err := s.AppendEvent(ctx, "ses_a", ok.EventType(), ok, store.Durable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bad int64
+	su := storetest.ConnAs(t, s, storetest.Superuser)
+	if err := su.QueryRow(ctx, `insert into events (session_id, type, payload) values ('ses_a', 'message.vanished', '{}') returning id`).Scan(&bad); err != nil {
+		t.Fatal(err)
+	}
+	evs, err := s.EventsSince(ctx, "ses_a", 0, 10)
+	var de *store.EventDecodeError
+	if !errors.As(err, &de) || de.EventID != bad {
+		t.Fatalf("EventsSince over an unknown type = %v, want an EventDecodeError for event %d", err, bad)
+	}
+	if len(evs) != 1 || evs[0].ID != first {
+		t.Fatalf("events returned with the error = %v, want only event %d before it", evs, first)
+	}
+}
+
 func TestRelaxedAppendCommitsAsync(t *testing.T) {
 	s := storetest.New(t)
 	newSession(t, s, "ses_a")

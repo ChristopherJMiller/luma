@@ -182,6 +182,7 @@ const clientPlain: [string, RuntimeField][] = [
   ['agent-summary.json', obj(AGENT_SUMMARY_SHAPE)],
   ['agent-list.json', obj(AGENT_LIST_SHAPE)],
   ['error-info.json', obj(ERROR_INFO_SHAPE)],
+  ['error-info-not-found.json', obj(ERROR_INFO_SHAPE)],
 ]
 
 const internalPlain: [string, RuntimeField][] = [
@@ -372,6 +373,9 @@ const C3: Record<string, string> = {
   memory_disabled: 'Memory is off in this conversation.',
   memory_pending_limit: "Several memory changes are already waiting for the person's review. Don't save more in this turn.",
   forget_too_short: 'Say at least 3 characters of what to forget.',
+  not_found: "Luma can't find that. It may have been deleted.",
+  invalid_request: "Luma didn't understand that request. Reload the page and try again.",
+  request_too_large: 'That message is too long for Luma. Shorten it and try again.',
   upstream_error: 'Something went wrong talking to Claude. Try again.',
   not_invited: "This account isn't invited to Luma.",
 }
@@ -389,14 +393,17 @@ describe('ERROR_COPY', () => {
         'conversation_attachments_full',
         'forget_too_short',
         'image_too_large',
+        'invalid_request',
         'maintenance',
         'memory_disabled',
         'memory_full',
         'memory_pending_limit',
+        'not_found',
         'not_invited',
         'overloaded',
         'pdf_too_long',
         'rate_limited',
+        'request_too_large',
         'unsupported_attachment',
         'upstream_error',
       ],

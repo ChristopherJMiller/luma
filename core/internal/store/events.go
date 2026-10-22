@@ -65,7 +65,9 @@ func (s *Store) appendEvent(ctx context.Context, db txBeginner, sessionID, typ s
 }
 
 // EventsSince returns up to limit events of a session with id > since, oldest
-// first, decoded into protocol events.
+// first, decoded into protocol events. A stored event that cannot be decoded
+// ends the read with an *EventDecodeError, returned together with the events
+// before it.
 func (s *Store) EventsSince(ctx context.Context, sessionID string, since int64, limit int) ([]protocol.Event, error) {
 	rows, err := s.pool.Query(ctx, `select id, type, payload, created_at from events
 		where session_id = $1 and id > $2 order by id limit $3`, sessionID, since, limit)
@@ -86,16 +88,29 @@ func (s *Store) EventsSince(ctx context.Context, sessionID string, since int64, 
 		}
 		full, err := withHeader(payload, id, sessionID, typ, created)
 		if err != nil {
-			return nil, err
+			return out, &EventDecodeError{EventID: id, Err: err}
 		}
 		decoded, err := protocol.DecodeEvent(full)
 		if err != nil {
-			return nil, fmt.Errorf("store: event %d: %w", id, err)
+			return out, &EventDecodeError{EventID: id, Err: err}
 		}
 		out = append(out, decoded)
 	}
 	return out, rows.Err()
 }
+
+// EventDecodeError is a stored event this build cannot decode: an unknown
+// type after a rollback, or a payload that is not an object. Reading it again
+// fails the same way, so a replay stops for good instead of retrying.
+type EventDecodeError struct {
+	EventID int64
+	Err     error
+}
+
+func (e *EventDecodeError) Error() string {
+	return fmt.Sprintf("store: event %d: %v", e.EventID, e.Err)
+}
+func (e *EventDecodeError) Unwrap() error { return e.Err }
 
 // withHeader merges the row's header fields over the stored body.
 func withHeader(body []byte, id int64, sessionID, typ string, created any) ([]byte, error) {

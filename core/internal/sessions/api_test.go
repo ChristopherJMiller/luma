@@ -181,6 +181,12 @@ func wantErrorInfo(t *testing.T, status int, body []byte, wantStatus int, code p
 	}
 }
 
+// wantError is wantErrorInfo with the code's own C3 copy as the message.
+func wantError(t *testing.T, status int, body []byte, wantStatus int, code protocol.ErrorCode) {
+	t.Helper()
+	wantErrorInfo(t, status, body, wantStatus, code, protocol.ErrorCopy[code])
+}
+
 func userMessageJSON(text string) string {
 	return fmt.Sprintf(`{"type":"user.message","client_id":%q,"content":[{"type":"text","text":%q}],"attachment_ids":[]}`, newClientID(), text)
 }
@@ -216,6 +222,7 @@ type purgeConductor struct {
 	once    sync.Once
 	release chan struct{}
 	err     error
+	hang    bool // never ack: return only when the caller's context ends
 }
 
 func newPurgeConductor() *purgeConductor {
@@ -230,12 +237,16 @@ func (c *purgeConductor) SendTurn(ctx context.Context, ts protocol.TurnSend) err
 	return err
 }
 
-func (c *purgeConductor) PurgeTree(_ context.Context, rootID, personRef string) error {
+func (c *purgeConductor) PurgeTree(ctx context.Context, rootID, personRef string) error {
 	c.mu.Lock()
 	c.log = append(c.log, "purge:"+rootID+":"+personRef)
-	release, err := c.release, c.err
+	release, err, hang := c.release, c.err, c.hang
 	c.mu.Unlock()
 	c.once.Do(func() { close(c.started) })
+	if hang {
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	if release != nil {
 		<-release
 	}
@@ -309,7 +320,6 @@ func TestSessionRoutes(t *testing.T) {
 		t.Fatalf("GET = %+v", got)
 	}
 
-	notFound := protocol.ErrorCopy[protocol.CodeUpstreamError]
 	for _, req := range [][2]string{
 		{http.MethodGet, "/v1/sessions/" + ses.ID},
 		{http.MethodPatch, "/v1/sessions/" + ses.ID},
@@ -326,7 +336,7 @@ func TestSessionRoutes(t *testing.T) {
 			body = userMessageJSON("hello")
 		}
 		st, b := w.do(req[0], req[1], oc, body)
-		wantErrorInfo(t, st, b, http.StatusNotFound, protocol.CodeUpstreamError, notFound)
+		wantError(t, st, b, http.StatusNotFound, protocol.CodeNotFound)
 	}
 	if h.gone(ses.ID) || h.row(ses.ID).Title != "" {
 		t.Fatal("another person's requests changed the session")
@@ -337,7 +347,7 @@ func TestSessionRoutes(t *testing.T) {
 		t.Fatalf("renamed title = %q, stored %q", got.Title, h.row(ses.ID).Title)
 	}
 	st, b := w.do(http.MethodPatch, "/v1/sessions/"+ses.ID, c, `{"title":"   "}`)
-	wantErrorInfo(t, st, b, http.StatusBadRequest, protocol.CodeUpstreamError, notFound)
+	wantError(t, st, b, http.StatusBadRequest, protocol.CodeInvalidRequest)
 
 	w.json(http.MethodPost, "/v1/sessions/"+ses.ID+"/archive", c, "", &got)
 	if got.ArchivedAt == nil {
@@ -382,13 +392,13 @@ func TestSessionRoutes(t *testing.T) {
 		{http.MethodGet, "/v1/sessions?after=bm90LWEtY3Vyc29y", ""},
 	} {
 		st, b := w.do(bad.method, bad.path, c, bad.body)
-		wantErrorInfo(t, st, b, http.StatusBadRequest, protocol.CodeUpstreamError, notFound)
+		wantError(t, st, b, http.StatusBadRequest, protocol.CodeInvalidRequest)
 	}
 	st, b = w.do(http.MethodPost, "/v1/sessions", c, `{"agent":"no-such-agent"}`)
-	wantErrorInfo(t, st, b, http.StatusNotFound, protocol.CodeUpstreamError, notFound)
+	wantError(t, st, b, http.StatusNotFound, protocol.CodeNotFound)
 	huge := fmt.Sprintf(`{"agent":"luma","pad":%q}`, strings.Repeat("x", 1<<20))
 	st, b = w.do(http.MethodPost, "/v1/sessions", c, huge)
-	wantErrorInfo(t, st, b, http.StatusRequestEntityTooLarge, protocol.CodeUpstreamError, notFound)
+	wantError(t, st, b, http.StatusRequestEntityTooLarge, protocol.CodeRequestTooLarge)
 
 	// Without a session the auth layer answers, status-only (S41).
 	if st, b := w.do(http.MethodGet, "/v1/sessions/"+ses.ID, nil, ""); st != http.StatusUnauthorized || bytes.HasPrefix(b, []byte("{")) {
@@ -451,7 +461,7 @@ func TestDeleteDeletesTree(t *testing.T) {
 	keep := h.newSession(family)
 
 	st, b := w.do(http.MethodDelete, "/v1/sessions/"+keep.ID, w.login(other), "")
-	wantErrorInfo(t, st, b, http.StatusNotFound, protocol.CodeUpstreamError, protocol.ErrorCopy[protocol.CodeUpstreamError])
+	wantError(t, st, b, http.StatusNotFound, protocol.CodeNotFound)
 
 	if st, b := w.do(http.MethodDelete, "/v1/sessions/"+fork1.ID, c, ""); st != http.StatusNoContent || len(b) != 0 {
 		t.Fatalf("DELETE = %d %q, want 204 and no body", st, b)
@@ -474,7 +484,7 @@ func TestDeleteDeletesTree(t *testing.T) {
 		t.Fatalf("purges = %v, want %v", purges, want)
 	}
 	st, b = w.do(http.MethodDelete, "/v1/sessions/"+root.ID, c, "")
-	wantErrorInfo(t, st, b, http.StatusNotFound, protocol.CodeUpstreamError, protocol.ErrorCopy[protocol.CodeUpstreamError])
+	wantError(t, st, b, http.StatusNotFound, protocol.CodeNotFound)
 }
 
 // S39: the tree's rows go only after its purge returns, and from the moment
@@ -508,7 +518,7 @@ func TestDeletePurgesBeforeRows(t *testing.T) {
 			t.Fatal("rows were deleted while the purge was still waiting for its ack")
 		}
 		st, b := w.do(http.MethodPost, "/v1/sessions/"+sib.ID+"/events", c, userMessageJSON("are you there"))
-		wantErrorInfo(t, st, b, http.StatusNotFound, protocol.CodeUpstreamError, protocol.ErrorCopy[protocol.CodeUpstreamError])
+		wantError(t, st, b, http.StatusNotFound, protocol.CodeNotFound)
 		if _, err := h.svc.Send(bg, family, root.ID, userMsg("and here", newClientID())); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("Send on the root mid-delete = %v, want ErrNotFound", err)
 		}
@@ -575,4 +585,106 @@ func TestDeletePurgesBeforeRows(t *testing.T) {
 			t.Fatalf("conductor saw %v, want %v", pc.Log(), want)
 		}
 	})
+}
+
+// deleteWithin runs DeleteTree for family's root, failing the test if it has
+// not returned within d.
+func deleteWithin(t *testing.T, h *harness, rootID string, d time.Duration) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- h.svc.DeleteTree(bg, family.ID, rootID) }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(d):
+		t.Fatalf("DeleteTree has not returned after %v", d)
+		return nil
+	}
+}
+
+// Defence in depth around S39: the barrier and the purge are each bounded
+// (Task 10's PurgeTree has its own 30 s), and running out of either goes on
+// with the delete as a lost link would.
+func TestDeleteTreeBounded(t *testing.T) {
+	t.Run("a purge that never acks", func(t *testing.T) {
+		h := newHarness(t)
+		pc := newPurgeConductor()
+		pc.hang = true
+		h.svc = h.service(pc)
+		h.svc.deletions.purgeWait = 100 * time.Millisecond
+		root := h.newSession(family)
+		sib := h.fork(root)
+		start := time.Now()
+		if err := deleteWithin(t, h, root.ID, 5*time.Second); err != nil {
+			t.Fatalf("DeleteTree = %v, want nil after the purge's bound", err)
+		}
+		if d := time.Since(start); d > 5*time.Second {
+			t.Fatalf("DeleteTree took %v with a 100 ms purge bound", d)
+		}
+		if !h.gone(root.ID) || !h.gone(sib.ID) {
+			t.Fatal("rows survived a purge that timed out")
+		}
+	})
+
+	t.Run("a barrier that never clears", func(t *testing.T) {
+		h := newHarness(t)
+		pc := newPurgeConductor()
+		h.svc = h.service(pc)
+		h.svc.deletions.barrierWait = 100 * time.Millisecond
+		root := h.newSession(family)
+		sib := h.fork(root)
+		inSend, letSend := make(chan struct{}), make(chan struct{})
+		sent := make(chan error, 1)
+		t.Cleanup(func() { close(letSend); <-sent }) // the stuck send ends before the store closes
+		pc.onSend = func(protocol.TurnSend) {
+			close(inSend)
+			<-letSend
+		}
+		go func() {
+			_, err := h.svc.Send(bg, family, sib.ID, userMsg("stuck", newClientID()))
+			sent <- err
+		}()
+		<-inSend
+		if err := deleteWithin(t, h, root.ID, 5*time.Second); err != nil {
+			t.Fatalf("DeleteTree = %v, want nil after the barrier's bound", err)
+		}
+		if want := []string{"purge:" + root.ID + ":" + h.ref(family)}; !slices.Equal(pc.Log(), want) {
+			t.Fatalf("conductor saw %v, want %v", pc.Log(), want)
+		}
+		if !h.gone(root.ID) || !h.gone(sib.ID) {
+			t.Fatal("rows survived a barrier that timed out")
+		}
+	})
+
+	if deleteBarrierWait != 30*time.Second || deletePurgeWait != 35*time.Second {
+		t.Fatalf("bounds = %v, %v; want 30s, 35s", deleteBarrierWait, deletePurgeWait)
+	}
+}
+
+// A resend after a flaky POST (Review Focus 3): the same client_id answers
+// 200 with the message stored the first time and starts no second turn, also
+// once the Gate has closed (the id is reserved before it).
+func TestRepeatedClientIDOverHTTP(t *testing.T) {
+	h := newHarness(t)
+	w := newWeb(h)
+	c := w.login(family)
+	ses := h.newSession(family)
+	body := userMessageJSON("did this go through")
+	var first, again, gated protocol.SendResult
+	w.json(http.MethodPost, "/v1/sessions/"+ses.ID+"/events", c, body, &first)
+	w.json(http.MethodPost, "/v1/sessions/"+ses.ID+"/events", c, body, &again)
+	h.gate.set(protocol.CodeMaintenance)
+	w.json(http.MethodPost, "/v1/sessions/"+ses.ID+"/events", c, body, &gated)
+	if first.Message == nil || again.Message == nil || gated.Message == nil {
+		t.Fatalf("results %+v %+v %+v, want a message each", first, again, gated)
+	}
+	if again.Message.ID != first.Message.ID || gated.Message.ID != first.Message.ID || again.Message.TurnID != first.Message.TurnID {
+		t.Fatalf("repeats answered %s and %s, want the first message %s", again.Message.ID, gated.Message.ID, first.Message.ID)
+	}
+	if n := len(h.cond.Sends()); n != 1 {
+		t.Fatalf("turn.send %d times, want 1", n)
+	}
+	if n := len(h.messages(ses.ID, "user")); n != 1 {
+		t.Fatalf("%d user messages stored, want 1", n)
+	}
 }

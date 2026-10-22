@@ -288,7 +288,7 @@ The tasks refer to these by name. Each is defined once, here. Task 4 Step 5 may 
 | `GET /v1/sessions/{root}/tree` | `{messages:[{message: Message, parent_id: string\|null, session_id}], head_id, last_event_ids:{[session_id]: number}, pending_writes: MemoryWrite[]}` |
 | `POST /v1/sessions/{id}/fork` | `{at_message}` → `Session` (P4) |
 | `POST /v1/sessions/{id}/events` | `ClientEvent` → `{message?: Message}`; 409 `busy`, 503 `maintenance`, 402 `budget_exhausted`. A `user.message` whose `client_id` (a UUID) was seen before returns that message and starts nothing; the id is reserved **before** the Gate on purpose, so a repeat returns its message even after the Gate closes, and an id refused before its message existed is reused by its retry (Task 9a) |
-| `GET /v1/sessions/{id}/stream?since=<id>` | WebSocket, server → client `Event` frames; ping every 25 s |
+| `GET /v1/sessions/{id}/stream?since=<id>` | WebSocket, server → client `Event` frames, every event with id > `since` once, in id order; ping every 25 s. The handshake needs exactly one allowed `Origin` and the cookie. Refused before the upgrade: 403/401 (auth layer), 404 `not_found`, 400 `invalid_request`. **Close codes:** **4401** the web session ended (sign in again); **4404** the conversation's tree was deleted (drop the thread); **1013** too far behind (1000 events) or the log could not be read for now (reconnect with `since`); **1011** a stored event cannot be read, and never will be (do not reconnect). Any other close (1006, a network drop) means reconnect with `since` |
 | `POST /v1/attachments` (multipart `file`) | `Attachment{id,media_type,filename,size_bytes,width?,height?,pages?}` |
 | `GET /v1/attachments/{id}`, `DELETE` | bytes (owner only) / 204 |
 | `GET /v1/memory/profile` / `PUT {content,version}` / `DELETE` | `Profile{content,version,updated_at,pending: MemoryWrite[]}` |
@@ -303,7 +303,7 @@ The tasks refer to these by name. Each is defined once, here. Task 4 Step 5 may 
 **Types frozen by Task 5** (`core/internal/protocol`, `packages/protocol`, fixtures in `protocol/fixtures/{client,link,internal}`; timestamps are RFC 3339 strings, nullable fields are `null`, never omitted):
 - `Session{id, root_id, parent_id|null, fork_at_message_id|null, agent_id, agent_version, title, tier, model, effort, incognito, workspace:"none", source:"web"|"ci", status, tainted, archived_at|null, created_at, updated_at, last_activity_at}`. `sdk_session_id`, `last_totals`, `helper_model` and the snapshots stay server-side.
 - Request and result bodies the table leaves unnamed: `SessionList{sessions, next?}`, `SessionPatch{title}`, `ForkRequest{at_message}`, `SendResult{message?}`, `ProfileUpdate{content, version}`, `AgentList{agents}`.
-- `ErrorInfo{code, message}` is the body of every REST error a handler returns (the auth layer's 401/403/415 are plain text, S41) and the `error` of `rpc.result`. `message` is the **rendered** C3 copy, placeholders filled (`pdf_too_long` carries its `{max}`).
+- `ErrorInfo{code, message}` is the body of every REST error a handler returns (the auth layer's 401/403/415 are plain text, S41) and the `error` of `rpc.result`. `message` is the **rendered** C3 copy, placeholders filled (`pdf_too_long` carries its `{max}`). A handler's 404 is `not_found`, a malformed request 400 `invalid_request`, a JSON body over 1 MiB 413 `request_too_large` (S49); `upstream_error` is only for a server-side failure.
 - **Containers are never `null` on the wire.** A Go nil slice or map encodes as `[]` / `{}` (a `MarshalJSON` on every type that carries one); `null` is only for fields the contract marks nullable (`parent_id`, `sdk_uuid`, `model`, `matched`, `decided_at`, `archived_at`, `cost_basis`, `resume`, `head_id`...). Every Go frame and client event also writes its own `type`, so `json.Marshal` equals `EncodeLinkFrame`.
 - **Compatibility (S37).** Additive fields are backward-compatible; removals and renames are lockstep. The runtime decoders (Go and TS) reject a missing required key, a wrong kind or an unknown `type`, and **ignore unknown keys** (a service-worker-cached PWA can meet a newer Core; Core and the conductor roll out apart). The tests stay strict against the fixtures (exact keys, at every depth).
 - **TS names.** `Event` shadows the DOM global in any module that imports it: import it as `import type { Event as LumaEvent }`. The `error` event's TS name is `SessionErrorEvent`. A client `user.message` carries `TextBlock[]` (Go `TextBlock`); `ContentBlock` is Core's turn.send input.
@@ -427,6 +427,9 @@ A `turn_result` that arrives in time ends the turn normally and cancels both. Af
 | `memory_disabled` | tool result text | "Memory is off in this conversation." |
 | `memory_pending_limit` | tool result text (4th pending write in a turn) | "Several memory changes are already waiting for the person's review. Don't save more in this turn." |
 | `forget_too_short` | tool result text | "Say at least 3 characters of what to forget." |
+| `not_found` | 404: no such session (or write, attachment, agent), or not the person's (S49) | "Luma can't find that. It may have been deleted." |
+| `invalid_request` | 400: a malformed request (S49) | "Luma didn't understand that request. Reload the page and try again." |
+| `request_too_large` | 413: a JSON body over 1 MiB (S49) | "That message is too long for Luma. Shorten it and try again." |
 | `upstream_error` | anything else | "Something went wrong talking to Claude. Try again." |
 | `not_invited` | 403 page at callback | "This account isn't invited to Luma." |
 

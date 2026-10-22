@@ -206,7 +206,8 @@ func TestEveryCodeHasCopy(t *testing.T) {
 		protocol.CodeCapacity, protocol.CodeBusy, protocol.CodeAttachmentTooLarge,
 		protocol.CodeImageTooLarge, protocol.CodePDFTooLong, protocol.CodeConversationAttachmentsFull,
 		protocol.CodeUnsupportedAttachment, protocol.CodeMemoryFull, protocol.CodeMemoryDisabled,
-		protocol.CodeMemoryPendingLimit, protocol.CodeForgetTooShort, protocol.CodeUpstreamError,
+		protocol.CodeMemoryPendingLimit, protocol.CodeForgetTooShort, protocol.CodeNotFound,
+		protocol.CodeInvalidRequest, protocol.CodeRequestTooLarge, protocol.CodeUpstreamError,
 		protocol.CodeNotInvited,
 	}
 	for _, c := range codes {

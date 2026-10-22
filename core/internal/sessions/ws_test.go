@@ -2,8 +2,10 @@ package sessions
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"slices"
 	"strconv"
@@ -17,6 +19,7 @@ import (
 
 	"github.com/ChristopherJMiller/luma/core/internal/auth"
 	"github.com/ChristopherJMiller/luma/core/internal/protocol"
+	"github.com/ChristopherJMiller/luma/core/internal/store/storetest"
 )
 
 // ---- helpers ----
@@ -54,8 +57,8 @@ func (h *harness) subscribers(sessionID string) int {
 func (h *harness) dropSubscribers(sessionID string) {
 	h.svc.hub.mu.Lock()
 	defer h.svc.hub.mu.Unlock()
-	for ch := range h.svc.hub.subs[sessionID] {
-		h.svc.hub.drop(sessionID, ch)
+	for sub := range h.svc.hub.subs[sessionID] {
+		h.svc.hub.drop(sessionID, sub, endBehind)
 	}
 }
 
@@ -187,9 +190,9 @@ func next(t *testing.T, c *websocket.Conn) protocol.Event {
 	return ev
 }
 
-// expectSessionEnded reads until the server closes the socket, which must be
-// with 4401 (the web session ended; the PWA goes to sign-in).
-func expectSessionEnded(t *testing.T, c *websocket.Conn) {
+// expectCloseCode reads until the server closes the socket and checks the
+// close code.
+func expectCloseCode(t *testing.T, c *websocket.Conn, code websocket.StatusCode) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(bg, 10*time.Second)
 	defer cancel()
@@ -198,11 +201,18 @@ func expectSessionEnded(t *testing.T, c *websocket.Conn) {
 		if err == nil {
 			continue
 		}
-		if got := websocket.CloseStatus(err); got != 4401 {
-			t.Fatalf("socket ended with %v (status %d), want close 4401", err, got)
+		if got := websocket.CloseStatus(err); got != code {
+			t.Fatalf("socket ended with %v (status %d), want close %d", err, got, code)
 		}
 		return
 	}
+}
+
+// expectSessionEnded: the close is 4401 (the web session ended; the PWA goes
+// to sign-in).
+func expectSessionEnded(t *testing.T, c *websocket.Conn) {
+	t.Helper()
+	expectCloseCode(t, c, 4401)
 }
 
 // stillOpen checks a socket delivers a fresh event.
@@ -383,11 +393,140 @@ func TestWSRejectsForeignOrigin(t *testing.T) {
 			t.Fatalf("%s: err %v, status %d; want 401 and no upgrade", name, err, hs.status)
 		}
 	}
+	// A handshake whose Upgrade lists another protocol first slips past
+	// RequirePerson's WebSocket test (it compares the whole header), so with
+	// no Origin it would pass as a plain GET; the stream itself wants exactly
+	// one Origin.
+	key := make([]byte, 16)
+	req, err := http.NewRequest(http.MethodGet, w.srv.URL+"/v1/sessions/"+ses.ID+"/stream", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "h2c, websocket")
+	req.Header.Set("Sec-WebSocket-Version", "13")
+	req.Header.Set("Sec-WebSocket-Key", base64.StdEncoding.EncodeToString(key))
+	req.AddCookie(c)
+	resp, err := w.srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("Upgrade: h2c, websocket without an Origin = %d, want 403", resp.StatusCode)
+	}
 	if n := h.subscribers(ses.ID); n != 0 {
 		t.Fatalf("refused handshakes left %d subscribers", n)
 	}
 	ws := w.dial(c, ses.ID, 0)
 	stillOpen(t, h, ws, ses.ID)
+}
+
+// Deleting a tree from another request closes every socket on any of its
+// sessions with 4404 (the PWA drops the thread instead of reconnecting);
+// another tree's socket stays open.
+func TestWSClosedWhenTreeDeleted(t *testing.T) {
+	h := newHarness(t)
+	w := newWeb(h)
+	phone, laptop := w.login(family), w.login(family)
+	root := h.newSession(family)
+	sib := h.fork(root)
+	keep := h.newSession(family)
+	onRoot, onSib, onKeep := w.dial(phone, root.ID, 0), w.dial(phone, sib.ID, 0), w.dial(phone, keep.ID, 0)
+	h.waitSubscribers(root.ID, 1)
+	h.waitSubscribers(sib.ID, 1)
+	if st, b := w.do(http.MethodDelete, "/v1/sessions/"+root.ID, laptop, ""); st != http.StatusNoContent {
+		t.Fatalf("DELETE = %d %s", st, b)
+	}
+	expectCloseCode(t, onRoot, 4404)
+	expectCloseCode(t, onSib, 4404)
+	stillOpen(t, h, onKeep, keep.ID)
+	h.waitSubscribers(root.ID, 0)
+	h.waitSubscribers(sib.ID, 0)
+}
+
+// recordLog is a slog handler that keeps every record.
+type recordLog struct {
+	mu   sync.Mutex
+	recs []slog.Record
+}
+
+func (l *recordLog) Enabled(context.Context, slog.Level) bool { return true }
+func (l *recordLog) WithAttrs([]slog.Attr) slog.Handler       { return l }
+func (l *recordLog) WithGroup(string) slog.Handler            { return l }
+func (l *recordLog) Handle(_ context.Context, r slog.Record) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.recs = append(l.recs, r.Clone())
+	return nil
+}
+
+// errorsNaming counts the error-level records with an "event" attribute of id.
+func (l *recordLog) errorsNaming(id int64) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, r := range l.recs {
+		r.Attrs(func(a slog.Attr) bool {
+			if r.Level == slog.LevelError && a.Key == "event" && a.Value.Any() == id {
+				n++
+			}
+			return true
+		})
+	}
+	return n
+}
+
+// A stored event this build cannot decode can never be replayed: the socket
+// closes with 1011 so the client stops reconnecting, and the event id is
+// logged once at error level, however often clients retry. Not parallel: it
+// replaces the default logger.
+func TestWSUndecodableEventClosesFor1011(t *testing.T) {
+	logs := &recordLog{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(logs))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	h := buildHarness(t)
+	w := newWeb(h)
+	c := w.login(family)
+	ses := h.newSession(family)
+	good := h.emit(ses.ID, 1)
+	var bad int64
+	conn := storetest.ConnAs(t, h.st, storetest.Superuser)
+	if err := conn.QueryRow(bg, `insert into events (session_id, type, payload) values ($1, 'message.vanished', '{}') returning id`, ses.ID).Scan(&bad); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		ws := w.dial(c, ses.ID, 0)
+		if ev := next(t, ws); ev.ID != good[0] {
+			t.Fatalf("read %d, want the readable event %d first", ev.ID, good[0])
+		}
+		expectCloseCode(t, ws, websocket.StatusInternalError)
+	}
+	if n := logs.errorsNaming(bad); n != 1 {
+		t.Fatalf("event %d logged %d times at error level, want once", bad, n)
+	}
+}
+
+// A replay that fails for a reason that can pass (the database) closes with
+// 1013, so the client reconnects with since; once the cause is gone it
+// continues without a gap.
+func TestWSReplayDatabaseFailureCloses1013(t *testing.T) {
+	h := newHarness(t)
+	w := newWeb(h)
+	c := w.login(family)
+	ses := h.newSession(family)
+	ids := h.emit(ses.ID, 2)
+	h.sql(`revoke select on events from ` + storetest.CoreRole)
+	ws := w.dial(c, ses.ID, 0)
+	expectCloseCode(t, ws, websocket.StatusTryAgainLater)
+	h.sql(`grant select on events to ` + storetest.CoreRole)
+	ws = w.dial(c, ses.ID, 0)
+	for _, want := range ids {
+		if ev := next(t, ws); ev.ID != want {
+			t.Fatalf("read %d, want %d", ev.ID, want)
+		}
+	}
 }
 
 // The allowlist decides, not the Host header: an allowed origin other than
@@ -414,17 +553,18 @@ func TestWSRefusedBeforeUpgrade(t *testing.T) {
 	for _, tc := range []struct {
 		session, since string
 		status         int
+		code           protocol.ErrorCode
 	}{
-		{theirs.ID, "0", http.StatusNotFound},
-		{"ses_00000000000000000000000000", "0", http.StatusNotFound},
-		{mine.ID, "-1", http.StatusBadRequest},
-		{mine.ID, "seven", http.StatusBadRequest},
+		{theirs.ID, "0", http.StatusNotFound, protocol.CodeNotFound},
+		{"ses_00000000000000000000000000", "0", http.StatusNotFound, protocol.CodeNotFound},
+		{mine.ID, "-1", http.StatusBadRequest, protocol.CodeInvalidRequest},
+		{mine.ID, "seven", http.StatusBadRequest, protocol.CodeInvalidRequest},
 	} {
 		_, hs, err := w.dialFrom(w.origin, c, tc.session, tc.since)
 		if err == nil {
 			t.Fatalf("%s since %s upgraded", tc.session, tc.since)
 		}
-		wantErrorInfo(t, hs.status, hs.body, tc.status, protocol.CodeUpstreamError, protocol.ErrorCopy[protocol.CodeUpstreamError])
+		wantError(t, hs.status, hs.body, tc.status, tc.code)
 	}
 	// No since replays from the start.
 	conn, _, err := w.dialFrom(w.origin, c, mine.ID, "")

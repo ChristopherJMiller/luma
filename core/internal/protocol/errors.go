@@ -22,6 +22,9 @@ const (
 	CodeMemoryDisabled              ErrorCode = "memory_disabled"
 	CodeMemoryPendingLimit          ErrorCode = "memory_pending_limit"
 	CodeForgetTooShort              ErrorCode = "forget_too_short"
+	CodeNotFound                    ErrorCode = "not_found"
+	CodeInvalidRequest              ErrorCode = "invalid_request"
+	CodeRequestTooLarge             ErrorCode = "request_too_large"
 	CodeUpstreamError               ErrorCode = "upstream_error"
 	CodeNotInvited                  ErrorCode = "not_invited"
 )
@@ -45,6 +48,9 @@ var ErrorCopy = map[ErrorCode]string{
 	CodeMemoryDisabled:              "Memory is off in this conversation.",
 	CodeMemoryPendingLimit:          "Several memory changes are already waiting for the person's review. Don't save more in this turn.",
 	CodeForgetTooShort:              "Say at least 3 characters of what to forget.",
+	CodeNotFound:                    "Luma can't find that. It may have been deleted.",
+	CodeInvalidRequest:              "Luma didn't understand that request. Reload the page and try again.",
+	CodeRequestTooLarge:             "That message is too long for Luma. Shorten it and try again.",
 	CodeUpstreamError:               "Something went wrong talking to Claude. Try again.",
 	CodeNotInvited:                  "This account isn't invited to Luma.",
 }

@@ -17,6 +17,9 @@ export type ErrorCode =
   | 'memory_disabled'
   | 'memory_pending_limit'
   | 'forget_too_short'
+  | 'not_found'
+  | 'invalid_request'
+  | 'request_too_large'
   | 'upstream_error'
   | 'not_invited'
 
@@ -43,6 +46,9 @@ export const ERROR_COPY = {
   memory_disabled: 'Memory is off in this conversation.',
   memory_pending_limit: "Several memory changes are already waiting for the person's review. Don't save more in this turn.",
   forget_too_short: 'Say at least 3 characters of what to forget.',
+  not_found: "Luma can't find that. It may have been deleted.",
+  invalid_request: "Luma didn't understand that request. Reload the page and try again.",
+  request_too_large: 'That message is too long for Luma. Shorten it and try again.',
   upstream_error: 'Something went wrong talking to Claude. Try again.',
   not_invited: "This account isn't invited to Luma.",
 } satisfies Record<ErrorCode, string>

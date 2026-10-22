@@ -377,6 +377,13 @@ func (h *harness) counter(name string) float64 {
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 	t.Parallel()
+	return buildHarness(t)
+}
+
+// buildHarness is newHarness for a test that must not run in parallel (one
+// that replaces the default logger).
+func buildHarness(t *testing.T) *harness {
+	t.Helper()
 	st := storetest.New(t)
 	dir := catalogDir(t, "claude-haiku-5-5")
 	cat, err := agents.LoadCatalog(dir)
@@ -842,8 +849,9 @@ func TestFreshSessionHasNoResume(t *testing.T) {
 func TestSendPersistsBeforeConductor(t *testing.T) {
 	h := newHarness(t)
 	ses := h.newSession(family)
-	live, cancel := h.svc.hub.subscribe(ses.ID, 100)
+	sub, cancel := h.svc.hub.subscribe(ses.ID, 100)
 	defer cancel()
+	live := sub.ch
 	var stored, persisted, fannedOut bool
 	calls := 0
 	h.cond.onSend = func(ts protocol.TurnSend) {

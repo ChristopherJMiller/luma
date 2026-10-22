@@ -25,6 +25,11 @@ const (
 	maxRequestBody = 1 << 20
 	// listPageSize is the number of roots in one page of GET /v1/sessions.
 	listPageSize = 50
+	// deleteBarrierWait and deletePurgeWait bound a tree delete's wait for the
+	// tree's actors and for the conductor's purge ack (Task 10's PurgeTree
+	// gives up at 30 s itself); running out of either goes on with the delete.
+	deleteBarrierWait = 30 * time.Second
+	deletePurgeWait   = 35 * time.Second
 )
 
 // Routes registers C1's session routes, each behind requirePerson (the BFF's
@@ -224,13 +229,16 @@ func (s *Service) owned(ctx context.Context, p auth.Person, sessionID string) (s
 // DeleteTree deletes a person's conversation tree: the one tree-delete path,
 // used by DELETE and by the Task 15 janitor (S39). In order:
 //  1. it marks the root deleting, so Send (and Task 11's Fork) on any session
-//     of the tree answers 404 from here on, and waits until every send of the
-//     tree already in an actor has gone out, so no host opens after the purge;
+//     of the tree answers 404 from here on, and waits (up to
+//     deleteBarrierWait) until every send of the tree already in an actor has
+//     gone out, so no host opens after the purge;
 //  2. Conductor.PurgeTree(root, the owner's person ref), which returns on the
-//     conductor's tree.purged ack, link loss, or after 30 s (Task 10). A
-//     failure or timeout is logged and the delete goes on: the janitor's
-//     orphan sweep catches a late mirror write;
-//  3. store.DeleteTree.
+//     conductor's tree.purged ack, link loss, or after 30 s (Task 10), and is
+//     cut at deletePurgeWait here as well. A failure or timeout is logged and
+//     the delete goes on as after a lost link: the janitor's orphan sweep
+//     catches a late mirror write;
+//  3. store.DeleteTree, then every stream of the tree's sessions closes with
+//     4404 (the client drops the thread).
 //
 // rootID must be a root the person owns, otherwise ErrNotFound. The delete
 // runs to the end even if ctx is cancelled (a client that leaves mid-delete
@@ -254,13 +262,25 @@ func (s *Service) DeleteTree(ctx context.Context, personID, rootID string) error
 	if err != nil {
 		return err
 	}
-	for _, ses := range tree { // a barrier: each actor finishes the work it already has
-		if err := s.call(ctx, ses.ID, func(context.Context, *actor) error { return nil }); err != nil {
-			return err
+	ids := make([]string, 0, len(tree))
+	for _, ses := range tree {
+		ids = append(ids, ses.ID)
+	}
+	// A barrier: each actor finishes the work it already has.
+	barrier, cancel := context.WithTimeout(ctx, orDefault(s.deletions.barrierWait, deleteBarrierWait))
+	for _, id := range ids {
+		// The no-op cannot fail, so an error is the bound running out.
+		if err := s.call(barrier, id, func(context.Context, *actor) error { return nil }); err != nil {
+			slog.Warn("sessions: tree delete: the tree's sessions did not settle in time; deleting anyway", "root", rootID, "session", id)
+			break
 		}
 	}
+	cancel()
 	started := s.clock()
-	if err := s.cond.PurgeTree(ctx, rootID, ref); err != nil {
+	purge, cancel := context.WithTimeout(ctx, orDefault(s.deletions.purgeWait, deletePurgeWait))
+	err = s.cond.PurgeTree(purge, rootID, ref)
+	cancel()
+	if err != nil {
 		slog.Warn("sessions: tree purge not acknowledged; deleting the rows anyway", "root", rootID, "err", err)
 	}
 	if err := s.st.DeleteTree(ctx, personID, rootID); err != nil {
@@ -269,14 +289,24 @@ func (s *Service) DeleteTree(ctx context.Context, personID, rootID string) error
 		}
 		return err
 	}
+	s.hub.dropSessions(ids, endDeleted)
 	slog.Info("sessions: tree deleted", "root", rootID, "sessions", len(tree), "purge_seconds", s.clock().Sub(started).Seconds())
 	return nil
+}
+
+func orDefault(d, def time.Duration) time.Duration {
+	if d > 0 {
+		return d
+	}
+	return def
 }
 
 // deletions counts the deletes in progress per root.
 type deletions struct {
 	mu    sync.Mutex
 	roots map[string]int
+	// barrierWait and purgeWait replace the bounds when set (tests).
+	barrierWait, purgeWait time.Duration
 }
 
 func (d *deletions) mark(rootID string) {
@@ -334,7 +364,7 @@ func readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 	if err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
-			writeErrorInfo(w, r, http.StatusRequestEntityTooLarge, protocol.CodeUpstreamError)
+			writeErrorInfo(w, r, http.StatusRequestEntityTooLarge, protocol.CodeRequestTooLarge)
 			return nil, false
 		}
 		writeError(w, r, fmt.Errorf("%w: unreadable body", ErrInvalid))
@@ -369,9 +399,9 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 // writeError answers a handler error with its status and an ErrorInfo body
-// (C1, C3). C3 has no code for a malformed request or a missing session, so
-// those carry upstream_error, C3's code for anything else; clients act on the
-// status. A Gate refusal carries the Gate's ErrorInfo, already rendered.
+// (C1, C3): ErrNotFound is 404 not_found, ErrInvalid 400 invalid_request
+// (S49), ErrBusy 409 busy, and a Gate refusal carries the Gate's ErrorInfo,
+// already rendered. Anything else is 500 upstream_error.
 func writeError(w http.ResponseWriter, r *http.Request, err error) {
 	var refused *RefusedError
 	switch {
@@ -382,10 +412,10 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 		writeErrorInfo(w, r, http.StatusConflict, protocol.CodeBusy)
 		return
 	case errors.Is(err, ErrNotFound):
-		writeErrorInfo(w, r, http.StatusNotFound, protocol.CodeUpstreamError)
+		writeErrorInfo(w, r, http.StatusNotFound, protocol.CodeNotFound)
 		return
 	case errors.Is(err, ErrInvalid):
-		writeErrorInfo(w, r, http.StatusBadRequest, protocol.CodeUpstreamError)
+		writeErrorInfo(w, r, http.StatusBadRequest, protocol.CodeInvalidRequest)
 		return
 	}
 	if r.Context().Err() == nil { // else the client left; the work it started runs on
@@ -395,9 +425,10 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 }
 
 // refusalStatus is the HTTP status of a refusal carrying a C3 code:
-// maintenance 503 and budget_exhausted 402 (S1), busy 409, and 400 for a cap
-// on the message's attachments (Task 12's Bind). No request is refused with
-// the other codes, so one that is is a bug: 500.
+// maintenance 503 and budget_exhausted 402 (S1), busy 409, not_found 404,
+// request_too_large 413, and 400 for invalid_request or a cap on the
+// message's attachments (Task 12's Bind). No request is refused with the
+// other codes, so one that is is a bug: 500.
 func refusalStatus(code protocol.ErrorCode) int {
 	switch code {
 	case protocol.CodeMaintenance:
@@ -406,8 +437,12 @@ func refusalStatus(code protocol.ErrorCode) int {
 		return http.StatusPaymentRequired
 	case protocol.CodeBusy:
 		return http.StatusConflict
-	case protocol.CodeAttachmentTooLarge, protocol.CodeImageTooLarge, protocol.CodePDFTooLong,
-		protocol.CodeConversationAttachmentsFull, protocol.CodeUnsupportedAttachment:
+	case protocol.CodeNotFound:
+		return http.StatusNotFound
+	case protocol.CodeRequestTooLarge:
+		return http.StatusRequestEntityTooLarge
+	case protocol.CodeInvalidRequest, protocol.CodeAttachmentTooLarge, protocol.CodeImageTooLarge,
+		protocol.CodePDFTooLong, protocol.CodeConversationAttachmentsFull, protocol.CodeUnsupportedAttachment:
 		return http.StatusBadRequest
 	case protocol.CodeRateLimited, protocol.CodeOverloaded, protocol.CodeConductorRestarted, protocol.CodeCapacity,
 		protocol.CodeUpstreamError: // turn errors: they reach the client as error events
