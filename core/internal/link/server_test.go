@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -72,19 +73,37 @@ type linkEvent struct {
 }
 
 type fakeSessions struct {
-	mu      sync.Mutex
-	running map[string]string
-	events  []linkEvent
-	states  []protocol.HostState
-	lost    [][]string
+	mu       sync.Mutex
+	running  map[string]string
+	events   []linkEvent
+	states   []protocol.HostState
+	lost     [][]string
+	log      []string // events and losses, in the order they arrived
+	barriers int
+
+	// While hold is set, OnLinkEvent blocks on it (a slow actor whose
+	// mailbox is full); held is signalled once per blocked call.
+	hold chan struct{}
+	held chan struct{}
+	// slow is how long every OnLinkEvent takes.
+	slow time.Duration
 }
 
 func newFakeSessions() *fakeSessions { return &fakeSessions{running: map[string]string{}} }
 
 func (f *fakeSessions) OnLinkEvent(sessionID, turnID string, ev protocol.LinkEvent) {
 	f.mu.Lock()
+	hold, held, slow := f.hold, f.held, f.slow
+	f.mu.Unlock()
+	if hold != nil {
+		held <- struct{}{}
+		<-hold
+	}
+	time.Sleep(slow)
+	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.events = append(f.events, linkEvent{sessionID, turnID, ev.LinkEventType()})
+	f.log = append(f.log, "event")
 }
 
 func (f *fakeSessions) OnHostState(hs protocol.HostState) {
@@ -97,6 +116,34 @@ func (f *fakeSessions) OnConductorLost(ids []string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.lost = append(f.lost, slices.Sorted(slices.Values(ids)))
+	f.log = append(f.log, "lost")
+}
+
+func (f *fakeSessions) Barrier(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.barriers++
+	return nil
+}
+
+// holdEvents makes OnLinkEvent block until the returned release is called.
+func (f *fakeSessions) holdEvents() (held <-chan struct{}, release func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hold, f.held = make(chan struct{}), make(chan struct{}, 64)
+	hold := f.hold
+	return f.held, func() {
+		f.mu.Lock()
+		f.hold = nil
+		f.mu.Unlock()
+		close(hold)
+	}
+}
+
+func (f *fakeSessions) Log() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.log)
 }
 
 func (f *fakeSessions) RunningTurn(sessionID string) (string, bool) {
@@ -734,12 +781,253 @@ func TestMalformedFramesRejected(t *testing.T) {
 	c.sendRaw(`not json`)
 	// A Core -> conductor frame has no business coming the other way.
 	c.send(protocol.HostOpen{SessionID: "ses_A", Spec: spec("ses_A")})
-	eventually(t, "three malformed rejections", func() bool { return rejected(t, h, "malformed") == 3 })
+	// Frames are text; a binary one is malformed even if its bytes are JSON.
+	ctx, cancel := context.WithTimeout(bg, 2*time.Second)
+	defer cancel()
+	if err := c.ws.Write(ctx, websocket.MessageBinary, []byte(`{"type":"hello","conductor_version":"v","sdk_version":"s","cli_version":"c","max_hosts":4}`)); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "four malformed rejections", func() bool { return rejected(t, h, "malformed") == 4 })
 	// The link stays up and keeps working.
 	c.send(protocol.Hello{ConductorVersion: "v", SDKVersion: "s", CLIVersion: "c", MaxHosts: 4})
 	h.open(c, "ses_B")
-	if got := rejected(t, h, "malformed"); got != 3 {
+	if got := rejected(t, h, "malformed"); got != 4 {
 		t.Fatalf("hello was rejected: malformed = %v", got)
+	}
+	if !h.srv.Connected() {
+		t.Fatal("a malformed frame ended the link")
+	}
+}
+
+// A frame over the read limit ends the link (1009), and its sessions are lost.
+func TestOversizedFrameEndsTheLink(t *testing.T) {
+	if readLimit != 8<<20 {
+		t.Fatalf("readLimit = %d, want 8 MiB", readLimit)
+	}
+	h := newHarness(t)
+	c := h.connect(false)
+	h.open(c, "ses_A")
+	h.sess.setRunning("ses_A", "turn_1")
+	c.send(textDelta("ses_A", "turn_1", strings.Repeat("x", readLimit)))
+	c.expectClose(websocket.StatusMessageTooBig)
+	eventually(t, "the link's sessions are lost", func() bool { return len(h.sess.Lost()) == 1 })
+	if h.srv.Connected() || len(h.sess.Events()) != 0 {
+		t.Fatalf("connected %v, events %v after an oversized frame", h.srv.Connected(), h.sess.Events())
+	}
+}
+
+// S51: after Core's host.close, the session's next host.state is the old
+// host's. A reopen waits for its closed (consumed: it fails no turn and does
+// not remove the new host), at most 10 s, or until the link drops.
+func TestReopenWaitsForTheOldHostsClose(t *testing.T) {
+	if closingWait != 10*time.Second {
+		t.Fatalf("closingWait = %v, want 10s", closingWait)
+	}
+
+	t.Run("the old host's closed lets the reopen go", func(t *testing.T) {
+		h := newHarness(t)
+		c := h.connect(false)
+		h.open(c, "ses_A")
+		if err := h.srv.Close(bg, "ses_A", "error"); err != nil {
+			t.Fatal(err)
+		}
+		if f := c.next(); f != (protocol.HostClose{SessionID: "ses_A", Reason: "error"}) {
+			t.Fatalf("frame = %#v", f)
+		}
+		done := make(chan error, 1)
+		go func() { done <- h.srv.Open(bg, spec("ses_A")) }()
+		c.none() // no host.open while the old host is closing
+		// The old host reports in before it closes: dropped, not forwarded.
+		c.send(protocol.HostState{SessionID: "ses_A", State: "ready", SDKSessionID: "0d9c8b7a-6f5e-4d3c-9b2a-1f0e9d8c7b6a"})
+		c.none()
+		c.send(protocol.HostState{SessionID: "ses_A", State: "closed", Reason: "error"})
+		if f, ok := c.next().(protocol.HostOpen); !ok || f.SessionID != "ses_A" {
+			t.Fatalf("frame after the old close = %#v, want host.open", f)
+		}
+		if err := <-done; err != nil {
+			t.Fatalf("Open = %v", err)
+		}
+		if got := h.sess.States(); len(got) != 0 {
+			t.Fatalf("the old host's states reached the sessions: %v", got)
+		}
+		if got := h.srv.OpenHosts(); got != 1 {
+			t.Fatalf("OpenHosts = %d, want the new host tracked", got)
+		}
+		// The new host works, and its own close is forwarded.
+		h.sess.setRunning("ses_A", "turn_2")
+		c.send(textDelta("ses_A", "turn_2", "new host"))
+		c.send(protocol.HostState{SessionID: "ses_A", State: "closed", Reason: "idle"})
+		eventually(t, "the new host's close is forwarded", func() bool { return len(h.sess.States()) == 1 })
+		if got := h.sess.Events(); !reflect.DeepEqual(got, []linkEvent{{"ses_A", "turn_2", "text_delta"}}) {
+			t.Fatalf("events = %v", got)
+		}
+	})
+
+	t.Run("after 10 s the old host counts as closed", func(t *testing.T) {
+		clock := &fakeClock{}
+		h := newHarness(t, withClock(clock))
+		c := h.connect(false)
+		h.open(c, "ses_A")
+		if err := h.srv.Close(bg, "ses_A", "error"); err != nil {
+			t.Fatal(err)
+		}
+		c.next()
+		done := make(chan error, 1)
+		go func() { done <- h.srv.Open(bg, spec("ses_A")) }()
+		eventually(t, "the reopen waits", func() bool { return clock.pending() == 1 })
+		clock.advance(10*time.Second - time.Millisecond)
+		c.none()
+		clock.advance(time.Millisecond)
+		if f, ok := c.next().(protocol.HostOpen); !ok || f.SessionID != "ses_A" {
+			t.Fatalf("frame after 10 s = %#v, want host.open", f)
+		}
+		if err := <-done; err != nil {
+			t.Fatalf("Open = %v", err)
+		}
+		if got := h.srv.OpenHosts(); got != 1 {
+			t.Fatalf("OpenHosts = %d", got)
+		}
+	})
+
+	t.Run("a lost link ends the wait", func(t *testing.T) {
+		h := newHarness(t)
+		c := h.connect(false)
+		h.open(c, "ses_A")
+		if err := h.srv.Close(bg, "ses_A", "error"); err != nil {
+			t.Fatal(err)
+		}
+		c.next()
+		done := make(chan error, 1)
+		go func() { done <- h.srv.Open(bg, spec("ses_A")) }()
+		c.none()
+		_ = c.ws.Close(websocket.StatusGoingAway, "gone")
+		select {
+		case err := <-done:
+			if !errors.Is(err, ErrNotConnected) {
+				t.Fatalf("Open = %v, want ErrNotConnected", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Open kept waiting after the link dropped")
+		}
+	})
+}
+
+// The reader keeps reading while a slow actor holds the forwarder, so pongs
+// flow and the link stays up; the held frames are then forwarded in order.
+func TestSlowActorKeepsTheLinkAlive(t *testing.T) {
+	h := newHarness(t, withLiveness(20*time.Millisecond, 150*time.Millisecond))
+	c := h.connect(false)
+	h.open(c, "ses_A")
+	h.sess.setRunning("ses_A", "turn_1")
+	held, release := h.sess.holdEvents()
+	for i := range 5 {
+		c.send(textDelta("ses_A", "turn_1", fmt.Sprint(i)))
+	}
+	<-held
+	time.Sleep(600 * time.Millisecond) // four pong timeouts
+	if !h.srv.Connected() || len(h.sess.Lost()) != 0 {
+		t.Fatalf("a slow actor dropped the link: connected %v, lost %v", h.srv.Connected(), h.sess.Lost())
+	}
+	release()
+	eventually(t, "the held frames are forwarded, or the link lost", func() bool {
+		return len(h.sess.Events()) == 5 || len(h.sess.Lost()) > 0
+	})
+	if lost := h.sess.Lost(); len(lost) != 0 {
+		t.Fatalf("the link was lost while the actor was slow (%v); events %v", lost, h.sess.Events())
+	}
+	if len(h.sess.Events()) != 5 {
+		t.Fatalf("events = %v, want all five in order", h.sess.Events())
+	}
+}
+
+// A superseded link's frames reach the sessions before its OnConductorLost,
+// and none after it.
+func TestSupersededLinkForwardsNothingAfterTheLoss(t *testing.T) {
+	h := newHarness(t)
+	a := h.connect(false)
+	h.open(a, "ses_A")
+	h.sess.setRunning("ses_A", "turn_1")
+	// Each event takes 5 ms, so the link's end, once waiting, gets in between
+	// two of them and cuts the queue.
+	h.sess.mu.Lock()
+	h.sess.slow = 5 * time.Millisecond
+	h.sess.mu.Unlock()
+	held, release := h.sess.holdEvents()
+	for i := range 20 {
+		a.send(textDelta("ses_A", "turn_1", fmt.Sprint(i)))
+	}
+	<-held // the forwarder is inside OnLinkEvent with frames queued behind it
+	connected := make(chan struct{})
+	go func() {
+		h.connect(false)
+		close(connected)
+	}()
+	time.Sleep(50 * time.Millisecond) // the new link is waiting for the old one to end
+	release()
+	<-connected
+	eventually(t, "the old link is lost", func() bool { return len(h.sess.Lost()) == 1 })
+	time.Sleep(100 * time.Millisecond)
+	log := h.sess.Log()
+	if log[len(log)-1] != "lost" || slices.Index(log, "lost") != len(log)-1 {
+		t.Fatalf("log = %v: an old-link frame reached the sessions after its loss", log)
+	}
+	if n := len(log) - 1; n == 20 {
+		t.Fatalf("all 20 queued frames were forwarded; the loss did not cut the queue")
+	}
+}
+
+// Writes are bounded by their own timeout, not by the caller's context: a
+// caller that gives up must not close the conductor's link.
+func TestWritesIgnoreTheCallersCancellation(t *testing.T) {
+	if writeTimeout != 30*time.Second {
+		t.Fatalf("writeTimeout = %v, want 30s", writeTimeout)
+	}
+	h := newHarness(t)
+	c := h.connect(false)
+	h.open(c, "ses_A")
+	ctx, cancel := context.WithCancel(bg)
+	cancel()
+	ts := protocol.TurnSend{SessionID: "ses_A", TurnID: "turn_1", Content: []protocol.ContentBlock{{Type: "text", Text: "hi"}}}
+	if err := h.srv.SendTurn(ctx, ts); err != nil {
+		t.Fatalf("SendTurn with a cancelled context = %v", err)
+	}
+	if f := c.next(); !reflect.DeepEqual(f, ts) {
+		t.Fatalf("frame = %#v", f)
+	}
+	if !h.srv.Connected() {
+		t.Fatal("a cancelled caller closed the link")
+	}
+}
+
+// A host.open that cannot be encoded leaves no host behind.
+func TestOpenThatCannotBeSentLeavesNoHost(t *testing.T) {
+	h := newHarness(t)
+	c := h.connect(false)
+	bad := spec("ses_A")
+	bad.Resume = &protocol.Resume{SDKSessionID: "s", BaselineTotals: &protocol.Totals{CostUSD: math.NaN()}}
+	if err := h.srv.Open(bg, bad); err == nil {
+		t.Fatal("Open of an unencodable spec returned nil")
+	}
+	if got := h.srv.OpenHosts(); got != 0 {
+		t.Fatalf("OpenHosts = %d after a failed Open", got)
+	}
+	if got := metricValue(t, h.reg, "luma_open_hosts", nil); got != 0 {
+		t.Fatalf("luma_open_hosts = %v after a failed Open", got)
+	}
+	c.none()
+	h.open(c, "ses_B")
+}
+
+// Barrier passes through to the session service (maintenance, S52).
+func TestBarrierReachesTheSessions(t *testing.T) {
+	h := newHarness(t)
+	if err := h.srv.Barrier(bg); err != nil {
+		t.Fatal(err)
+	}
+	h.sess.mu.Lock()
+	defer h.sess.mu.Unlock()
+	if h.sess.barriers != 1 {
+		t.Fatalf("barriers = %d, want 1", h.sess.barriers)
 	}
 }
 
@@ -1108,8 +1396,12 @@ type stack struct {
 	mem *fakeMemory
 }
 
-func newStack(t *testing.T) *stack {
+func newStack(t *testing.T, att ...sessions.AttachmentResolver) *stack {
 	t.Helper()
+	var resolver sessions.AttachmentResolver = noAttachments{}
+	if len(att) > 0 {
+		resolver = att[0]
+	}
 	st := storetest.New(t)
 	cat, err := agents.LoadCatalog("../../../agents")
 	if err != nil {
@@ -1129,7 +1421,7 @@ func newStack(t *testing.T) *stack {
 	if err != nil {
 		t.Fatal(err)
 	}
-	late.Service = sessions.NewService(st, agents.NewLive(cat), srv, noProfile{}, noAttachments{}, mt,
+	late.Service = sessions.NewService(st, agents.NewLive(cat), srv, noProfile{}, resolver, mt,
 		sessions.NopLedger{}, m, time.Now, sessions.Config{})
 	mux := http.NewServeMux()
 	srv.Routes(mux)
@@ -1289,5 +1581,78 @@ func TestMaintenanceOverTheLink(t *testing.T) {
 	s.send(ses.ID, "back")
 	if f, ok := c.next().(protocol.HostOpen); !ok || f.SessionID != ses.ID {
 		t.Fatalf("frame after Off = %#v, want host.open", f)
+	}
+}
+
+// heldAttachments holds Bind until released: a send sits on its actor, past
+// the Gate, before its host.open.
+type heldAttachments struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (a *heldAttachments) Bind(context.Context, auth.Person, string, []string, string) ([]protocol.ContentBlock, error) {
+	close(a.entered)
+	<-a.release
+	return []protocol.ContentBlock{{Type: "text", Text: "an attached note"}}, nil
+}
+
+// S52: a send that passed the Gate just before maintenance closed it is
+// delivered before the drain looks at the running turns, so it is drained
+// (interrupted) instead of slipping past the shutdown.
+func TestMaintenanceWaitsForASendThatPassedTheGate(t *testing.T) {
+	att := &heldAttachments{entered: make(chan struct{}), release: make(chan struct{})}
+	s := newStack(t, att)
+	c := s.connect(false)
+	ses, err := s.svc.Create(bg, person, protocol.CreateSession{Agent: "luma"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.st.InsertAttachment(bg, store.Attachment{ID: "att_1", PersonID: person.ID, MediaType: "text/plain",
+		Filename: "note.txt", SizeBytes: 4, SHA256: strings.Repeat("0", 64), Data: []byte("note")}); err != nil {
+		t.Fatal(err)
+	}
+	sent := make(chan error, 1)
+	go func() {
+		msg := userMessage("read this")
+		msg.AttachmentIDs = []string{"att_1"}
+		_, err := s.svc.Send(bg, person, ses.ID, msg)
+		sent <- err
+	}()
+	<-att.entered // the send is past the Gate
+
+	done := make(chan maintenance.Status, 1)
+	go func() {
+		st, err := s.mt.On(bg, "upgrade", 0)
+		if err != nil {
+			t.Error(err)
+		}
+		done <- st
+	}()
+	eventually(t, "the gate closes", func() bool { return s.mt.CheckNewTurn(bg) != nil })
+	c.none() // On waits at the barrier: no shutdown ahead of the held send
+	close(att.release)
+
+	if f, ok := c.next().(protocol.HostOpen); !ok || f.SessionID != ses.ID {
+		t.Fatalf("frame = %#v, want the held send's host.open", f)
+	}
+	if f, ok := c.next().(protocol.TurnSend); !ok || f.SessionID != ses.ID {
+		t.Fatalf("frame = %#v, want its turn.send", f)
+	}
+	if err := <-sent; err != nil {
+		t.Fatalf("the held send = %v", err)
+	}
+	if f := c.next(); f != (protocol.TurnInterrupt{SessionID: ses.ID}) {
+		t.Fatalf("frame = %#v, want the drain's turn.interrupt", f)
+	}
+	c.send(protocol.HostState{SessionID: ses.ID, State: "closed", Reason: "maintenance"})
+	if f := c.next(); f != (protocol.Shutdown{Reason: "maintenance"}) {
+		t.Fatalf("frame = %#v, want shutdown{maintenance}", f)
+	}
+	if st := <-done; !st.Enabled || st.OpenHosts != 0 || st.RunningTurns != 0 {
+		t.Fatalf("status = %#v", st)
+	}
+	if got := s.errorCodes(ses.ID); !reflect.DeepEqual(got, []protocol.ErrorCode{protocol.CodeMaintenance}) {
+		t.Fatalf("error events = %v, want [maintenance]", got)
 	}
 }

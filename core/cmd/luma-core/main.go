@@ -65,23 +65,22 @@ func run(ctx context.Context, args []string, env func(string) string, stdout, st
 	return 2
 }
 
-// adminURL is the admin API on LUMA_ADMIN_LISTEN (default 127.0.0.1:8082).
-func adminURL(env func(string) string) string {
-	addr := env("LUMA_ADMIN_LISTEN")
-	if addr == "" {
-		addr = defaultAdminListen
+// adminAddr is LUMA_ADMIN_LISTEN, default 127.0.0.1:8082.
+func adminAddr(env func(string) string) string {
+	if addr := env("LUMA_ADMIN_LISTEN"); addr != "" {
+		return addr
 	}
-	return "http://" + addr + maintenance.AdminPath
+	return defaultAdminListen
 }
+
+// adminURL is the admin API at addr.
+func adminURL(addr string) string { return "http://" + addr + maintenance.AdminPath }
 
 func runMaintenance(ctx context.Context, args []string, env func(string) string, stdout io.Writer) error {
 	if len(args) == 0 {
 		return fmt.Errorf("%w: maintenance needs on, off or status", errUsage)
 	}
-	addr := env("LUMA_ADMIN_LISTEN")
-	if addr == "" {
-		addr = defaultAdminListen
-	}
+	addr := adminAddr(env)
 	if err := maintenance.CheckAdminAddr(addr); err != nil {
 		return fmt.Errorf("%w: LUMA_ADMIN_LISTEN: %w", errUsage, err)
 	}
@@ -123,7 +122,7 @@ func runMaintenance(ctx context.Context, args []string, env func(string) string,
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, method, adminURL(env), payload)
+	req, err := http.NewRequestWithContext(ctx, method, adminURL(addr), payload)
 	if err != nil {
 		return err
 	}

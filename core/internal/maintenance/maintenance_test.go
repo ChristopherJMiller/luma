@@ -78,8 +78,43 @@ type fakeFleet struct {
 	running        map[string]bool
 	hosts          int
 	endOnInterrupt bool
-	calls          []string        // "interrupt:<id>", "shutdown:<reason>"
+	calls          []string        // "barrier", "interrupt:<id>", "shutdown:<reason>"
 	at             []time.Duration // when, since start
+
+	// barrierHold, if set, holds Barrier until it is closed or ctx ends.
+	barrierHold chan struct{}
+	// hostsClose is how long after shutdown the hosts report closed; < 0 is
+	// never. Zero closes them at once.
+	hostsClose time.Duration
+}
+
+func (f *fakeFleet) Barrier(ctx context.Context) error {
+	f.mu.Lock()
+	f.calls = append(f.calls, "barrier")
+	f.at = append(f.at, time.Since(f.start))
+	hold := f.barrierHold
+	f.mu.Unlock()
+	if hold == nil {
+		return nil
+	}
+	select {
+	case <-hold:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// when is the time of the first call named c.
+func (f *fakeFleet) when(t *testing.T, c string) time.Duration {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	i := slices.Index(f.calls, c)
+	if i < 0 {
+		t.Fatalf("no %s call in %v", c, f.calls)
+	}
+	return f.at[i]
 }
 
 func newFleet(hosts int, running ...string) *fakeFleet {
@@ -123,7 +158,16 @@ func (f *fakeFleet) Shutdown(_ context.Context, reason string) error {
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, "shutdown:"+reason)
 	f.at = append(f.at, time.Since(f.start))
-	f.hosts = 0
+	switch d := f.hostsClose; {
+	case d == 0:
+		f.hosts = 0
+	case d > 0:
+		time.AfterFunc(d, func() {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			f.hosts = 0
+		})
+	}
 	return nil
 }
 
@@ -238,16 +282,17 @@ func TestMaintenanceDrainsThenShutsDown(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("On did not return")
 		}
-		calls, at := f.Calls()
-		if want := []string{"interrupt:ses_B", "shutdown:maintenance"}; !reflect.DeepEqual(calls, want) {
+		calls, _ := f.Calls()
+		if want := []string{"barrier", "interrupt:ses_B", "shutdown:maintenance"}; !reflect.DeepEqual(calls, want) {
 			t.Fatalf("calls = %v, want %v", calls, want)
 		}
-		if at[0] < 300*time.Millisecond {
-			t.Fatalf("interrupted at %v, before the 300ms drain timeout", at[0])
+		interrupted, shut := f.when(t, "interrupt:ses_B"), f.when(t, "shutdown:maintenance")
+		if interrupted < 300*time.Millisecond {
+			t.Fatalf("interrupted at %v, before the 300ms drain timeout", interrupted)
 		}
 		// ses_B ignores its interrupt, so shutdown waits out the grace.
-		if at[1]-at[0] < 150*time.Millisecond {
-			t.Fatalf("shut down %v after the interrupt, before the grace", at[1]-at[0])
+		if shut-interrupted < 150*time.Millisecond {
+			t.Fatalf("shut down %v after the interrupt, before the grace", shut-interrupted)
 		}
 		if !st.Enabled || st.Reason != "token rotation" || st.OpenHosts != 0 {
 			t.Fatalf("status = %#v", st)
@@ -261,12 +306,12 @@ func TestMaintenanceDrainsThenShutsDown(t *testing.T) {
 		if _, err := m.On(bg, "", 100*time.Millisecond); err != nil {
 			t.Fatal(err)
 		}
-		calls, at := f.Calls()
-		if want := []string{"interrupt:ses_A", "shutdown:maintenance"}; !reflect.DeepEqual(calls, want) {
+		calls, _ := f.Calls()
+		if want := []string{"barrier", "interrupt:ses_A", "shutdown:maintenance"}; !reflect.DeepEqual(calls, want) {
 			t.Fatalf("calls = %v, want %v", calls, want)
 		}
-		if at[1]-at[0] >= 150*time.Millisecond {
-			t.Fatalf("shutdown waited %v after the turn ended", at[1]-at[0])
+		if d := f.when(t, "shutdown:maintenance") - f.when(t, "interrupt:ses_A"); d >= 150*time.Millisecond {
+			t.Fatalf("shutdown waited %v after the turn ended", d)
 		}
 	})
 
@@ -280,12 +325,84 @@ func TestMaintenanceDrainsThenShutsDown(t *testing.T) {
 		if _, err := m.On(bg, "", 2*time.Second); err != nil {
 			t.Fatal(err)
 		}
-		calls, at := f.Calls()
-		if want := []string{"shutdown:maintenance"}; !reflect.DeepEqual(calls, want) {
+		calls, _ := f.Calls()
+		if want := []string{"barrier", "shutdown:maintenance"}; !reflect.DeepEqual(calls, want) {
 			t.Fatalf("calls = %v, want %v", calls, want)
 		}
-		if at[0] >= time.Second {
-			t.Fatalf("shut down at %v: the drain waited past the last turn", at[0])
+		if at := f.when(t, "shutdown:maintenance"); at >= time.Second {
+			t.Fatalf("shut down at %v: the drain waited past the last turn", at)
+		}
+	})
+
+	// S52: sends that passed the Gate before it closed finish first.
+	t.Run("the barrier runs after the gate closes and before anything else", func(t *testing.T) {
+		if barrierWait != 30*time.Second {
+			t.Fatalf("barrierWait = %v, want 30s", barrierWait)
+		}
+		f := newFleet(1, "ses_A")
+		f.endOnInterrupt = true
+		f.barrierHold = make(chan struct{})
+		m, _ := newTest(t, &fakeSettings{}, f)
+		done := make(chan Status, 1)
+		go func() {
+			s, _ := m.On(bg, "", 0)
+			done <- s
+		}()
+		eventually(t, "the barrier is reached", func() bool { calls, _ := f.Calls(); return len(calls) == 1 })
+		if m.CheckNewTurn(bg) == nil {
+			t.Fatal("the barrier ran before the gate closed")
+		}
+		time.Sleep(100 * time.Millisecond)
+		if calls, _ := f.Calls(); !reflect.DeepEqual(calls, []string{"barrier"}) {
+			t.Fatalf("calls while the barrier holds = %v", calls)
+		}
+		close(f.barrierHold)
+		<-done
+		if calls, _ := f.Calls(); !reflect.DeepEqual(calls, []string{"barrier", "interrupt:ses_A", "shutdown:maintenance"}) {
+			t.Fatalf("calls = %v", calls)
+		}
+	})
+
+	t.Run("a barrier that never returns is bounded", func(t *testing.T) {
+		f := newFleet(0)
+		f.barrierHold = make(chan struct{}) // never closed
+		m, _ := newTest(t, &fakeSettings{}, f)
+		m.barrierWait = 100 * time.Millisecond
+		if _, err := m.On(bg, "", 0); err != nil {
+			t.Fatal(err)
+		}
+		if at := f.when(t, "shutdown:maintenance"); at < 100*time.Millisecond {
+			t.Fatalf("shut down at %v, before the barrier's bound", at)
+		}
+	})
+
+	t.Run("On answers once the hosts have closed, waiting at most the grace", func(t *testing.T) {
+		f := newFleet(2)
+		f.hostsClose = 60 * time.Millisecond
+		m, _ := newTest(t, &fakeSettings{}, f)
+		s, err := m.On(bg, "", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.OpenHosts != 0 {
+			t.Fatalf("status = %#v, want the hosts closed", s)
+		}
+		if waited := time.Since(f.start) - f.when(t, "shutdown:maintenance"); waited < 60*time.Millisecond {
+			t.Fatalf("On answered %v after the shutdown, before the hosts closed", waited)
+		}
+
+		stuck := newFleet(2)
+		stuck.hostsClose = -1
+		m2, _ := newTest(t, &fakeSettings{}, stuck)
+		s, err = m2.On(bg, "", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.OpenHosts != 2 {
+			t.Fatalf("status = %#v, want the hosts that never closed", s)
+		}
+		if waited := time.Since(stuck.start) - stuck.when(t, "shutdown:maintenance"); waited < 150*time.Millisecond {
+			t.Fatalf("On answered %v after the shutdown, before the grace", waited)
 		}
 	})
 
@@ -309,8 +426,8 @@ func TestMaintenanceDrainsThenShutsDown(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("On kept draining after Off")
 		}
-		if calls, _ := f.Calls(); len(calls) != 0 {
-			t.Fatalf("calls after an aborted drain = %v", calls)
+		if calls, _ := f.Calls(); !reflect.DeepEqual(calls, []string{"barrier"}) {
+			t.Fatalf("calls after an aborted drain = %v, want only the barrier", calls)
 		}
 		if m.CheckNewTurn(bg) != nil {
 			t.Fatal("the gate is still closed after Off")
@@ -462,7 +579,7 @@ func TestAdminHandler(t *testing.T) {
 	if code != http.StatusOK || !s.Enabled || s.Reason != "upgrade" || s.RunningTurns != 0 || s.OpenHosts != 0 {
 		t.Fatalf("POST on = %d %#v", code, s)
 	}
-	if calls, _ := f.Calls(); !reflect.DeepEqual(calls, []string{"interrupt:ses_A", "shutdown:maintenance"}) {
+	if calls, _ := f.Calls(); !reflect.DeepEqual(calls, []string{"barrier", "interrupt:ses_A", "shutdown:maintenance"}) {
 		t.Fatalf("calls = %v", calls)
 	}
 	code, s = do(http.MethodPost, "application/json", `{"enabled":false}`)

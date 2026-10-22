@@ -368,6 +368,26 @@ func (s *Service) Taint(ctx context.Context, sessionID string) error {
 	})
 }
 
+// Barrier returns once every live actor has run the work queued before the
+// call: a no-op passes through each in turn, like DeleteTree's barrier.
+// Maintenance calls it after closing the Gate (S52): the Gate is checked on
+// the actor, so a send that passed it has delivered its turn (or failed) by
+// the time Barrier returns. ctx bounds the wait.
+func (s *Service) Barrier(ctx context.Context) error {
+	s.mu.Lock()
+	ids := make([]string, 0, len(s.actors))
+	for id := range s.actors {
+		ids = append(ids, id)
+	}
+	s.mu.Unlock()
+	for _, id := range ids {
+		if err := s.call(ctx, id, func(context.Context, *actor) error { return nil }); err != nil {
+			return fmt.Errorf("sessions: barrier at %s: %w", id, err)
+		}
+	}
+	return nil
+}
+
 // RunningTurn returns the session's running turn id. The link accepts events
 // and rpcs only for it.
 func (s *Service) RunningTurn(sessionID string) (turnID string, ok bool) {

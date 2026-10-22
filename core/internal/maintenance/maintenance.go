@@ -31,6 +31,9 @@ const (
 	interruptGrace = 10 * time.Second
 	// drainPoll is how often the drain looks at the running turns.
 	drainPoll = 250 * time.Millisecond
+	// barrierWait bounds the barrier through the session actors (S52), as
+	// DeleteTree bounds its own.
+	barrierWait = 30 * time.Second
 
 	settingKey = "maintenance"
 )
@@ -41,8 +44,11 @@ type Settings interface {
 	SetSetting(ctx context.Context, key string, value any) error
 }
 
-// Fleet is the conductor as maintenance drains it; *link.Server implements it.
+// Fleet is the conductor and its turns as maintenance drains them;
+// *link.Server implements it. Barrier returns once every session actor has
+// finished the work queued before it (sessions.Service.Barrier).
 type Fleet interface {
+	Barrier(ctx context.Context) error
 	RunningTurns() []string
 	OpenHosts() int
 	Interrupt(ctx context.Context, sessionID string) error
@@ -72,12 +78,13 @@ func (s Status) Line() string {
 
 // Maintenance is the switch. It is a sessions.Gate.
 type Maintenance struct {
-	st    Settings
-	fleet Fleet
-	m     *metrics.Core
-	clock func() time.Time
-	poll  time.Duration
-	grace time.Duration
+	st          Settings
+	fleet       Fleet
+	m           *metrics.Core
+	clock       func() time.Time
+	poll        time.Duration
+	grace       time.Duration
+	barrierWait time.Duration
 
 	enabled atomic.Bool // read by every Create and Send
 	mu      sync.Mutex  // guards state and orders its saves
@@ -88,7 +95,8 @@ type Maintenance struct {
 // New loads the saved state: a Core restarted in maintenance comes up in it.
 // A saved value that does not decode is an error.
 func New(ctx context.Context, st Settings, fleet Fleet, m *metrics.Core) (*Maintenance, error) {
-	mt := &Maintenance{st: st, fleet: fleet, m: m, clock: time.Now, poll: drainPoll, grace: interruptGrace}
+	mt := &Maintenance{st: st, fleet: fleet, m: m, clock: time.Now, poll: drainPoll, grace: interruptGrace,
+		barrierWait: barrierWait}
 	raw, err := st.Setting(ctx, settingKey)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
@@ -124,11 +132,14 @@ func (mt *Maintenance) Status() Status {
 		RunningTurns: len(mt.fleet.RunningTurns()), OpenHosts: mt.fleet.OpenHosts()}
 }
 
-// On refuses new work at once, saves the state, waits up to drain for the
-// running turns, interrupts the rest (giving them a short grace to finish),
-// then sends shutdown{reason:"maintenance"}. An Off during the drain stops
-// it. If the state cannot be saved, the gate stays closed and the error is
-// returned before any drain.
+// On refuses new work at once and saves the state. It then passes a barrier
+// through every session actor (≤ 30 s), so a send that passed the gate before
+// it closed has delivered its turn (S52); waits up to drain for the running
+// turns; interrupts the rest, giving them a grace to send their turn_result;
+// sends shutdown{reason:"maintenance"}; and answers once the open hosts are
+// gone, waiting at most the grace. An Off during the drain stops it. If the
+// state cannot be saved, the gate stays closed and the error is returned
+// before any drain.
 func (mt *Maintenance) On(ctx context.Context, reason string, drain time.Duration) (Status, error) {
 	if err := mt.set(ctx, true, reason); err != nil {
 		return mt.Status(), err
@@ -137,7 +148,14 @@ func (mt *Maintenance) On(ctx context.Context, reason string, drain time.Duratio
 	mt.drainMu.Lock()
 	defer mt.drainMu.Unlock()
 
-	if !mt.wait(ctx, drain) {
+	bctx, cancel := context.WithTimeout(ctx, mt.barrierWait)
+	err := mt.fleet.Barrier(bctx)
+	cancel()
+	if err != nil {
+		slog.Warn("maintenance: the barrier through the sessions did not finish; draining anyway", "err", err)
+	}
+	noTurns := func() bool { return len(mt.fleet.RunningTurns()) == 0 }
+	if !mt.wait(ctx, drain, noTurns) {
 		return mt.Status(), ctx.Err()
 	}
 	if !mt.enabled.Load() {
@@ -150,7 +168,7 @@ func (mt *Maintenance) On(ctx context.Context, reason string, drain time.Duratio
 				slog.Warn("maintenance: interrupt failed", "session", id, "err", err)
 			}
 		}
-		if !mt.wait(ctx, mt.grace) {
+		if !mt.wait(ctx, mt.grace, noTurns) {
 			return mt.Status(), ctx.Err()
 		}
 		if !mt.enabled.Load() {
@@ -161,6 +179,9 @@ func (mt *Maintenance) On(ctx context.Context, reason string, drain time.Duratio
 		return mt.Status(), fmt.Errorf("maintenance: shutdown: %w", err)
 	}
 	slog.Info("maintenance: conductor told to close every CLI")
+	if !mt.wait(ctx, mt.grace, func() bool { return mt.fleet.OpenHosts() == 0 }) {
+		return mt.Status(), ctx.Err()
+	}
 	return mt.Status(), nil
 }
 
@@ -205,11 +226,11 @@ func (mt *Maintenance) publish() {
 	mt.m.MaintenanceEnabled.Set(v)
 }
 
-// wait returns once no turn runs, maintenance is off, or d has passed. It
-// returns false only if ctx ended.
-func (mt *Maintenance) wait(ctx context.Context, d time.Duration) bool {
+// wait returns once done reports true, maintenance is off, or d has passed.
+// It returns false only if ctx ended.
+func (mt *Maintenance) wait(ctx context.Context, d time.Duration, done func() bool) bool {
 	deadline := mt.clock().Add(d)
-	for mt.enabled.Load() && len(mt.fleet.RunningTurns()) > 0 {
+	for mt.enabled.Load() && !done() {
 		left := deadline.Sub(mt.clock())
 		if left <= 0 {
 			return true

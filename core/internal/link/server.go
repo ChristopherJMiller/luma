@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"slices"
 	"sync"
@@ -35,6 +36,8 @@ const (
 	purgeTimeout = 30 * time.Second // the longest PurgeTree waits for tree.purged (S39)
 	writeTimeout = 30 * time.Second // one frame's write; a turn.send can carry ~27 MiB of base64
 	readLimit    = 8 << 20          // the largest frame Core reads (a turn_result with a long answer)
+	closingWait  = 10 * time.Second // the longest a reopen waits for the old host's closed (S51)
+	queueSize    = 1024             // frames the reader may run ahead of the forwarder
 
 	closeSuperseded websocket.StatusCode = 4000 // a newer authenticated link took over (P30)
 )
@@ -57,12 +60,14 @@ const (
 )
 
 // Sessions is the session service as the link drives it; *sessions.Service
-// implements it. OnLinkEvent is called in frame order from one goroutine.
+// implements it. OnLinkEvent and OnHostState are called in frame order from
+// one goroutine per link. Barrier is maintenance's (S52), passed through.
 type Sessions interface {
 	OnLinkEvent(sessionID, turnID string, ev protocol.LinkEvent)
 	OnHostState(hs protocol.HostState)
 	OnConductorLost(sessionIDs []string)
 	RunningTurn(sessionID string) (turnID string, ok bool)
+	Barrier(ctx context.Context) error
 }
 
 // RPCHandler serves one memory rpc of a session's running turn (MemoryRPC
@@ -86,10 +91,12 @@ type Server struct {
 	h Handlers
 
 	pingEvery, pongWait time.Duration
-	// newTimer starts a timer of the purge wait (tests inject a fake clock).
+	// newTimer starts a timer of the purge and closing waits (tests inject a
+	// fake clock).
 	newTimer func(d time.Duration) (<-chan time.Time, func() bool)
 	accepted atomic.Int64 // links taken over, for tests
 
+	// mu guards cur, every conn's maps, and the two link gauges.
 	mu  sync.Mutex
 	cur *conn // the current link; nil when none
 }
@@ -103,14 +110,20 @@ type conn struct {
 
 	lastPong atomic.Int64 // unix nanos of the last pong (or the accept)
 
+	// queue carries decoded frames from the reader to the forwarder, in
+	// order, so a slow actor never stops the reader (and the pongs).
+	queue chan protocol.LinkFrame
+
 	// fwd orders forwarding against the link's end: a frame forwarded before
-	// the end reaches the sessions before their OnConductorLost.
+	// the end reaches the sessions before their OnConductorLost, and none
+	// after it.
 	fwd   sync.Mutex
 	ended bool // guarded by fwd
 
 	// Guarded by Server.mu.
-	opened map[string]bool   // sessions whose host.open went out on this link, until host.state closed
-	purges map[string]*purge // tree.purge waits by root
+	opened  map[string]bool          // sessions whose host.open went out on this link, until host.state closed
+	closing map[string]chan struct{} // sessions Core sent host.close for; closed by the old host's closed (S51)
+	purges  map[string]*purge        // tree.purge waits by root
 }
 
 // purge is one tree.purge in flight; every concurrent PurgeTree of the root
@@ -183,18 +196,75 @@ func (s *Server) RunningTurns() []string {
 // ---- Core -> conductor (sessions.Conductor) ----
 
 // Open sends host.open; the session is open on this link from now until the
-// conductor reports its host closed.
+// conductor reports its host closed. If Core closed the session's previous
+// host (Close), Open first waits for that host's closed, at most closingWait,
+// or until the link ends (ErrNotConnected) (S51). A frame that cannot be
+// encoded or written leaves no host behind.
 func (s *Server) Open(ctx context.Context, spec protocol.HostSpec) error {
-	s.mu.Lock()
-	c := s.cur
-	if c == nil {
-		s.mu.Unlock()
-		return ErrNotConnected
+	id := spec.SessionID
+	b, err := protocol.EncodeLinkFrame(protocol.HostOpen{SessionID: id, Spec: spec})
+	if err != nil {
+		return err
 	}
-	c.opened[spec.SessionID] = true
-	s.h.Metrics.OpenHosts.Set(float64(len(c.opened)))
-	s.mu.Unlock()
-	return s.write(ctx, c, protocol.HostOpen{SessionID: spec.SessionID, Spec: spec})
+	var c *conn
+	for {
+		s.mu.Lock()
+		c = s.cur
+		if c == nil {
+			s.mu.Unlock()
+			return ErrNotConnected
+		}
+		old := c.closing[id]
+		if old == nil {
+			c.opened[id] = true
+			s.h.Metrics.OpenHosts.Set(float64(len(c.opened)))
+			s.mu.Unlock()
+			break
+		}
+		s.mu.Unlock()
+		if err := s.awaitClosed(ctx, c, id, old); err != nil {
+			return err
+		}
+	}
+	if err := s.writeBytes(ctx, c, "host.open", b); err != nil {
+		s.mu.Lock()
+		if c.opened[id] {
+			delete(c.opened, id)
+			if s.cur == c {
+				s.h.Metrics.OpenHosts.Set(float64(len(c.opened)))
+			}
+		}
+		s.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+// awaitClosed waits for the closed of a host Core closed. After closingWait
+// the old host counts as closed; a link that ends first is ErrNotConnected.
+func (s *Server) awaitClosed(ctx context.Context, c *conn, id string, old chan struct{}) error {
+	timeout, stop := s.newTimer(closingWait)
+	defer stop()
+	select {
+	case <-old:
+		return nil
+	case <-c.done:
+		return ErrNotConnected
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timeout:
+	}
+	slog.Warn("link: no closed from a host Core closed; reopening anyway", "session", id, "after", closingWait.String())
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if c.closing[id] == old {
+		delete(c.closing, id)
+		delete(c.opened, id)
+		if s.cur == c {
+			s.h.Metrics.OpenHosts.Set(float64(len(c.opened)))
+		}
+	}
+	return nil
 }
 
 // SendTurn sends turn.send.
@@ -208,9 +278,28 @@ func (s *Server) Interrupt(ctx context.Context, sessionID string) error {
 }
 
 // Close sends host.close with any C2 reason ("error" included, S48). The
-// session stays open on the link until the conductor's host.state closed.
+// host is then closing (S51): it stays open on the link until the
+// conductor's host.state closed, which the link consumes, and a reopen waits
+// for it.
 func (s *Server) Close(ctx context.Context, sessionID, reason string) error {
-	return s.send(ctx, protocol.HostClose{SessionID: sessionID, Reason: reason})
+	s.mu.Lock()
+	c := s.cur
+	if c == nil {
+		s.mu.Unlock()
+		return ErrNotConnected
+	}
+	if c.opened[sessionID] && c.closing[sessionID] == nil {
+		c.closing[sessionID] = make(chan struct{})
+	}
+	s.mu.Unlock()
+	return s.write(ctx, c, protocol.HostClose{SessionID: sessionID, Reason: reason})
+}
+
+// Barrier returns once every session actor has finished the work queued
+// before it (sessions.Service.Barrier): maintenance calls it after closing
+// the Gate, so a send that passed the Gate has delivered its turn (S52).
+func (s *Server) Barrier(ctx context.Context) error {
+	return s.h.Sessions.Barrier(ctx)
 }
 
 // Shutdown sends shutdown{reason}: the conductor closes every host. With no
@@ -290,10 +379,17 @@ func (s *Server) write(ctx context.Context, c *conn, f protocol.LinkFrame) error
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(ctx, writeTimeout)
+	return s.writeBytes(ctx, c, f.FrameType(), b)
+}
+
+// writeBytes writes one frame, bounded by writeTimeout only. The caller's
+// cancellation is not passed on: a write cancelled half way closes the
+// WebSocket, and one caller giving up must not end the conductor's link.
+func (s *Server) writeBytes(ctx context.Context, c *conn, typ string, b []byte) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), writeTimeout)
 	defer cancel()
 	if err := c.ws.Write(ctx, websocket.MessageText, b); err != nil {
-		return fmt.Errorf("link: write %s: %w", f.FrameType(), err)
+		return fmt.Errorf("link: write %s: %w", typ, err)
 	}
 	return nil
 }
@@ -316,13 +412,15 @@ func (s *Server) serveLink(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(context.WithoutCancel(r.Context()))
 	c := &conn{
 		ws: ws, ctx: ctx, cancel: cancel, done: make(chan struct{}),
-		opened: map[string]bool{}, purges: map[string]*purge{},
+		queue:  make(chan protocol.LinkFrame, queueSize),
+		opened: map[string]bool{}, closing: map[string]chan struct{}{}, purges: map[string]*purge{},
 	}
 	c.lastPong.Store(time.Now().UnixNano())
 	s.takeOver(c)
 	slog.Info("link: conductor connected", "pod", id.PodName)
 
 	go s.keepAlive(c)
+	go s.forward(c)
 	err = s.readLoop(c)
 	slog.Info("link: conductor link ended", "pod", id.PodName, "close_status", int(websocket.CloseStatus(err)))
 	s.end(c, websocket.StatusNormalClosure, "")
@@ -336,6 +434,8 @@ func (s *Server) takeOver(c *conn) {
 		old := s.cur
 		if old == nil {
 			s.cur = c
+			s.h.Metrics.ConductorConnected.Set(1)
+			s.h.Metrics.OpenHosts.Set(0)
 			s.mu.Unlock()
 			break
 		}
@@ -344,8 +444,6 @@ func (s *Server) takeOver(c *conn) {
 		s.end(old, closeSuperseded, "superseded")
 	}
 	s.accepted.Add(1)
-	s.h.Metrics.ConductorConnected.Set(1)
-	s.h.Metrics.OpenHosts.Set(0)
 }
 
 // end finishes a link once: it stops forwarding, releases its purges, closes
@@ -358,23 +456,21 @@ func (s *Server) end(c *conn, code websocket.StatusCode, reason string) {
 	}
 	c.ended = true
 	s.mu.Lock()
-	current := s.cur == c
-	if current {
+	if s.cur == c {
 		s.cur = nil
+		s.h.Metrics.ConductorConnected.Set(0)
+		s.h.Metrics.OpenHosts.Set(0)
 	}
 	lost := make([]string, 0, len(c.opened))
 	for id := range c.opened {
 		lost = append(lost, id)
 	}
 	clear(c.opened)
+	clear(c.closing) // their reopens wait on c.done too
 	s.mu.Unlock()
 	c.fwd.Unlock()
 
 	close(c.done)
-	if current {
-		s.h.Metrics.ConductorConnected.Set(0)
-		s.h.Metrics.OpenHosts.Set(0)
-	}
 	go func() {
 		_ = c.ws.Close(code, reason)
 		c.cancel()
@@ -410,7 +506,9 @@ func (s *Server) keepAlive(c *conn) {
 	}
 }
 
-// readLoop reads and dispatches frames, one at a time, until the link ends.
+// readLoop reads and decodes frames until the link ends, and queues them for
+// the forwarder. It blocks only when the forwarder is queueSize frames
+// behind, so pongs keep being read while an actor is slow.
 func (s *Server) readLoop(c *conn) error {
 	for {
 		typ, b, err := c.ws.Read(c.ctx)
@@ -426,7 +524,29 @@ func (s *Server) readLoop(c *conn) error {
 			s.reject(rejectMalformed, "undecodable frame", "err", err)
 			continue
 		}
-		s.dispatch(c, f)
+		select {
+		case c.queue <- f:
+		case <-c.done:
+			return net.ErrClosed
+		}
+	}
+}
+
+// forward dispatches the link's frames in the order they were read, until
+// the link ends; frames still queued then are dropped.
+func (s *Server) forward(c *conn) {
+	for {
+		select {
+		case <-c.done:
+			return
+		default:
+		}
+		select {
+		case f := <-c.queue:
+			s.dispatch(c, f)
+		case <-c.done:
+			return
+		}
 	}
 }
 
@@ -441,18 +561,9 @@ func (s *Server) dispatch(c *conn, f protocol.LinkFrame) {
 		slog.Info("link: hello", "conductor_version", f.ConductorVersion, "sdk_version", f.SDKVersion,
 			"cli_version", f.CLIVersion, "max_hosts", f.MaxHosts)
 	case protocol.HostState:
-		s.mu.Lock()
-		open := c.opened[f.SessionID]
-		if open && f.State == "closed" {
-			delete(c.opened, f.SessionID)
-			s.h.Metrics.OpenHosts.Set(float64(len(c.opened)))
+		if s.hostState(c, f) {
+			s.h.Sessions.OnHostState(f)
 		}
-		s.mu.Unlock()
-		if !open {
-			s.reject(rejectUnopened, "host.state", "session", f.SessionID)
-			return
-		}
-		s.h.Sessions.OnHostState(f)
 	case protocol.EventFrame:
 		if s.bound(c, "event", f.SessionID, f.TurnID) {
 			s.h.Sessions.OnLinkEvent(f.SessionID, f.TurnID, f.Event)
@@ -477,6 +588,38 @@ func (s *Server) dispatch(c *conn, f protocol.LinkFrame) {
 	default:
 		s.reject(rejectMalformed, "frame sent the wrong way", "frame", f.FrameType())
 	}
+}
+
+// hostState updates the link's view of a session's host and reports whether
+// the frame goes on to the sessions. A host.state for a session not open on
+// this link is rejected. While Core's host.close is outstanding (S51) the
+// frame is the old host's: its closed ends the old host and releases a
+// waiting reopen, and neither it nor a ready reaches the sessions, so it
+// cannot fail a newer turn or drop a newer host.
+func (s *Server) hostState(c *conn, f protocol.HostState) bool {
+	s.mu.Lock()
+	open := c.opened[f.SessionID]
+	old, closing := c.closing[f.SessionID]
+	switch {
+	case !open:
+	case closing && f.State == "closed":
+		delete(c.closing, f.SessionID)
+		close(old)
+		fallthrough
+	case !closing && f.State == "closed":
+		delete(c.opened, f.SessionID)
+		s.h.Metrics.OpenHosts.Set(float64(len(c.opened)))
+	}
+	s.mu.Unlock()
+	switch {
+	case !open:
+		s.reject(rejectUnopened, "host.state", "session", f.SessionID)
+		return false
+	case closing:
+		slog.Debug("link: host.state of a host Core closed", "session", f.SessionID, "state", f.State, "reason", f.Reason)
+		return false
+	}
+	return true
 }
 
 // bound reports whether an event or rpc belongs to a session opened on this

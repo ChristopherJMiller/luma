@@ -359,13 +359,13 @@ Frames are JSON `{type, ...}`. Hand-written fixtures for every type live in `pro
 - `rpc{rpc_id, session_id, turn_id, method:"memory.remember"|"memory.forget", params:{text, untrusted}}`. A set `untrusted` taints the session through its actor, `sessions.Service.Taint`, the one taint writer (S47; Task 13 calls it)
 - `tree.purged{root_id}`: the ack of `tree.purge`, sent once `pool.purgeTree` has closed the tree's hosts, let their `SessionStore` appends settle and removed the dirs (also after a purge that failed, which is logged). Added by Task 10 to the Go and TS protocol packages with fixture `protocol/fixtures/link/tree-purged.json`; additive, so compatible (S37, S39)
 
-Core accepts `event` and `rpc` only for a session opened **on this link**, and only with the session's **running** `turn_id`. Anything else is dropped and counted in `luma_link_rejected_total{reason}`: `unopened` (also a `host.state` for a session Core did not open on this link), `stale_turn`, or `malformed` (an undecodable frame, or a Core → conductor frame sent the wrong way). A dropped `rpc` is still answered, `rpc.result{ok:false, error: upstream_error}`, so its tool call ends (Task 10). A session is open on a link from Core's `host.open` until the conductor's `host.state{closed}`. The link is pinged every 10 s and lost after 30 s without a pong; a newer authenticated link closes the old one with 4000 `superseded` (P30).
+Core accepts `event` and `rpc` only for a session opened **on this link**, and only with the session's **running** `turn_id`. Anything else is dropped and counted in `luma_link_rejected_total{reason}`: `unopened` (also a `host.state` for a session Core did not open on this link), `stale_turn`, or `malformed` (an undecodable frame, or a Core → conductor frame sent the wrong way). A dropped `rpc` is still answered, `rpc.result{ok:false, error: upstream_error}`, so its tool call ends (Task 10). A session's host is open on a link from Core's `host.open` until the conductor's `host.state{closed}`. **After Core sends `host.close`, the host is `closing` (S51):** the conductor's next `host.state` for that session belongs to the old host, so a `ready` is dropped and the `closed` is consumed by the link (it fails no turn and removes no newer host); a `host.open` for the session waits for that `closed`, at most **10 s** (then the old host counts as closed) or until the link drops. The link is pinged every 10 s and lost after 30 s without a pong; a newer authenticated link closes the old one with 4000 `superseded` (P30). Frames are read by one goroutine and handed to the session service, in order, by one per-link forwarder, so a slow actor never stops the pongs.
 
 **Turn lifecycle (S45).** A turn starts with `turn.send` and runs until exactly one of:
 - **`turn_result`**, the terminal frame of every turn that reached an SDK result, failed ones included: every API failure surfaces as a `success` result with `is_error: true` that carries real usage (Spike S11). Core completes the assistant message (its `sdk_uuid` is the fork point), writes `last_totals`, ledgers the usage and sets the session idle;
-- **`host.state{closed}`** under the turn, or **link loss**: no result will come. Core fails the turn (`capacity`, `maintenance`, `conductor_restarted` or `upstream_error` by reason) and nothing is ledgered.
+- **`host.state{closed}`** under the turn, or **link loss**: no result will come. Core fails the turn (`capacity`, `maintenance`, `conductor_restarted` or `upstream_error` by reason) and nothing is ledgered. The one exception is the idle-eviction race, below.
 
-**The idle-eviction race (Task 10).** A `turn.send` can go out on a host the conductor is closing as idle. So `host.state{closed, reason:"idle"|"evicted"}` under a turn that has had no `message_started` and no `error` does not fail it: Core reopens the host (with resume) and resends the same `turn.send`, **once**; a second such close fails the turn. The conductor therefore **drops a `turn.send` for a session with no open host** (and logs it), and never answers it with a `host.state` (Tasks 19b/19c).
+**The idle-eviction race (Task 10).** A `turn.send` can go out on a host the conductor is closing as idle. The conductor closes a host as `idle` or `evicted` **only if it has not accepted a `turn.send`** for it (19b's `send()` flips the host to `running` synchronously), so such a close under a turn that has had no `message_started` and no `error` means the CLI never saw the turn. Core does not fail it: it reopens the host (with resume) and resends the same `turn.send`, **once**; a second such close fails the turn. The conductor therefore **drops a `turn.send` for a session with no open host** (and logs it), and never answers it with a `host.state` (Tasks 19b/19c).
 
 A link `error` **does not end the turn**. It marks the turn's assistant message `error` with its `code` (storing the message if `message_started` never came) and emits the client `error{code, retryable}`; the turn still ends on its `turn_result`, which keeps the message's `error` status. Only the turn's first error reaches the client. So the conductor sends `error`, then `turn_result`, for a failed result, and never `turn_result` before `error`.
 
@@ -373,7 +373,7 @@ A link `error` **does not end the turn**. It marks the turn's assistant message 
 - **after a link `error`**, no `turn_result` within **120 s** → Core sends `host.close{reason:"error"}` and fails the turn (`upstream_error` unless the turn already reported an error, whose code the message keeps);
 - **a wall-clock cap** of `LUMA_TURN_MAX_MINUTES` (default **15**, C6) from `turn.send` → `turn.interrupt`; no `turn_result` within **30 s** of it → `host.close{reason:"error"}` and the turn fails as `upstream_error`.
 
-A `turn_result` that arrives in time ends the turn normally and cancels both. After a `host.close{reason:"error"}` the next send reopens the host with resume.
+A `turn_result` that arrives in time ends the turn normally and cancels both. After a `host.close{reason:"error"}` the next send reopens the host with resume, once the old host's `closed` has arrived (or 10 s have passed; S51, above).
 
 **LinkEvent** (the turn is implied by the envelope):
 - `message_started{model}`: the first main-loop assistant stream of the turn
@@ -1382,8 +1382,9 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
 - **Maintenance rules:**
   - **On:**
     1. refuse `Create`/`Send` with `maintenance`;
-    2. wait up to the drain timeout for running turns, then interrupt them;
-    3. send `shutdown{reason:"maintenance"}`.
+    2. pass a barrier through every live session actor (≤ 30 s, like `DeleteTree`'s), so a send that passed the Gate before it closed has delivered its turn (S52);
+    3. wait up to the drain timeout for running turns, then interrupt them and give them a **10 s** grace to send their `turn_result`;
+    4. send `shutdown{reason:"maintenance"}`, then wait (≤ 10 s) for the open hosts to reach 0 before answering.
 
     `status` prints `enabled=<bool> running_turns=<n> open_hosts=<n>`.
   - **Off** clears the flag. Hosts reopen lazily.

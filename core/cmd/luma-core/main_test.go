@@ -66,6 +66,13 @@ func (f *fleet) OpenHosts() int {
 	return f.hosts
 }
 
+func (f *fleet) Barrier(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "barrier")
+	return nil
+}
+
 func (f *fleet) Interrupt(_ context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -143,7 +150,7 @@ func TestMaintenanceCommands(t *testing.T) {
 	f.mu.Lock()
 	calls := slices.Clone(f.calls)
 	f.mu.Unlock()
-	if !slices.Equal(calls, []string{"interrupt:ses_A", "shutdown:maintenance"}) {
+	if !slices.Equal(calls, []string{"barrier", "interrupt:ses_A", "shutdown:maintenance"}) {
 		t.Fatalf("calls = %v", calls)
 	}
 	if code, out, _ := runCmd(env, "maintenance", "status"); code != 0 || out != "enabled=true running_turns=0 open_hosts=0\n" {
@@ -188,7 +195,7 @@ func TestMaintenanceAdminAddress(t *testing.T) {
 	if code, out, errOut := runCmd(gone, "maintenance", "status"); code != 1 || out != "" || errOut == "" {
 		t.Fatalf("exit %d, stdout %q, stderr %q", code, out, errOut)
 	}
-	if got := adminURL(noEnv); got != "http://127.0.0.1:8082/maintenance" {
+	if got := adminURL(adminAddr(noEnv)); got != "http://127.0.0.1:8082/maintenance" {
 		t.Fatalf("default admin URL = %q", got)
 	}
 }
