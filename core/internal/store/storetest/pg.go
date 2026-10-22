@@ -25,6 +25,9 @@ const (
 	ConductorRole = "luma_conductor"
 	// Database is the database New creates and migrates.
 	Database = "luma"
+	// CoreRole is the non-superuser database owner the store runs as, like
+	// Core in production.
+	CoreRole = "luma_core"
 )
 
 // New starts a Postgres (initdb into t.TempDir(), a unix socket, a random
@@ -68,14 +71,14 @@ func New(t testing.TB) *store.Store {
 	if err != nil {
 		t.Fatalf("storetest: connect: %v", err)
 	}
-	for _, q := range []string{`create database ` + Database, `create role ` + ConductorRole + ` login`} {
+	for _, q := range []string{`create role ` + CoreRole + ` login`, `create database ` + Database + ` owner ` + CoreRole, `create role ` + ConductorRole + ` login`} {
 		if _, err := admin.Exec(ctx, q); err != nil {
 			t.Fatalf("storetest: %s: %v", q, err)
 		}
 	}
 	_ = admin.Close(ctx)
 
-	cfg := store.PGConfig{Host: sock, Port: port, Database: Database, User: Superuser, SSLMode: "disable"}
+	cfg := store.PGConfig{Host: sock, Port: port, Database: Database, User: CoreRole, SSLMode: "disable"}
 	octx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	s, err := store.Open(octx, cfg)

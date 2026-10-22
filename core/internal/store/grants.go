@@ -29,7 +29,8 @@ func (s *Store) GrantConductor(ctx context.Context, role string) error {
 		return fmt.Errorf("store: sdk_transcript_entries.seq has no sequence")
 	}
 	stmts := []string{
-		fmt.Sprintf(`revoke connect on database %s from public`, d),
+		// All of it, not just CONNECT: PUBLIC also holds TEMP on a new database.
+		fmt.Sprintf(`revoke all on database %s from public`, d),
 		`revoke all on schema public from public`,
 		fmt.Sprintf(`grant connect on database %s to %s`, d, r),
 		fmt.Sprintf(`grant usage on schema public to %s`, r),
@@ -37,10 +38,34 @@ func (s *Store) GrantConductor(ctx context.Context, role string) error {
 		fmt.Sprintf(`grant usage on sequence %s to %s`, *seq, r),
 	}
 	return s.inTx(ctx, func(tx pgx.Tx) error {
+		// Two Core pods in a rolling update both run this at startup.
+		if _, err := tx.Exec(ctx, `select pg_advisory_xact_lock(hashtextextended('luma-grant-conductor', 0))`); err != nil {
+			return err
+		}
 		for _, q := range stmts {
 			if _, err := tx.Exec(ctx, q); err != nil {
 				return fmt.Errorf("store: grant conductor: %w", err)
 			}
+		}
+		// REVOKE and GRANT only WARN when the caller does not own the object,
+		// so read the result back instead of trusting the statements.
+		var ok bool
+		err := tx.QueryRow(ctx, `select
+			has_database_privilege($1, $2, 'CONNECT')
+			and has_schema_privilege($1, 'public', 'USAGE')
+			and has_table_privilege($1, 'sdk_transcript_entries', 'SELECT, INSERT, DELETE')
+			and has_sequence_privilege($1, $3, 'USAGE')
+			and not has_table_privilege($1, 'sdk_transcript_entries', 'UPDATE')
+			and not exists (select 1 from pg_database d, aclexplode(d.datacl) a
+				where d.datname = $2 and a.grantee = 0)
+			and not exists (select 1 from pg_namespace n, aclexplode(n.nspacl) a
+				where n.nspname = 'public' and a.grantee = 0)`,
+			role, db, *seq).Scan(&ok)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("store: grant conductor: privileges not as intended after granting (is the caller the database owner?)")
 		}
 		return nil
 	})

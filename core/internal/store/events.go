@@ -22,30 +22,46 @@ import (
 //
 // Relaxed runs SET LOCAL synchronous_commit = off (P24) for delta-only events.
 func (s *Store) AppendEvent(ctx context.Context, sessionID, typ string, payload any, d Durability) (int64, error) {
+	return s.appendEvent(ctx, s.pool, sessionID, typ, payload, d)
+}
+
+// txBeginner is a pool or a single connection.
+type txBeginner interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
+}
+
+func (s *Store) appendEvent(ctx context.Context, db txBeginner, sessionID, typ string, payload any, d Durability) (int64, error) {
+	if body, ok := payload.(protocol.EventBody); ok && body.EventType() != typ {
+		return 0, fmt.Errorf("store: event type %q does not match its body's %q", typ, body.EventType())
+	}
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return 0, fmt.Errorf("store: event payload: %w", err)
 	}
+	mode := "on"
+	if d == Relaxed {
+		mode = "off"
+	}
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `set local synchronous_commit = `+mode); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(ctx, `select pg_advisory_xact_lock(hashtextextended($1, 0))`, sessionID); err != nil {
+		return 0, err
+	}
 	var id int64
-	err = s.inTx(ctx, func(tx pgx.Tx) error {
-		if d == Relaxed {
-			if _, err := tx.Exec(ctx, `set local synchronous_commit = off`); err != nil {
-				return err
-			}
-		}
-		if _, err := tx.Exec(ctx, `select pg_advisory_xact_lock(hashtextextended($1, 0))`, sessionID); err != nil {
-			return err
-		}
-		if err := tx.QueryRow(ctx, `insert into events (session_id, type, payload) values ($1, $2, $3) returning id`,
-			sessionID, typ, b).Scan(&id); err != nil {
-			return err
-		}
-		if s.appendHook != nil {
-			s.appendHook(ctx, tx)
-		}
-		return nil
-	})
-	return id, err
+	if err := tx.QueryRow(ctx, `insert into events (session_id, type, payload) values ($1, $2, $3) returning id`,
+		sessionID, typ, b).Scan(&id); err != nil {
+		return 0, err
+	}
+	if s.appendHook != nil {
+		s.appendHook(ctx, tx)
+	}
+	return id, tx.Commit(ctx)
 }
 
 // EventsSince returns up to limit events of a session with id > since, oldest

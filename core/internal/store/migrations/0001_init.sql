@@ -55,6 +55,7 @@ create table sessions (
 );
 create index sessions_roots_idx on sessions (person_id, archived_at, updated_at desc) where id = root_id;
 create index sessions_root_idx on sessions (root_id);
+create index sessions_parent_idx on sessions (parent_id);
 create index sessions_status_idx on sessions (status);
 
 -- parent_message_id has no foreign key, for the same reason as fork_at_message_id.

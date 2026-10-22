@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -48,7 +49,7 @@ func (s *Store) Attachment(ctx context.Context, id string) (Attachment, error) {
 
 // BindAttachments binds a person's unbound attachments to a tree. It returns
 // ErrNotFound (and binds nothing) if any id is missing, not the person's, or
-// already bound to another tree.
+// already bound to another tree. Duplicate ids count once.
 func (s *Store) BindAttachments(ctx context.Context, personID, rootID string, ids []string) error {
 	return s.inTx(ctx, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `update attachments set root_id = $3
@@ -56,7 +57,7 @@ func (s *Store) BindAttachments(ctx context.Context, personID, rootID string, id
 		if err != nil {
 			return err
 		}
-		if tag.RowsAffected() != int64(len(ids)) {
+		if tag.RowsAffected() != int64(len(slices.Compact(slices.Sorted(slices.Values(ids))))) {
 			return ErrNotFound
 		}
 		return nil

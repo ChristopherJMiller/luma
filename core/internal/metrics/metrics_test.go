@@ -3,6 +3,7 @@ package metrics_test
 import (
 	"reflect"
 	"sort"
+	"strconv"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -60,7 +61,7 @@ func TestEveryC7CoreMetricRegistered(t *testing.T) {
 		}
 		vals := make([]string, len(m.labels))
 		for i := range vals {
-			vals[i] = "x"
+			vals[i] = "v" + strconv.Itoa(i) // a distinct value per position
 		}
 		switch c := f.Interface().(type) {
 		case *prometheus.CounterVec:
@@ -86,16 +87,26 @@ func TestEveryC7CoreMetricRegistered(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := map[string][]string{}
+	byLabel := map[string]string{} // metric/label -> the value it was given
 	for _, mf := range mfs {
 		var labels []string
 		for _, l := range mf.GetMetric()[0].GetLabel() {
 			labels = append(labels, l.GetName())
+			byLabel[mf.GetName()+"/"+l.GetName()] = l.GetValue()
 		}
 		got[mf.GetName()] = labels
 	}
 	want := map[string][]string{}
 	for _, m := range c7Core {
 		want[m.name] = m.labels
+	}
+	// Label order: the value given at position i must land on C7's i-th label.
+	for _, m := range c7Core {
+		for i, l := range m.labels {
+			if v := byLabel[m.name+"/"+l]; v != "v"+strconv.Itoa(i) {
+				t.Errorf("%s: label %s is at the wrong position (got value %q, want v%d)", m.name, l, v, i)
+			}
+		}
 	}
 	var names []string
 	for n := range got {
