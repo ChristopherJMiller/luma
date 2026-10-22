@@ -169,9 +169,19 @@ func TestWatchRegistryKeepsOldOnBadFile(t *testing.T) {
 		t.Fatal("the initial reload lost p1")
 	}
 
+	// The same debounce split (below) can also reload before the rename, and
+	// read the previous, good file again: skip good reloads that still hold
+	// p1 until the bad file's failure arrives.
 	writeFile(t, path, "people: {p1: {display_name: One, tier: wizard}}\n")
-	if r := next(); r.err == nil || r.reg != nil {
-		t.Fatalf("a bad file reloaded as %+v, %v; want an error and no registry", r.reg, r.err)
+	bad := next()
+	for bad.err == nil {
+		if _, ok := bad.reg.Lookup("google", "a@example.com"); !ok {
+			t.Fatalf("a reload during the bad write delivered something new: %+v", bad.reg)
+		}
+		bad = next()
+	}
+	if bad.reg != nil {
+		t.Fatalf("a bad file reloaded as %+v, %v; want an error and no registry", bad.reg, bad.err)
 	}
 
 	// One write can debounce into two reloads on a slow runner (the tmp-file
