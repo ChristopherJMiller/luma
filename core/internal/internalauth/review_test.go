@@ -53,6 +53,7 @@ func newFakeKube(t *testing.T) *fakeKube {
 		if !ok {
 			status = map[string]any{"authenticated": false, "error": "invalid"}
 		}
+		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"apiVersion": "authentication.k8s.io/v1", "kind": "TokenReview", "status": status,
 		})

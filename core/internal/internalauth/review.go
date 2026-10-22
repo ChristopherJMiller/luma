@@ -54,7 +54,13 @@ type KubeReviewer struct {
 	audience     string
 	ownTokenFile string
 	client       *http.Client
+	cfgErr       error // fixed-text configuration failure; every review fails closed
 }
+
+// Err reports a configuration failure found at construction (unusable CA,
+// non-https API server). The constructor's signature is frozen, so the
+// serve task treats a non-nil Err as a startup error.
+func (k *KubeReviewer) Err() error { return k.cfgErr }
 
 // NewKubeReviewer builds a reviewer. apiServer is a base URL such as
 // https://10.96.0.1:443 (see APIServerFromEnv); caFile is the cluster CA
@@ -63,16 +69,24 @@ type KubeReviewer struct {
 // must carry.
 func NewKubeReviewer(apiServer, caFile, ownTokenFile, audience string) *KubeReviewer {
 	pool := x509.NewCertPool()
-	if pem, err := os.ReadFile(caFile); err == nil { //nolint:gosec // G304: operator-mounted CA path
-		pool.AppendCertsFromPEM(pem)
+	var cfgErr error
+	if pem, err := os.ReadFile(caFile); err != nil { //nolint:gosec // G304: operator-mounted CA path
+		cfgErr = errors.New("ca file unreadable")
+	} else if !pool.AppendCertsFromPEM(pem) {
+		cfgErr = errors.New("ca file has no usable certificate")
 	}
-	// An unreadable CA leaves an empty pool: every review fails closed.
+	if !strings.HasPrefix(apiServer, "https://") {
+		cfgErr = errors.New("apiserver url is not https")
+	}
 	return &KubeReviewer{
+		cfgErr:       cfgErr,
 		apiServer:    strings.TrimRight(apiServer, "/"),
 		audience:     audience,
 		ownTokenFile: ownTokenFile,
 		client: &http.Client{
 			Timeout: 5 * time.Second,
+			// A redirect would resend our bearer to wherever it points.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 			Transport: &http.Transport{
 				TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
 			},
@@ -116,6 +130,9 @@ type reviewResponse struct {
 
 // Review implements Reviewer.
 func (k *KubeReviewer) Review(ctx context.Context, token string) (Identity, error) {
+	if k.cfgErr != nil {
+		return Identity{}, fmt.Errorf("%w: %s", ErrReviewUnavailable, k.cfgErr.Error())
+	}
 	own, err := os.ReadFile(k.ownTokenFile) //nolint:gosec // G304: operator-mounted token path
 	if err != nil || len(bytes.TrimSpace(own)) == 0 {
 		return Identity{}, fmt.Errorf("%w: own token unreadable", ErrReviewUnavailable)

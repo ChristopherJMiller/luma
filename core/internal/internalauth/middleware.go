@@ -16,6 +16,39 @@ import (
 // maxCacheTTL bounds how long a positive review is trusted.
 const maxCacheTTL = 60 * time.Second
 
+const (
+	// maxTokenBytes: projected tokens are ~1-2 KiB; anything bigger is junk.
+	maxTokenBytes = 8 << 10
+	// maxConcurrentReviews bounds TokenReviews in flight so a flood of
+	// distinct garbage bearers cannot starve Core's own apiserver quota.
+	maxConcurrentReviews = 8
+)
+
+// jwtShaped reports whether tok is three non-empty base64url segments.
+// A cheap gate in front of the apiserver; the apiserver does the real check.
+func jwtShaped(tok string) bool {
+	if len(tok) > maxTokenBytes {
+		return false
+	}
+	segs, n := 0, 0
+	for i := 0; i <= len(tok); i++ {
+		if i == len(tok) || tok[i] == '.' {
+			if n == 0 {
+				return false
+			}
+			segs++
+			n = 0
+			continue
+		}
+		c := tok[i]
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '-' && c != '_' && c != '=' {
+			return false
+		}
+		n++
+	}
+	return segs == 3
+}
+
 // ParsePrincipals parses "conductor=system:serviceaccount:ns:sa,evals=...".
 // The result maps ServiceAccount username -> principal.
 func ParsePrincipals(s string) (map[string]Principal, error) {
@@ -35,7 +68,8 @@ func ParsePrincipals(s string) (map[string]Principal, error) {
 		default:
 			return nil, fmt.Errorf("internalauth: unknown principal %q", name)
 		}
-		if !strings.HasPrefix(user, "system:serviceaccount:") || strings.Count(user, ":") != 3 {
+		segs := strings.Split(user, ":")
+		if len(segs) != 4 || segs[0] != "system" || segs[1] != "serviceaccount" || segs[2] == "" || segs[3] == "" {
 			return nil, fmt.Errorf("internalauth: principal %q: %q is not a ServiceAccount username", name, user)
 		}
 		if _, dup := out[user]; dup {
@@ -77,18 +111,38 @@ func Middleware(r Reviewer, audience string, principals map[string]Principal, al
 
 func middleware(r Reviewer, audience string, principals map[string]Principal, allow []Principal, now func() time.Time) func(http.Handler) http.Handler {
 	var mu sync.Mutex
+	sem := make(chan struct{}, maxConcurrentReviews)
 	cache := map[[32]byte]cacheEntry{}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			deny := func(code int, reason string) {
-				slog.Warn("internal auth denied", "path", req.URL.Path, "status", code, "reason", reason)
-				w.Header().Set("WWW-Authenticate", `Bearer realm="luma-internal"`)
+			// Bodies are status text only (S41/S43).
+			deny := func(code int, reason string, detail ...string) {
+				attrs := []any{"path", req.URL.Path, "status", code, "reason", reason}
+				if len(detail) > 0 {
+					attrs = append(attrs, "detail", detail[0])
+				}
+				slog.Warn("internal auth denied", attrs...)
+				switch code {
+				case http.StatusUnauthorized:
+					w.Header().Set("WWW-Authenticate", `Bearer realm="luma-internal"`)
+				case http.StatusServiceUnavailable:
+					w.Header().Set("Retry-After", "2")
+				}
 				http.Error(w, http.StatusText(code), code)
 			}
-			scheme, tok, ok := strings.Cut(req.Header.Get("Authorization"), " ")
+			hv := req.Header.Values("Authorization")
+			if len(hv) != 1 {
+				deny(http.StatusUnauthorized, "no_bearer")
+				return
+			}
+			scheme, tok, ok := strings.Cut(hv[0], " ")
 			tok = strings.TrimSpace(tok)
 			if !ok || !strings.EqualFold(scheme, "Bearer") || tok == "" {
 				deny(http.StatusUnauthorized, "no_bearer")
+				return
+			}
+			if !jwtShaped(tok) {
+				deny(http.StatusUnauthorized, "malformed_token")
 				return
 			}
 			key := sha256.Sum256([]byte(tok))
@@ -100,13 +154,21 @@ func middleware(r Reviewer, audience string, principals map[string]Principal, al
 			}
 			mu.Unlock()
 			if !hit {
+				select {
+				case sem <- struct{}{}:
+				default:
+					deny(http.StatusServiceUnavailable, "review_saturated")
+					return
+				}
 				id, err := r.Review(req.Context(), tok)
+				<-sem
 				switch {
 				case errors.Is(err, ErrUnauthenticated):
 					deny(http.StatusUnauthorized, "unauthenticated")
 					return
 				case err != nil:
-					deny(http.StatusServiceUnavailable, "review_unavailable")
+					// Review's errors are fixed text and never carry the token.
+					deny(http.StatusServiceUnavailable, "review_unavailable", err.Error())
 					return
 				}
 				if !hasAudience(id.Audiences, audience) {
@@ -157,8 +219,9 @@ func hasAudience(have []string, want string) bool {
 	return found == 1
 }
 
-// lookupPrincipal compares against every configured username with a
-// constant-time compare and does not short-circuit.
+// lookupPrincipal compares against every configured username without
+// short-circuiting. The data is not secret (usernames, audiences); this is
+// tidiness, not a security boundary.
 func lookupPrincipal(m map[string]Principal, user string) (Principal, bool) {
 	var res Principal
 	found := 0

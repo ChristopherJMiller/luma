@@ -60,9 +60,9 @@ func kubeRev(t *testing.T) (*fakeKube, Reviewer) {
 
 func TestValidConductorToken(t *testing.T) {
 	f, r := kubeRev(t)
-	f.allow("good", saConductor, testAudience)
+	f.allow("good.a.b", saConductor, testAudience)
 	h, hits := serve(t, r, PrincipalConductor)
-	rec := do(h, "Bearer good")
+	rec := do(h, "Bearer good.a.b")
 	if rec.Code != 200 || rec.Body.String() != "conductor|"+saConductor+"|pod-luma-conductor" || *hits != 1 {
 		t.Fatalf("%d %q hits=%d", rec.Code, rec.Body.String(), *hits)
 	}
@@ -84,7 +84,7 @@ func TestMissingOrMalformedBearer401(t *testing.T) {
 func TestUnauthenticatedToken401(t *testing.T) {
 	_, r := kubeRev(t)
 	h, hits := serve(t, r, PrincipalConductor)
-	if rec := do(h, "Bearer unknown"); rec.Code != 401 || *hits != 0 {
+	if rec := do(h, "Bearer unknown.a.b"); rec.Code != 401 || *hits != 0 {
 		t.Fatalf("%d hits=%d", rec.Code, *hits)
 	}
 }
@@ -92,10 +92,10 @@ func TestUnauthenticatedToken401(t *testing.T) {
 func TestWrongAudience401(t *testing.T) {
 	f, r := kubeRev(t)
 	// An API-audience token (e.g. Core's own) must not open the internal port.
-	f.allow("apitok", saConductor, "https://kubernetes.default.svc")
-	f.allow("noaud", saConductor)
+	f.allow("apitok.a.b", saConductor, "https://kubernetes.default.svc")
+	f.allow("noaud.a.b", saConductor)
 	h, hits := serve(t, r, PrincipalConductor)
-	for _, tok := range []string{"apitok", "noaud"} {
+	for _, tok := range []string{"apitok.a.b", "noaud.a.b"} {
 		if rec := do(h, "Bearer "+tok); rec.Code != 401 {
 			t.Errorf("%s -> %d", tok, rec.Code)
 		}
@@ -107,11 +107,11 @@ func TestWrongAudience401(t *testing.T) {
 
 func TestUnknownServiceAccount403(t *testing.T) {
 	f, r := kubeRev(t)
-	f.allow("other", "system:serviceaccount:luma:luma-gateway", testAudience)
-	f.allow("otherns", "system:serviceaccount:evil:luma-conductor", testAudience)
-	f.allow("user", "alice", testAudience)
+	f.allow("other.a.b", "system:serviceaccount:luma:luma-gateway", testAudience)
+	f.allow("otherns.a.b", "system:serviceaccount:evil:luma-conductor", testAudience)
+	f.allow("user.a.b", "alice", testAudience)
 	h, hits := serve(t, r, PrincipalConductor)
-	for _, tok := range []string{"other", "otherns", "user"} {
+	for _, tok := range []string{"other.a.b", "otherns.a.b", "user.a.b"} {
 		if rec := do(h, "Bearer "+tok); rec.Code != 403 {
 			t.Errorf("%s -> %d", tok, rec.Code)
 		}
@@ -123,46 +123,46 @@ func TestUnknownServiceAccount403(t *testing.T) {
 
 func TestPrincipalNotAllowedForRoute403(t *testing.T) {
 	f, r := kubeRev(t)
-	f.allow("cond", saConductor, testAudience)
-	f.allow("ev", saEvals, testAudience)
+	f.allow("cond.a.b", saConductor, testAudience)
+	f.allow("ev.a.b", saEvals, testAudience)
 	h, hits := serve(t, r, PrincipalEvals)
-	if rec := do(h, "Bearer cond"); rec.Code != 403 {
+	if rec := do(h, "Bearer cond.a.b"); rec.Code != 403 {
 		t.Fatalf("conductor on evals route -> %d", rec.Code)
 	}
-	if rec := do(h, "Bearer ev"); rec.Code != 200 {
+	if rec := do(h, "Bearer ev.a.b"); rec.Code != 200 {
 		t.Fatalf("evals on evals route -> %d", rec.Code)
 	}
 	// A cached conductor must still be refused on the evals route.
-	if rec := do(h, "Bearer cond"); rec.Code != 403 || *hits != 1 {
+	if rec := do(h, "Bearer cond.a.b"); rec.Code != 403 || *hits != 1 {
 		t.Fatalf("cached conductor -> %d hits=%d", rec.Code, *hits)
 	}
 }
 
 func TestMultiplePrincipalsAllowed(t *testing.T) {
 	f, r := kubeRev(t)
-	f.allow("cond", saConductor, testAudience)
+	f.allow("cond.a.b", saConductor, testAudience)
 	h, _ := serve(t, r, PrincipalEvals, PrincipalConductor)
-	if rec := do(h, "Bearer cond"); rec.Code != 200 {
+	if rec := do(h, "Bearer cond.a.b"); rec.Code != 200 {
 		t.Fatalf("%d", rec.Code)
 	}
 }
 
 func TestAPIServerDown503FailsClosed(t *testing.T) {
 	f, r := kubeRev(t)
-	f.allow("good", saConductor, testAudience)
+	f.allow("good.a.b", saConductor, testAudience)
 	h, hits := serve(t, r, PrincipalConductor)
 	f.srv.Close()
-	if rec := do(h, "Bearer good"); rec.Code != 503 || *hits != 0 {
+	if rec := do(h, "Bearer good.a.b"); rec.Code != 503 || *hits != 0 {
 		t.Fatalf("%d hits=%d", rec.Code, *hits)
 	}
 }
 
 func TestPositiveCacheHitsApiserverOnce(t *testing.T) {
 	f, r := kubeRev(t)
-	f.allow("good", saConductor, testAudience)
+	f.allow("good.a.b", saConductor, testAudience)
 	h, _ := serve(t, r, PrincipalConductor)
 	for range 5 {
-		if rec := do(h, "Bearer good"); rec.Code != 200 {
+		if rec := do(h, "Bearer good.a.b"); rec.Code != 200 {
 			t.Fatal(rec.Code)
 		}
 	}
@@ -174,11 +174,11 @@ func TestPositiveCacheHitsApiserverOnce(t *testing.T) {
 func TestNegativeResultsNotCached(t *testing.T) {
 	f, r := kubeRev(t)
 	h, _ := serve(t, r, PrincipalConductor)
-	if rec := do(h, "Bearer late"); rec.Code != 401 {
+	if rec := do(h, "Bearer late.a.b"); rec.Code != 401 {
 		t.Fatal(rec.Code)
 	}
-	f.allow("late", saConductor, testAudience)
-	if rec := do(h, "Bearer late"); rec.Code != 200 {
+	f.allow("late.a.b", saConductor, testAudience)
+	if rec := do(h, "Bearer late.a.b"); rec.Code != 200 {
 		t.Fatalf("after becoming valid -> %d", rec.Code)
 	}
 }
@@ -249,15 +249,15 @@ func TestTokenNeverLogged(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(old) })
 
 	f, r := kubeRev(t)
-	f.allow("TOKEN-OK-1234", saConductor, testAudience)
-	f.allow("TOKEN-WRONGAUD-1234", saConductor, "other")
-	f.allow("TOKEN-OTHERSA-1234", "system:serviceaccount:x:y", testAudience)
+	f.allow("TOKEN-OK-1234.a.b", saConductor, testAudience)
+	f.allow("TOKEN-WRONGAUD-1234.a.b", saConductor, "other")
+	f.allow("TOKEN-OTHERSA-1234.a.b", "system:serviceaccount:x:y", testAudience)
 	h, _ := serve(t, r, PrincipalConductor)
-	for _, tok := range []string{"TOKEN-OK-1234", "TOKEN-WRONGAUD-1234", "TOKEN-OTHERSA-1234", "TOKEN-BAD-1234"} {
+	for _, tok := range []string{"TOKEN-OK-1234.a.b", "TOKEN-WRONGAUD-1234.a.b", "TOKEN-OTHERSA-1234.a.b", "TOKEN-BAD-1234.a.b"} {
 		do(h, "Bearer "+tok)
 	}
 	f.srv.Close()
-	do(h, "Bearer TOKEN-DOWN-1234")
+	do(h, "Bearer TOKEN-DOWN-1234.a.b")
 
 	out := buf.String()
 	if !strings.Contains(out, "internal auth denied") {

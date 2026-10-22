@@ -598,6 +598,8 @@ turns:
 | `POST /internal/v1/eval-runs` | `evals` | `{suite, sdk_version, cli_version, image, started_at, finished_at, passed, failed, cost_usd, results:[{id, passed, failures[], cost_usd}]}` → 201. `0 ≤ cost_usd ≤ LUMA_EVAL_MAX_COST_USD`, otherwise 422. |
 | `POST /internal/v1/usage-reconciliations` | `reconcile` | `{day:"YYYY-MM-DD", workspaces:[{name, api_usd}]}` → `{workspaces:[{name, api_usd, ledger_usd, drift_ratio}]}`; idempotent per (day, workspace) |
 
+**Internal auth failures (S43).** Internal 401, 403 and 503 are status-only plain-text bodies (S41 style). 401: missing, malformed or oversized bearer, unauthenticated review, wrong audience. 403: unmapped ServiceAccount or a principal not allowed on the route. 503 (with `Retry-After`): the TokenReview could not complete (apiserver unreachable or erroring, review concurrency saturated); it is retryable with backoff.
+
 **Workspace mapping (S5),** a fixed table in Core: Anthropic workspace `luma-interactive` → `api_workspace = 'interactive'`, `luma-ci` → `'ci'`. Any other `name` → 422. `ledger_usd` = Σ `cost_ledger.cost_usd` over that `api_workspace` and the UTC day. `usage_reconciliations.workspace` stores the Anthropic name.
 
 ---
