@@ -174,10 +174,16 @@ func TestWatchRegistryKeepsOldOnBadFile(t *testing.T) {
 		t.Fatalf("a bad file reloaded as %+v, %v; want an error and no registry", r.reg, r.err)
 	}
 
+	// One write can debounce into two reloads on a slow runner (the tmp-file
+	// create and the rename land either side of the 20ms window), so a second
+	// failed reload of the bad file may still be in flight. Skip failures
+	// until the good file arrives; next() fails the test at its deadline.
 	writeFile(t, path, registryWithoutP1)
-	if r := next(); r.err != nil {
-		t.Fatalf("good file after the bad one: %v", r.err)
-	} else if _, ok := r.reg.Lookup("google", "c@example.com"); !ok {
+	r := next()
+	for r.err != nil {
+		r = next()
+	}
+	if _, ok := r.reg.Lookup("google", "c@example.com"); !ok {
 		t.Fatal("the good file after the bad one was not delivered")
 	}
 	cancel()
