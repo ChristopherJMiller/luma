@@ -42,7 +42,7 @@ func (f *fakeCore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`{"workspaces":[{"name":"luma-ci","api_usd":2.5,"ledger_usd":2.5,"drift_ratio":0}]}`))
 }
 
-func runWith(t *testing.T, f *fakeCore) (error, []time.Duration, *os.File) {
+func runWith(t *testing.T, f *fakeCore) ([]time.Duration, error) {
 	t.Helper()
 	var waits []time.Duration
 	old := sleep
@@ -53,12 +53,12 @@ func runWith(t *testing.T, f *fakeCore) (error, []time.Duration, *os.File) {
 	c, _ := newAdmin(t)
 	tokFile := keyFile(t, "tok-1")
 	err := Run(bg, c, core.Client(), core.URL, tokFile, time.Date(2026, 10, 14, 0, 0, 0, 0, time.UTC), []string{"luma-interactive", "luma-ci"})
-	return err, waits, nil
+	return waits, err
 }
 
 func TestRunPostsCostsToCore(t *testing.T) {
 	f := &fakeCore{statuses: []int{200}}
-	err, waits, _ := runWith(t, f)
+	waits, err := runWith(t, f)
 	if err != nil || len(waits) != 0 || len(f.bodies) != 1 {
 		t.Fatalf("err=%v waits=%v posts=%d", err, waits, len(f.bodies))
 	}
@@ -76,7 +76,7 @@ func TestRunPostsCostsToCore(t *testing.T) {
 func TestRunRetriesCore503(t *testing.T) {
 	t.Run("two 503s with Retry-After then success", func(t *testing.T) {
 		f := &fakeCore{statuses: []int{503, 503, 200}, retry: "1"}
-		err, waits, _ := runWith(t, f)
+		waits, err := runWith(t, f)
 		if err != nil || len(f.bodies) != 3 {
 			t.Fatalf("err=%v posts=%d", err, len(f.bodies))
 		}
@@ -87,14 +87,14 @@ func TestRunRetriesCore503(t *testing.T) {
 	})
 	t.Run("Retry-After longer than the backoff wins", func(t *testing.T) {
 		f := &fakeCore{statuses: []int{503, 200}, retry: "30"}
-		err, waits, _ := runWith(t, f)
+		waits, err := runWith(t, f)
 		if err != nil || len(waits) != 1 || waits[0] != 30*time.Second {
 			t.Fatalf("err=%v waits=%v", err, waits)
 		}
 	})
 	t.Run("six 503s fail after five retries", func(t *testing.T) {
 		f := &fakeCore{statuses: []int{503}}
-		err, waits, _ := runWith(t, f)
+		waits, err := runWith(t, f)
 		if err == nil || len(f.bodies) != 6 {
 			t.Fatalf("err=%v posts=%d, want an error after 6", err, len(f.bodies))
 		}
@@ -107,7 +107,7 @@ func TestRunRetriesCore503(t *testing.T) {
 	})
 	t.Run("a 403 fails at once", func(t *testing.T) {
 		f := &fakeCore{statuses: []int{403}}
-		err, waits, _ := runWith(t, f)
+		waits, err := runWith(t, f)
 		if err == nil || len(f.bodies) != 1 || len(waits) != 0 {
 			t.Fatalf("err=%v posts=%d waits=%v", err, len(f.bodies), waits)
 		}

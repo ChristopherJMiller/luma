@@ -89,7 +89,7 @@ func Run(ctx context.Context, c *AdminClient, core *http.Client, coreURL, tokenF
 // post sends one attempt, with the token read afresh.
 func post(ctx context.Context, core *http.Client, coreURL, tokenFile string, body []byte) (int, time.Duration, protocol.UsageReconciliationResult, error) {
 	var res protocol.UsageReconciliationResult
-	tok, err := os.ReadFile(tokenFile)
+	tok, err := os.ReadFile(tokenFile) //nolint:gosec // the projected token path is operator-set, not user input
 	if err != nil || strings.TrimSpace(string(tok)) == "" {
 		return 0, 0, res, errors.New("core token file unreadable or empty")
 	}
