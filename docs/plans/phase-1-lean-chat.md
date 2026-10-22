@@ -291,8 +291,8 @@ The tasks refer to these by name. Each is defined once, here. Task 4 Step 5 may 
 | `GET /v1/sessions/{id}/stream?since=<id>` | WebSocket, server → client `Event` frames, every event with id > `since` once, in id order; ping every 25 s. The handshake needs exactly one allowed `Origin` and the cookie. Refused before the upgrade: 403/401 (auth layer), 404 `not_found`, 400 `invalid_request`. **Close codes:** **4401** the web session ended (sign in again); **4404** the conversation's tree was deleted (drop the thread); **1013** too far behind (1000 events) or the log could not be read for now (reconnect with `since`); **1011** a stored event cannot be read, and never will be (do not reconnect). Any other close (1006, a network drop) means reconnect with `since` |
 | `POST /v1/attachments` (multipart `file`) | `Attachment{id,media_type,filename,size_bytes,width?,height?,pages?}`; 413 `attachment_too_large` or `image_too_large`, 415 `unsupported_attachment`, 400 `invalid_request` (no `file` part, a malformed body). **503 `rate_limited` with `Retry-After: 5`** when 4 uploads are in flight, or 2 of the person's: refused before the body is read (Task 12 security review, S57) |
 | `GET /v1/attachments/{id}`, `DELETE` | bytes (owner only; `X-Content-Type-Options: nosniff`, `Content-Security-Policy: sandbox`, `Cache-Control: private, no-store`; images `inline`, everything else `attachment`) / 204. DELETE removes an upload no message has taken; one a message has taken is 400 `invalid_request`, deleted only with its tree |
-| `GET /v1/memory/profile` / `PUT {content,version}` / `DELETE` | `Profile{content,version,updated_at,pending: MemoryWrite[]}` |
-| `POST /v1/memory/writes/{id}/accept`, `/reject` | `MemoryWrite` (owner only) |
+| `GET /v1/memory/profile` / `PUT {content,version}` / `DELETE` | `Profile{content,version,updated_at,pending: MemoryWrite[]}`; `pending` is the person's pending writes, oldest first (those of deleted conversations too). A person with no profile reads `content ""`, `version 0`. PUT needs both fields (else 400 `invalid_request`: a body without `content` must not clear the profile), saves only at the current `version` (**409 `invalid_request`** on a stale one; the PWA shows its own copy) and refuses content over `MaxProfileBytes` (6000 UTF-8 bytes) with 413 `request_too_large`. DELETE empties the content and moves `version` on; pending writes stay (Task 13) |
+| `POST /v1/memory/writes/{id}/accept`, `/reject` | `MemoryWrite` (owner only). 404 `not_found` for another person's write, or one already decided the other way; the same decision again returns the write unchanged (a retried click). Accepting a remember that no longer fits is **409 `memory_full`** and the write stays pending; accepting a forget removes the lines matching **now** and records them as `matched` (Task 13) |
 
 **Every unsafe method** (POST, PUT, PATCH, DELETE, and any method other than GET, HEAD and OPTIONS) needs exactly one allowed `Origin`. A request **with a body** needs `Content-Type: application/json`, or `multipart/form-data` on `POST /v1/attachments`. A request with an **empty body** needs no `Content-Type`, because the Origin check is the CSRF control (S42). A body of unknown length (chunked) counts as a body. Anything else gets 403 or 415. The guard runs **before** authentication, so a foreign-Origin request without a cookie gets 403, not 401 (S17).
 
@@ -349,7 +349,7 @@ Frames are JSON `{type, ...}`. Hand-written fixtures for every type live in `pro
 - `turn.interrupt{session_id}`
 - `host.close{session_id, reason:"deleted"|"shutdown"|"maintenance"|"error"}`; `error` is Core giving up on a stuck turn (S48, below; fixture `link/host-close-error.json`)
 - `tree.purge{root_id, person_ref}`: remove the tree's project dirs (`conv/<root_id>` and `config/<person_ref>/projects/<root_id>`) after its hosts close, even when none is open (S14). Core deletes the tree's rows only after the `tree.purged` ack, link-down or 30 s, whichever comes first (S39)
-- `rpc.result{rpc_id, ok, result?: MemoryResult, error?: ErrorInfo}`, where `MemoryResult = {status:"applied"|"pending"|"disabled"|"full"|"rejected", write_id?: string, removed?: number, code?: ErrorCode}`
+- `rpc.result{rpc_id, ok, result?: MemoryResult, error?: ErrorInfo}`, where `MemoryResult = {status:"applied"|"pending"|"disabled"|"full"|"rejected", write_id?: string, removed?: number, code?: ErrorCode}`. `write_id` is the `memory_writes` row an applied or pending write made; `removed` is an applied forget's count (0 included); `code` is `memory_disabled`, `memory_full`, or for `rejected` `forget_too_short` / `memory_pending_limit`. `full` and `rejected` leave no row. A remember with no text or over 300 characters (the tool schema's cap) is a broken rpc: `ok:false`, `upstream_error` (Task 13)
 - `shutdown{reason}`
 
 **Conductor → Core:**
@@ -425,13 +425,13 @@ A `turn_result` that arrives in time ends the turn normally and cancels both. Af
 | `pdf_too_long` | pages > the tier's `pdf_max_pages` | "That PDF has more than {max} pages, the most Luma reads in this mode." |
 | `conversation_attachments_full` | > 20 MiB per tree, counting each message's attachments (one sent again counts again, S57) | "This conversation already holds 20 MB of files. Start a new chat to add more." |
 | `unsupported_attachment` | sniffed type not allowed, or unparseable: text that is not UTF-8, holds a C0 control other than tab/LF/CR, or is > 1 MiB; a PDF whose page counter fails, crashes or runs past 30 s (S57) | "Luma can read photos, PDFs and text files." |
-| `memory_full` | tool result text | "The profile is full. Ask the person to tidy it in Luma's profile page." |
+| `memory_full` | tool result text; 409 on accepting a held remember that no longer fits (Task 13) | "The profile is full. Ask the person to tidy it in Luma's profile page." |
 | `memory_disabled` | tool result text | "Memory is off in this conversation." |
 | `memory_pending_limit` | tool result text (4th pending write in a turn) | "Several memory changes are already waiting for the person's review. Don't save more in this turn." |
 | `forget_too_short` | tool result text | "Say at least 3 characters of what to forget." |
 | `not_found` | 404: no such session (or write, attachment, agent), or not the person's (S49) | "Luma can't find that. It may have been deleted." |
-| `invalid_request` | 400: a malformed request (S49) | "Luma didn't understand that request. Reload the page and try again." |
-| `request_too_large` | 413: a JSON body over 1 MiB (S49) | "That message is too long for Luma. Shorten it and try again." |
+| `invalid_request` | 400: a malformed request (S49); 409: a profile PUT at a stale `version` (Task 13) | "Luma didn't understand that request. Reload the page and try again." |
+| `request_too_large` | 413: a JSON body over 1 MiB (S49), or a profile PUT over 6000 bytes (Task 13) | "That message is too long for Luma. Shorten it and try again." |
 | `upstream_error` | anything else | "Something went wrong talking to Claude. Try again." |
 | `not_invited` | 403 page at callback | "This account isn't invited to Luma." |
 
