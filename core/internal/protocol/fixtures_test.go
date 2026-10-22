@@ -93,6 +93,7 @@ var linkFixtures = []fixture{
 	{"turn-send.json", "turn.send", linkFrame},
 	{"turn-interrupt.json", "turn.interrupt", linkFrame},
 	{"host-close.json", "host.close", linkFrame},
+	{"host-close-error.json", "host.close", linkFrame},
 	{"tree-purge.json", "tree.purge", linkFrame},
 	{"rpc-result-applied.json", "rpc.result", linkFrame},
 	{"rpc-result-full.json", "rpc.result", linkFrame},

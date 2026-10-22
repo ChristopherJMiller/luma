@@ -34,7 +34,7 @@ type TurnInterrupt struct {
 // HostClose is `host.close`.
 type HostClose struct {
 	SessionID string `json:"session_id"`
-	Reason    string `json:"reason"` // deleted | shutdown | maintenance
+	Reason    string `json:"reason"` // deleted | shutdown | maintenance | error (Core gave up on a stuck turn, S48)
 }
 
 // TreePurge is `tree.purge`: remove the tree's project dirs after its hosts

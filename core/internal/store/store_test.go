@@ -743,6 +743,20 @@ func TestCompleteTurnIsOneTransaction(t *testing.T) {
 	if err != nil || ses.LastTotals == nil || ses.LastTotals.CostUSD != 0.5 {
 		t.Fatalf("last_totals after a failed CompleteTurn = %+v, %v; want the earlier 0.5 (rolled back)", ses.LastTotals, err)
 	}
+
+	// A message is settled only within its own session.
+	newSession(t, s, "ses_b")
+	foreign := done
+	foreign.SessionID = "ses_b"
+	if err := s.CompleteTurn(ctx, foreign, later); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("CompleteTurn of ses_a's message under ses_b: %v, want ErrNotFound", err)
+	}
+	if err := s.FinishMessage(ctx, foreign); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("FinishMessage of ses_a's message under ses_b: %v, want ErrNotFound", err)
+	}
+	if b, err := s.Session(ctx, "ses_b"); err != nil || b.LastTotals != nil {
+		t.Fatalf("ses_b last_totals = %+v, %v; want none (rolled back)", b.LastTotals, err)
+	}
 }
 
 func TestAttachmentMetaOwnerOnlyWithoutBytes(t *testing.T) {

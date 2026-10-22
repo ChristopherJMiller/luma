@@ -135,6 +135,7 @@ const frames: [string, string][] = [
   ['turn-send.json', 'turn.send'],
   ['turn-interrupt.json', 'turn.interrupt'],
   ['host-close.json', 'host.close'],
+  ['host-close-error.json', 'host.close'],
   ['tree-purge.json', 'tree.purge'],
   ['rpc-result-applied.json', 'rpc.result'],
   ['rpc-result-full.json', 'rpc.result'],

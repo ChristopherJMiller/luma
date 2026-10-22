@@ -45,8 +45,22 @@ type turn struct {
 	user    protocol.Message
 	asst    *protocol.Message   // set only once stored
 	errCode *protocol.ErrorCode // the turn's first error; the message keeps it (S45)
-	started time.Time
+	// unstored: the assistant message could not be stored. The turn waits for
+	// its turn_result (to ledger it) or a host close, and stores nothing more.
+	unstored  bool
+	started   time.Time
+	capStop   func() bool // the wall-clock cap's timer (S48)
+	graceStop func() bool // the wait for a turn_result after an error or the cap's interrupt (S48)
 }
+
+// deadline is a turn backstop that fired (S48).
+type deadline int
+
+const (
+	deadlineCap            deadline = iota // the turn ran Config.TurnMax: interrupt it
+	deadlineInterruptGrace                 // no turn_result 30 s after an interrupt Core sent
+	deadlineErrorGrace                     // no turn_result 120 s after a link error
+)
 
 func newActor(s *Service, id string) *actor {
 	return &actor{s: s, id: id, mbox: make(chan func(*actor), mailboxSize)}
@@ -139,13 +153,18 @@ func (a *actor) setStatus(ctx context.Context, status string) error {
 func (a *actor) tainted() bool { return a.sess.TaintedAt != nil || a.taintUnsaved }
 
 // taint stamps tainted_at once (P9); it is never cleared. A failed write
-// leaves the session tainted in memory, to be stored by a retry.
+// leaves the session tainted in memory, to be stored by a retry. A session
+// that is gone has nothing to taint.
 func (a *actor) taint(ctx context.Context) error {
 	if a.sess.TaintedAt != nil {
 		a.taintUnsaved = false
 		return nil
 	}
 	if err := a.s.st.TaintSession(ctx, a.id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			a.taintUnsaved = false
+			return nil
+		}
 		a.taintUnsaved = true
 		return err
 	}
@@ -315,6 +334,48 @@ func (a *actor) deliver(ctx context.Context, um protocol.UserMessage, blocks []p
 	if err := a.s.cond.SendTurn(ctx, ts); err != nil {
 		a.warn("turn.send failed", err)
 		a.failTurn(ctx, protocol.CodeConductorRestarted)
+		return
+	}
+	a.turn.capStop = a.arm(a.s.cfg.TurnMax, deadlineCap)
+}
+
+// ---- turn backstops (S48) ----
+
+// arm schedules a deadline of the running turn. The timer only posts to the
+// actor, which drops the deadline if that turn has ended.
+func (a *actor) arm(d time.Duration, kind deadline) func() bool {
+	s, id, turnID := a.s, a.id, a.turn.id
+	return s.afterFunc(d, func() {
+		s.post(id, func(ctx context.Context, b *actor) { b.onDeadline(ctx, turnID, kind) })
+	})
+}
+
+// armGrace starts the wait for the turn's result, unless one already runs.
+func (a *actor) armGrace(d time.Duration, kind deadline) {
+	if a.turn.graceStop == nil {
+		a.turn.graceStop = a.arm(d, kind)
+	}
+}
+
+func (a *actor) onDeadline(ctx context.Context, turnID string, kind deadline) {
+	t := a.turn
+	if t == nil || t.id != turnID {
+		return // the turn ended first
+	}
+	switch kind {
+	case deadlineCap:
+		slog.Warn("sessions: turn reached its wall-clock cap; interrupting", "session", a.id, "turn", t.id, "cap", a.s.cfg.TurnMax)
+		if err := a.s.cond.Interrupt(ctx, a.id); err != nil {
+			a.warn("interrupt failed", err)
+		}
+		a.armGrace(interruptGrace, deadlineInterruptGrace)
+	case deadlineInterruptGrace, deadlineErrorGrace:
+		slog.Warn("sessions: no turn_result in time; closing the host", "session", a.id, "turn", t.id)
+		if err := a.s.cond.Close(ctx, a.id, "error"); err != nil {
+			a.warn("host.close failed", err)
+		}
+		a.hostOpen = false
+		a.failTurn(ctx, protocol.CodeUpstreamError)
 	}
 }
 
@@ -396,20 +457,27 @@ func (a *actor) onLink(ctx context.Context, turnID string, ev protocol.LinkEvent
 
 // assistant returns the turn's one assistant message (P23), storing it and
 // emitting message.started on first use. If the store cannot take it, the
-// turn is failed, the CLI's turn interrupted, and assistant returns nil.
+// turn is marked unstored: the client gets upstream_error, the CLI's turn is
+// interrupted, and the turn waits for its turn_result (to ledger it) or a
+// host close; assistant returns nil, then and for the rest of the turn.
 func (a *actor) assistant(ctx context.Context, model string) *protocol.Message {
-	if a.turn.asst != nil {
-		return a.turn.asst
+	t := a.turn
+	if t.asst != nil || t.unstored {
+		return t.asst
 	}
 	if err := a.startAssistant(ctx, model); err != nil {
-		a.warn("assistant message insert failed; failing the turn", err)
+		a.warn("assistant message insert failed; abandoning the turn", err)
+		t.unstored = true
+		if a.markError(ctx, protocol.CodeUpstreamError) {
+			a.note(ctx, protocol.ErrorEvent{Code: protocol.CodeUpstreamError, Retryable: true}, store.Durable)
+		}
 		if err := a.s.cond.Interrupt(ctx, a.id); err != nil {
 			a.warn("interrupt failed", err)
 		}
-		a.failTurn(ctx, protocol.CodeUpstreamError)
+		a.armGrace(interruptGrace, deadlineInterruptGrace)
 		return nil
 	}
-	return a.turn.asst
+	return t.asst
 }
 
 // startAssistant stores the turn's assistant message and emits
@@ -496,8 +564,8 @@ func (a *actor) modelSwitched(ctx context.Context, e protocol.LinkModelSwitched)
 }
 
 // linkError marks the turn's message error and tells the client; the turn
-// itself ends on its turn_result (S45). Later errors of the turn are counted
-// and logged only.
+// itself ends on its turn_result (S45), or after 120 s without one (S48).
+// Later errors of the turn are counted and logged only.
 func (a *actor) linkError(ctx context.Context, e protocol.LinkError) {
 	if e.Detail == "thinking_binding" {
 		a.s.m.ThinkingBindingErrorsTotal.Inc()
@@ -506,16 +574,23 @@ func (a *actor) linkError(ctx context.Context, e protocol.LinkError) {
 	if a.markError(ctx, e.Code) {
 		a.note(ctx, protocol.ErrorEvent{Code: e.Code, Retryable: e.Retryable}, store.Durable)
 	}
+	a.armGrace(errorGrace, deadlineErrorGrace)
 }
 
 // turnResult ends the turn, errored or not: the message (its content and its
 // sdk_uuid, the fork point) and last_totals in one transaction (S2), then
 // message.completed, usage, the ledger, idle. If the store refuses the
-// completion, the spend is still ledgered and the turn fails instead.
+// completion, or never stored the message, the spend is still ledgered and
+// the turn ends as an error.
 func (a *actor) turnResult(ctx context.Context, r protocol.TurnResult) {
 	t := a.turn
 	m := a.assistant(ctx, "")
 	if m == nil {
+		a.recordTurn(ctx, r)
+		if err := a.s.st.SetLastTotals(ctx, a.id, r.Totals); err != nil {
+			a.warn("last_totals update failed", err)
+		}
+		a.endTurn(ctx, "error")
 		return
 	}
 	if len(r.Content) > 0 {
@@ -525,9 +600,10 @@ func (a *actor) turnResult(ctx context.Context, r protocol.TurnResult) {
 		u := r.SDKUUID
 		m.SDKUUID = &u
 	}
-	done, outcome := *m, "error"
-	if t.errCode == nil {
-		done.Status, outcome = "complete", "complete"
+	done, outcome := *m, "complete"
+	done.Status = "complete"
+	if t.errCode != nil {
+		done.Status, done.ErrorCode, outcome = "error", t.errCode, "error"
 	}
 	if err := a.s.st.CompleteTurn(ctx, done, r.Totals); err != nil {
 		a.warn("turn completion failed; failing the turn", err)
@@ -560,12 +636,13 @@ func (a *actor) markError(ctx context.Context, code protocol.ErrorCode) bool {
 	}
 	c := code
 	t.errCode = &c
-	if t.user.ID == "" {
-		return true // a recovered turn without a user message: nothing to mark
+	if t.user.ID == "" || t.unstored {
+		return true // a recovered turn without a user message, or no message: nothing to mark
 	}
 	if t.asst == nil {
 		if err := a.startAssistant(ctx, ""); err != nil {
-			a.warn("error message insert failed", err)
+			a.warn("error message insert failed; the turn stores no message", err)
+			t.unstored = true
 			return true
 		}
 	}
@@ -597,6 +674,16 @@ func (a *actor) failTurn(ctx context.Context, code protocol.ErrorCode) {
 
 func (a *actor) endTurn(ctx context.Context, outcome string) {
 	t := a.turn
+	for _, stop := range []func() bool{t.capStop, t.graceStop} {
+		if stop != nil {
+			stop()
+		}
+	}
+	if a.taintUnsaved { // retry now: a restart before the next turn would lose it
+		if err := a.taint(ctx); err != nil {
+			a.warn("taint still unwritten", err)
+		}
+	}
 	a.turn = nil
 	a.s.setRunning(a.id, "")
 	if err := a.setStatus(ctx, "idle"); err != nil {
@@ -684,6 +771,11 @@ func (a *actor) sweep(ctx context.Context) error {
 		a.lastMsg = &msgs[len(msgs)-1].ID
 	}
 	if t.asst != nil && t.asst.Status != "running" {
+		if t.asst.Status == "error" {
+			// It was waiting for its result after an error: this is the
+			// turn's one message.completed.
+			a.note(ctx, protocol.MessageCompleted{Message: *t.asst}, store.Durable)
+		}
 		return a.setStatus(ctx, "idle")
 	}
 	a.turn = t

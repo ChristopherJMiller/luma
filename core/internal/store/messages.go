@@ -89,8 +89,9 @@ func (s *Store) Messages(ctx context.Context, sessionID string) ([]protocol.Mess
 	return out, rows.Err()
 }
 
-// FinishMessage settles a message: its final content, status, SDK uuid,
-// model and error code.
+// FinishMessage settles a message of m.SessionID: its final content, status,
+// SDK uuid, model and error code. A message of another session is
+// ErrNotFound.
 func (s *Store) FinishMessage(ctx context.Context, m protocol.Message) error {
 	return finishMessage(ctx, s.pool, m)
 }
@@ -100,9 +101,9 @@ func finishMessage(ctx context.Context, db execer, m protocol.Message) error {
 	if err != nil {
 		return err
 	}
-	return execOne(ctx, db, `update messages set content = $2, status = $3, sdk_uuid = $4,
-		model = $5, error_code = $6 where id = $1`,
-		m.ID, content, m.Status, m.SDKUUID, m.Model, errorCodeArg(m.ErrorCode))
+	return execOne(ctx, db, `update messages set content = $3, status = $4, sdk_uuid = $5,
+		model = $6, error_code = $7 where id = $1 and session_id = $2`,
+		m.ID, m.SessionID, content, m.Status, m.SDKUUID, m.Model, errorCodeArg(m.ErrorCode))
 }
 
 // CompleteTurn settles a turn's assistant message (FinishMessage) and records

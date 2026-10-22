@@ -84,7 +84,15 @@ func (NopLedger) RecordMainRequest(store.Session, protocol.MainRequestUsage) {}
 type Config struct {
 	Location            *time.Location // LUMA_TIMEZONE; nil is UTC
 	WebFetchDenyDomains []string
+	TurnMax             time.Duration // LUMA_TURN_MAX_MINUTES: a turn's wall-clock cap from turn.send; zero is 15 minutes (S48)
 }
+
+// The turn backstops (S48).
+const (
+	defaultTurnMax = 15 * time.Minute  // a turn's wall-clock cap, unless Config.TurnMax says otherwise
+	interruptGrace = 30 * time.Second  // after the cap's interrupt, the wait for its turn_result
+	errorGrace     = 120 * time.Second // after a link error, the wait for its turn_result
+)
 
 var (
 	// ErrNotFound: the session, or the agent, does not exist or is not the
@@ -124,6 +132,9 @@ type Service struct {
 	// appendEvent is st.AppendEvent: every event of a session is written
 	// through it, by that session's actor (a test counts the writers).
 	appendEvent func(ctx context.Context, sessionID, typ string, payload any, d store.Durability) (int64, error)
+	// afterFunc runs f once d has passed and returns its stop function: the
+	// turn backstops' timers (time.AfterFunc; tests inject a fake clock).
+	afterFunc func(d time.Duration, f func()) (stop func() bool)
 
 	hub hub
 
@@ -138,10 +149,14 @@ func NewService(st *store.Store, live *agents.Live, c Conductor, prof ProfileSou
 	if cfg.Location == nil {
 		cfg.Location = time.UTC
 	}
+	if cfg.TurnMax <= 0 {
+		cfg.TurnMax = defaultTurnMax
+	}
 	cfg.WebFetchDenyDomains = append([]string{}, cfg.WebFetchDenyDomains...)
 	return &Service{
 		st: st, live: live, cond: c, prof: prof, att: att, gate: gate, led: led, m: m, clock: clock, cfg: cfg,
 		appendEvent: st.AppendEvent,
+		afterFunc:   func(d time.Duration, f func()) func() bool { return time.AfterFunc(d, f).Stop },
 		hub:         hub{subs: map[string]map[chan protocol.Event]struct{}{}},
 		actors:      map[string]*actor{},
 		running:     map[string]string{},

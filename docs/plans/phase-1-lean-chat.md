@@ -347,7 +347,7 @@ Frames are JSON `{type, ...}`. Hand-written fixtures for every type live in `pro
 - `host.open{session_id, spec: HostSpec}`
 - `turn.send{session_id, turn_id, content: ContentBlock[], untrusted: bool}`. Attachments are inlined as base64 image/document blocks or fenced text, and the `<luma-now>` block is already appended. `untrusted` = the session is tainted.
 - `turn.interrupt{session_id}`
-- `host.close{session_id, reason:"deleted"|"shutdown"|"maintenance"}`
+- `host.close{session_id, reason:"deleted"|"shutdown"|"maintenance"|"error"}`; `error` is Core giving up on a stuck turn (S48, below; fixture `link/host-close-error.json`)
 - `tree.purge{root_id, person_ref}`: remove the tree's project dirs (`conv/<root_id>` and `config/<person_ref>/projects/<root_id>`) after its hosts close, even when none is open (S14). Core deletes the tree's rows only after the `tree.purged` ack, link-down or 30 s, whichever comes first (S39)
 - `rpc.result{rpc_id, ok, result?: MemoryResult, error?: ErrorInfo}`, where `MemoryResult = {status:"applied"|"pending"|"disabled"|"full"|"rejected", write_id?: string, removed?: number, code?: ErrorCode}`
 - `shutdown{reason}`
@@ -366,6 +366,12 @@ Core accepts `event` and `rpc` only for a session opened **on this link**, and o
 - **`host.state{closed}`** under the turn, or **link loss**: no result will come. Core fails the turn (`capacity`, `maintenance`, `conductor_restarted` or `upstream_error` by reason) and nothing is ledgered.
 
 A link `error` **does not end the turn**. It marks the turn's assistant message `error` with its `code` (storing the message if `message_started` never came) and emits the client `error{code, retryable}`; the turn still ends on its `turn_result`, which keeps the message's `error` status. Only the turn's first error reaches the client. So the conductor sends `error`, then `turn_result`, for a failed result, and never `turn_result` before `error`.
+
+**No turn stays open (S48).** A turn that cannot reach an SDK result is ended by the conductor with `host.state{closed, reason:"error"}`; the conductor never leaves a turn open after `error` (Task 19b tests its side). Core backstops it in the session's actor:
+- **after a link `error`**, no `turn_result` within **120 s** → Core sends `host.close{reason:"error"}` and fails the turn (`upstream_error` unless the turn already reported an error, whose code the message keeps);
+- **a wall-clock cap** of `LUMA_TURN_MAX_MINUTES` (default **15**, C6) from `turn.send` → `turn.interrupt`; no `turn_result` within **30 s** of it → `host.close{reason:"error"}` and the turn fails as `upstream_error`.
+
+A `turn_result` that arrives in time ends the turn normally and cancels both. After a `host.close{reason:"error"}` the next send reopens the host with resume.
 
 **LinkEvent** (the turn is implied by the envelope):
 - `message_started{model}`: the first main-loop assistant stream of the turn
@@ -505,7 +511,7 @@ people: {<id>: {display_name, tier: admin|family, household: bool, emails: {goog
   - `KUBERNETES_SERVICE_HOST`/`_PORT`, set by the kubelet.
 - **Database:** `PGHOST`, `PGPORT`, `PGDATABASE=luma`, `PGUSER`, `PGPASSWORD`, `PGSSLMODE`, `LUMA_CONDUCTOR_DB_ROLE=luma_conductor`.
 - **Mounted config:** `LUMA_CONFIG_DIR=/etc/luma/config` (`*.agent.md` + `models.yaml`, watched), `LUMA_REGISTRY_FILE=/etc/luma/registry/registry.yaml` (watched), `LUMA_WEB_DIR=/usr/share/luma/web`.
-- **Behaviour:** `LUMA_TIMEZONE=UTC`, `LUMA_BUDGET_MONTHLY_USD=200`, `LUMA_BUDGET_WARN_RATIO=0.8`, `LUMA_MAX_TURN_COST_USD=5`, `LUMA_EVAL_MAX_COST_USD=25`, `LUMA_WEBFETCH_DENY_DOMAINS` (comma-joined apexes; each also denies its subdomains).
+- **Behaviour:** `LUMA_TIMEZONE=UTC`, `LUMA_BUDGET_MONTHLY_USD=200`, `LUMA_BUDGET_WARN_RATIO=0.8`, `LUMA_MAX_TURN_COST_USD=5`, `LUMA_EVAL_MAX_COST_USD=25`, `LUMA_WEBFETCH_DENY_DOMAINS` (comma-joined apexes; each also denies its subdomains), `LUMA_TURN_MAX_MINUTES=15` (a turn's wall-clock cap from `turn.send`, `sessions.Config.TurnMax`; S48).
 
 **`luma-core usage-reconcile`:** `LUMA_ANTHROPIC_ADMIN_KEY_FILE`, `LUMA_CORE_HTTP_URL=http://luma-core-internal:8081`, `LUMA_CORE_TOKEN_FILE`, `LUMA_RECONCILE_WORKSPACES=luma-interactive,luma-ci`, `LUMA_ANTHROPIC_API_URL=https://api.anthropic.com`.
 
@@ -1226,7 +1232,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
     RecordMainRequest(sess store.Session, u protocol.MainRequestUsage)
   }
   type NopLedger struct{}   // stand-in until Task 14
-  type Config struct { Location *time.Location; WebFetchDenyDomains []string }   // no HelperModel: it comes from Create's catalog snapshot (S11)
+  type Config struct { Location *time.Location; WebFetchDenyDomains []string; TurnMax time.Duration }   // no HelperModel: it comes from Create's catalog snapshot (S11); TurnMax = LUMA_TURN_MAX_MINUTES, zero is 15 min (S48)
   func (a agents.AgentFile) Admits(personTier string) bool   // added to core/internal/agents by this task: audience tier "" admits everyone, "family" admits family and admin, "admin" admits admin only; Task 15 uses the same method
   func NewService(st *store.Store, live *agents.Live, c Conductor, prof ProfileSource, att AttachmentResolver, gate Gate, led Ledger, m *metrics.Core, clock func() time.Time, cfg Config) *Service
   func (s *Service) Create(ctx, p auth.Person, req protocol.CreateSession) (protocol.Session, error)

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -97,6 +98,7 @@ type fakeConductor struct {
 	opens      []protocol.HostSpec
 	sends      []protocol.TurnSend
 	interrupts []string
+	closes     []string // "session:reason"
 	openErr    error
 	onSend     func(protocol.TurnSend)
 }
@@ -131,9 +133,73 @@ func (c *fakeConductor) Interrupt(_ context.Context, sessionID string) error {
 	return nil
 }
 
-func (c *fakeConductor) Close(context.Context, string, string) error     { return nil }
+func (c *fakeConductor) Close(_ context.Context, sessionID, reason string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closes = append(c.closes, sessionID+":"+reason)
+	return nil
+}
+
 func (c *fakeConductor) PurgeTree(context.Context, string, string) error { return nil }
 func (c *fakeConductor) Connected() bool                                 { return true }
+
+func (c *fakeConductor) Closes() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.closes...)
+}
+
+// fakeClock is the service's injected clock: Now, and timers that fire only
+// when the test advances it.
+type fakeClock struct {
+	mu     sync.Mutex
+	now    time.Time
+	timers []*fakeTimer
+}
+
+type fakeTimer struct {
+	at   time.Time
+	f    func()
+	done bool // fired or stopped
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *fakeClock) AfterFunc(d time.Duration, f func()) func() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	t := &fakeTimer{at: c.now.Add(d), f: f}
+	c.timers = append(c.timers, t)
+	return func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		was := !t.done
+		t.done = true
+		return was
+	}
+}
+
+// Advance moves the clock and runs, in order, every timer that is due.
+func (c *fakeClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	var due []*fakeTimer
+	for _, t := range c.timers {
+		if !t.done && !t.at.After(c.now) {
+			t.done = true
+			due = append(due, t)
+		}
+	}
+	c.mu.Unlock()
+	slices.SortStableFunc(due, func(a, b *fakeTimer) int { return a.at.Compare(b.at) })
+	for _, t := range due {
+		t.f()
+	}
+}
 
 func (c *fakeConductor) Opens() []protocol.HostSpec {
 	c.mu.Lock()
@@ -263,7 +329,23 @@ type harness struct {
 	led  *fakeLedger
 	reg  *prometheus.Registry
 	m    *metrics.Core
+	clk  *fakeClock
 	svc  *Service
+}
+
+// advance moves the fake clock, then lets the session's actor handle the
+// deadlines that fired.
+func (h *harness) advance(sessionID string, d time.Duration) {
+	h.t.Helper()
+	h.clk.Advance(d)
+	h.flush(sessionID)
+}
+
+// actorCount is the number of live actors.
+func (h *harness) actorCount() int {
+	h.svc.mu.Lock()
+	defer h.svc.mu.Unlock()
+	return len(h.svc.actors)
 }
 
 // sql runs a statement as the database superuser: tests inject store
@@ -308,21 +390,26 @@ func newHarness(t *testing.T) *harness {
 		prof: &fakeProfile{text: "<luma-context>\nsynthetic profile\n</luma-context>"},
 		att:  &fakeResolver{blocks: map[string]protocol.ContentBlock{}},
 		led:  &fakeLedger{}, reg: reg, m: metrics.NewCore(reg),
+		clk: &fakeClock{now: testNow},
 	}
 	h.svc = h.service(h.cond)
 	return h
 }
 
-// service builds another Service over the harness's store, catalog and fakes:
-// a second one stands for a restarted Core.
-func (h *harness) service(c Conductor) *Service {
+// service builds another Service over the harness's store, catalog, fakes and
+// clock: a second one stands for a restarted Core. opts adjust its Config.
+func (h *harness) service(c Conductor, opts ...func(*Config)) *Service {
 	la, err := time.LoadLocation("America/Los_Angeles")
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	return NewService(h.st, h.live, c, h.prof, h.att, h.gate, h.led, h.m,
-		func() time.Time { return testNow },
-		Config{Location: la, WebFetchDenyDomains: []string{"deny.example"}})
+	cfg := Config{Location: la, WebFetchDenyDomains: []string{"deny.example"}}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	svc := NewService(h.st, h.live, c, h.prof, h.att, h.gate, h.led, h.m, h.clk.Now, cfg)
+	svc.afterFunc = h.clk.AfterFunc
+	return svc
 }
 
 func (h *harness) create(p auth.Person, req protocol.CreateSession) protocol.Session {

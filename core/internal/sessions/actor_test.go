@@ -217,13 +217,15 @@ func TestStoreFailureFailsTurnNotCompletes(t *testing.T) {
 	h := newHarness(t)
 	h.sql(`create function luma_fail() returns trigger language plpgsql as $$ begin raise exception 'injected failure'; end $$`)
 
-	// The assistant message cannot be inserted.
+	// The assistant message cannot be inserted: the client is told, the CLI's
+	// turn is interrupted, and the turn waits for its result to ledger it
+	// (review round 2, minor 1).
 	h.sql(`create trigger fail_asst_insert before insert on messages for each row when (new.role = 'assistant') execute function luma_fail()`)
 	a := h.newSession(family)
 	h.send(family, a.ID, "one")
-	h.link(a.ID, protocol.LinkMessageStarted{Model: haiku})
-	if _, running := h.svc.RunningTurn(a.ID); running || h.row(a.ID).Status != "idle" {
-		t.Fatal("the turn survived a failed assistant insert")
+	h.link(a.ID, protocol.LinkMessageStarted{Model: haiku}, protocol.LinkTextDelta{Text: "lost"})
+	if _, running := h.svc.RunningTurn(a.ID); !running || h.row(a.ID).Status != "running" {
+		t.Fatal("the turn went idle before its result")
 	}
 	if n := len(h.events(a.ID, "message.started")); n != 0 {
 		t.Fatalf("message.started emitted for a message that was not stored (%d)", n)
@@ -232,7 +234,26 @@ func TestStoreFailureFailsTurnNotCompletes(t *testing.T) {
 		t.Fatalf("error events = %+v", errs)
 	}
 	if got := h.cond.Interrupts(); !reflect.DeepEqual(got, []string{a.ID}) {
-		t.Fatalf("interrupts = %v, want the abandoned turn interrupted", got)
+		t.Fatalf("interrupts = %v, want the abandoned turn interrupted once", got)
+	}
+	ra := result("sdk-a", "lost", 0.02)
+	h.link(a.ID, ra)
+	if len(h.led.turns) != 1 || h.led.turns[0].sessionID != a.ID || !reflect.DeepEqual(h.led.turns[0].usage, ra.Usage) {
+		t.Fatalf("ledger turns = %+v, want the abandoned turn's spend", h.led.turns)
+	}
+	if row := h.row(a.ID); row.Status != "idle" || row.LastTotals == nil || !reflect.DeepEqual(*row.LastTotals, ra.Totals) {
+		t.Fatalf("after the result: status %q, last_totals %+v", row.Status, row.LastTotals)
+	}
+	if asst := h.messages(a.ID, "assistant"); len(asst) != 0 {
+		t.Fatalf("assistant messages = %+v, want none stored", asst)
+	}
+	// Without a result, a host close ends it, with nothing ledgered.
+	c := h.newSession(family)
+	h.send(family, c.ID, "three")
+	h.link(c.ID, protocol.LinkMessageStarted{Model: haiku})
+	h.hostState(protocol.HostState{SessionID: c.ID, State: "closed", Reason: "error"})
+	if _, running := h.svc.RunningTurn(c.ID); running || h.row(c.ID).Status != "idle" || len(h.led.turns) != 1 {
+		t.Fatal("a host close did not end the abandoned turn, or something was ledgered")
 	}
 	h.sql(`drop trigger fail_asst_insert on messages`)
 
@@ -253,7 +274,7 @@ func TestStoreFailureFailsTurnNotCompletes(t *testing.T) {
 	if asst := h.messages(b.ID, "assistant"); len(asst) != 1 || asst[0].Status != "error" {
 		t.Fatalf("assistant message = %+v, want error", asst)
 	}
-	if len(h.led.turns) != 1 || h.led.turns[0].sessionID != b.ID {
+	if len(h.led.turns) != 2 || h.led.turns[1].sessionID != b.ID {
 		t.Fatalf("ledger turns = %+v, want the real spend recorded", h.led.turns)
 	}
 	if row := h.row(b.ID); row.LastTotals != nil || row.Status != "idle" {
@@ -317,6 +338,172 @@ func TestTaintFromConductorFlag(t *testing.T) {
 	}
 }
 
+// S48: no turn_result 120 s after a link error → host.close{error} and the
+// turn fails; the message keeps the error the client was already told.
+func TestErrorWithoutResultClosesHostAfter120s(t *testing.T) {
+	h := newHarness(t)
+	ses := h.newSession(family)
+	h.send(family, ses.ID, "hi")
+	h.link(ses.ID, protocol.LinkMessageStarted{Model: haiku}, protocol.LinkError{Code: protocol.CodeOverloaded, Retryable: true})
+	h.advance(ses.ID, 119*time.Second)
+	if _, running := h.svc.RunningTurn(ses.ID); !running || len(h.cond.Closes()) != 0 {
+		t.Fatal("the turn was given up before 120 s")
+	}
+	h.advance(ses.ID, time.Second)
+	if _, running := h.svc.RunningTurn(ses.ID); running || h.row(ses.ID).Status != "idle" {
+		t.Fatal("the turn is still open 120 s after its error")
+	}
+	if got := h.cond.Closes(); !reflect.DeepEqual(got, []string{ses.ID + ":error"}) {
+		t.Fatalf("host.close calls = %v, want one with reason error", got)
+	}
+	if asst := h.messages(ses.ID, "assistant"); len(asst) != 1 || asst[0].Status != "error" || *asst[0].ErrorCode != protocol.CodeOverloaded {
+		t.Fatalf("assistant message = %+v", asst)
+	}
+	if n, c := len(h.events(ses.ID, "error")), len(h.events(ses.ID, "message.completed")); n != 1 || c != 1 || len(h.led.turns) != 0 {
+		t.Fatalf("error events %d, message.completed %d, ledger turns %d; want 1, 1, 0", n, c, len(h.led.turns))
+	}
+	h.send(family, ses.ID, "again")
+	if n := len(h.cond.Opens()); n != 2 {
+		t.Fatalf("host.open sent %d times, want 2 (Core closed the host)", n)
+	}
+}
+
+// S48: a turn running LUMA_TURN_MAX_MINUTES (default 15) is interrupted; no
+// turn_result 30 s later → host.close{error} and upstream_error.
+func TestTurnWallClockCapInterruptsThenFails(t *testing.T) {
+	h := newHarness(t)
+	ses := h.newSession(family)
+	h.send(family, ses.ID, "a long one")
+	h.link(ses.ID, protocol.LinkMessageStarted{Model: haiku})
+	h.advance(ses.ID, 15*time.Minute-time.Second)
+	if n := len(h.cond.Interrupts()); n != 0 {
+		t.Fatalf("interrupted %d times before the cap", n)
+	}
+	h.advance(ses.ID, time.Second)
+	if got := h.cond.Interrupts(); !reflect.DeepEqual(got, []string{ses.ID}) {
+		t.Fatalf("interrupts at the cap = %v", got)
+	}
+	h.advance(ses.ID, 29*time.Second)
+	if _, running := h.svc.RunningTurn(ses.ID); !running {
+		t.Fatal("the turn failed before the 30 s grace ran out")
+	}
+	h.advance(ses.ID, time.Second)
+	if _, running := h.svc.RunningTurn(ses.ID); running || h.row(ses.ID).Status != "idle" {
+		t.Fatal("the turn is still open after the interrupt grace")
+	}
+	if errs := h.events(ses.ID, "error"); len(errs) != 1 || errs[0].Body != (protocol.ErrorEvent{Code: protocol.CodeUpstreamError, Retryable: true}) {
+		t.Fatalf("error events = %+v", errs)
+	}
+	if got := h.cond.Closes(); !reflect.DeepEqual(got, []string{ses.ID + ":error"}) {
+		t.Fatalf("host.close calls = %v", got)
+	}
+
+	// The cap comes from Config.TurnMax (LUMA_TURN_MAX_MINUTES).
+	cond := &fakeConductor{}
+	short := h.service(cond, func(c *Config) { c.TurnMax = 5 * time.Minute })
+	s2, err := short.Create(bg, family, protocol.CreateSession{Agent: "luma"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := short.Send(bg, family, s2.ID, userMsg("hi", newClientID())); err != nil {
+		t.Fatal(err)
+	}
+	h.clk.Advance(5 * time.Minute)
+	if err := short.call(bg, s2.ID, func(context.Context, *actor) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if got := cond.Interrupts(); !reflect.DeepEqual(got, []string{s2.ID}) {
+		t.Fatalf("interrupts with a 5 minute cap = %v", got)
+	}
+}
+
+// A turn_result in time cancels the backstops.
+func TestTurnCapCancelledByResult(t *testing.T) {
+	h := newHarness(t)
+	ses := h.newSession(family)
+	h.send(family, ses.ID, "one")
+	h.advance(ses.ID, 15*time.Minute)
+	h.link(ses.ID, protocol.LinkMessageStarted{Model: haiku}, result("sdk-1", "made it", 0.01))
+	h.advance(ses.ID, time.Minute)
+	if errs := h.events(ses.ID, "error"); len(errs) != 0 || len(h.cond.Closes()) != 0 {
+		t.Fatalf("a turn that finished inside its grace got errors %+v and closes %v", errs, h.cond.Closes())
+	}
+	if asst := h.messages(ses.ID, "assistant"); len(asst) != 1 || asst[0].Status != "complete" {
+		t.Fatalf("assistant message = %+v", asst)
+	}
+	h.send(family, ses.ID, "two")
+	h.link(ses.ID, protocol.LinkError{Code: protocol.CodeRateLimited, Retryable: true}, result("sdk-2", "", 0))
+	h.advance(ses.ID, 20*time.Minute)
+	if n, c := len(h.cond.Interrupts()), len(h.cond.Closes()); n != 1 || c != 0 {
+		t.Fatalf("interrupts %d, closes %d after finished turns; their timers must stop", n, c)
+	}
+}
+
+// A link error whose message cannot be stored leaves no message `running`:
+// the turn waits for its result without retrying the insert (round 2,
+// minor 2). The first assistant insert fails, later ones would succeed.
+func TestErrorInsertFailureLeavesNoRunningMessage(t *testing.T) {
+	h := newHarness(t)
+	h.sql(`create sequence luma_fail_once`)
+	h.sql(`grant usage on sequence luma_fail_once to public`) // the store's role runs the trigger
+	h.sql(`create function luma_fail_first() returns trigger language plpgsql as $$
+		begin if nextval('luma_fail_once') = 1 then raise exception 'injected failure'; end if; return new; end $$`)
+	h.sql(`create trigger fail_first_asst before insert on messages for each row when (new.role = 'assistant') execute function luma_fail_first()`)
+	ses := h.newSession(family)
+	h.send(family, ses.ID, "hi")
+	h.link(ses.ID, protocol.LinkError{Code: protocol.CodeOverloaded, Retryable: true},
+		protocol.LinkTextDelta{Text: "late"}, result("sdk-1", "late", 0.01))
+	for _, m := range h.messages(ses.ID, "assistant") {
+		if m.Status == "running" {
+			t.Fatalf("assistant message left running: %+v", m)
+		}
+	}
+	if len(h.led.turns) != 1 || h.row(ses.ID).Status != "idle" || len(h.events(ses.ID, "error")) != 1 {
+		t.Fatalf("ledger %d, status %q, error events %d; want 1, idle, 1",
+			len(h.led.turns), h.row(ses.ID).Status, len(h.events(ses.ID, "error")))
+	}
+}
+
+// Tainting a session deleted under its turn is nothing to taint: it must not
+// pin the actor with an unsaved taint (round 2, minor 4).
+func TestTaintOfDeletedSessionDoesNotPinActor(t *testing.T) {
+	h := newHarness(t)
+	ses := h.newSession(family)
+	h.send(family, ses.ID, "fetch it")
+	h.link(ses.ID, protocol.LinkMessageStarted{Model: haiku})
+	if err := h.st.DeleteTree(bg, family.ID, ses.ID); err != nil {
+		t.Fatal(err)
+	}
+	h.link(ses.ID, protocol.LinkToolStarted{ToolUseID: "tu1", Name: "WebFetch", Summary: "example.test"})
+	h.svc.OnConductorLost([]string{ses.ID})
+	h.flush(ses.ID)
+	deadline := time.Now().Add(3 * time.Second)
+	for h.actorCount() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the deleted session's actor is still alive")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// An unsaved taint is retried when the turn ends too (round 2, minor 5).
+func TestUnsavedTaintRetriedWhenTurnEnds(t *testing.T) {
+	h := newHarness(t)
+	h.sql(`create function luma_fail() returns trigger language plpgsql as $$ begin raise exception 'injected failure'; end $$`)
+	h.sql(`create trigger fail_taint before update on sessions for each row when (old.tainted_at is distinct from new.tainted_at) execute function luma_fail()`)
+	ses := h.newSession(family)
+	h.send(family, ses.ID, "fetch it")
+	h.link(ses.ID, protocol.LinkMessageStarted{Model: haiku}, protocol.LinkToolStarted{ToolUseID: "tu1", Name: "WebFetch", Summary: "example.test"})
+	if h.row(ses.ID).TaintedAt != nil {
+		t.Fatal("the injected failure did not stop the taint write")
+	}
+	h.sql(`drop trigger fail_taint on sessions`)
+	h.link(ses.ID, result("sdk-1", "done", 0.01))
+	if h.row(ses.ID).TaintedAt == nil {
+		t.Fatal("the unsaved taint was not stored when the turn ended")
+	}
+}
+
 func TestConductorLostFailsRunningTurn(t *testing.T) {
 	h := newHarness(t)
 	ses := h.newSession(family)
@@ -369,11 +556,17 @@ func TestSweepOnStartFailsStuckTurns(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A turn whose message already settled only goes idle: no restart error.
+	// Each still ends with exactly one message.completed (the errored one's
+	// comes from the sweep).
 	for _, c := range []struct {
 		id     string
 		errs   int
 		status string
 	}{{finished.ID, 0, "complete"}, {errored.ID, 1, "error"}} {
+		if completed := h.events(c.id, "message.completed"); len(completed) != 1 ||
+			completed[0].Body.(protocol.MessageCompleted).Message.Status != c.status {
+			t.Errorf("session %s message.completed = %+v, want one with status %s", c.id, completed, c.status)
+		}
 		if st := h.row(c.id).Status; st != "idle" {
 			t.Errorf("session %s status = %q, want idle", c.id, st)
 		}

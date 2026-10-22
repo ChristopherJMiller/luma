@@ -119,7 +119,7 @@ export interface TurnInterrupt {
 export interface HostClose {
   type: 'host.close'
   session_id: string
-  reason: 'deleted' | 'shutdown' | 'maintenance'
+  reason: 'deleted' | 'shutdown' | 'maintenance' | 'error' // error: Core gave up on a stuck turn (S48)
 }
 
 /** Remove the tree's project dirs after its hosts close, even when none is open (S14). */
