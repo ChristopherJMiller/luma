@@ -548,6 +548,62 @@ func TestRunningSessionsAndStatus(t *testing.T) {
 	}
 }
 
+// ListRoots pages a person's roots newest first, ties by id (descending),
+// after a keyset cursor (C1 GET /v1/sessions?after=). Forks, other people's
+// roots and (unless asked) archived roots are not listed.
+func TestListRootsPagesNewestFirst(t *testing.T) {
+	s := storetest.New(t)
+	for _, id := range []string{"ses_a", "ses_b", "ses_c", "ses_d"} {
+		newSession(t, s, id)
+	}
+	newFork(t, s, "ses_a_fork", "ses_a", "ses_a")
+	if _, err := s.CreateSession(ctx, store.Session{
+		ID: "ses_x", PersonID: "erin", AgentID: "luma", AgentVersion: "abc123",
+		Tier: "fast", Model: "claude-haiku-5-5", HelperModel: "claude-haiku-5-5",
+		Effort: "low", CacheTTL: "1h", APIWorkspace: "interactive", Source: "web",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ArchiveSession(ctx, "ses_d", true); err != nil {
+		t.Fatal(err)
+	}
+	// b is newest; a and c tie; d is oldest. The fork and erin's root are
+	// newer than all of them and must still not appear.
+	su := storetest.ConnAs(t, s, storetest.Superuser)
+	if _, err := su.Exec(ctx, `update sessions set updated_at = case id
+		when 'ses_b' then timestamptz '2026-10-20 12:00:03.000001Z'
+		when 'ses_a' then timestamptz '2026-10-20 12:00:02Z'
+		when 'ses_c' then timestamptz '2026-10-20 12:00:02Z'
+		when 'ses_d' then timestamptz '2026-10-20 12:00:01Z'
+		else timestamptz '2026-10-20 12:00:09Z' end`); err != nil {
+		t.Fatal(err)
+	}
+	ids := func(ss []store.Session) []string {
+		out := []string{}
+		for _, x := range ss {
+			out = append(out, x.ID)
+		}
+		return out
+	}
+	page1, err := s.ListRoots(ctx, "chris", false, nil, 2)
+	if err != nil || fmt.Sprint(ids(page1)) != "[ses_b ses_c]" {
+		t.Fatalf("page 1 = %v, %v; want [ses_b ses_c]", ids(page1), err)
+	}
+	last := page1[len(page1)-1]
+	page2, err := s.ListRoots(ctx, "chris", false, &store.RootCursor{UpdatedAt: last.UpdatedAt, ID: last.ID}, 2)
+	if err != nil || fmt.Sprint(ids(page2)) != "[ses_a]" {
+		t.Fatalf("page 2 = %v, %v; want [ses_a]", ids(page2), err)
+	}
+	all, err := s.ListRoots(ctx, "chris", true, nil, 10)
+	if err != nil || fmt.Sprint(ids(all)) != "[ses_b ses_c ses_a ses_d]" {
+		t.Fatalf("with archived = %v, %v; want [ses_b ses_c ses_a ses_d]", ids(all), err)
+	}
+	end, err := s.ListRoots(ctx, "chris", true, &store.RootCursor{UpdatedAt: all[3].UpdatedAt, ID: all[3].ID}, 10)
+	if err != nil || len(end) != 0 {
+		t.Fatalf("after the oldest = %v, %v; want none", ids(end), err)
+	}
+}
+
 func TestMessagesRoundTripWithTurnID(t *testing.T) {
 	s := storetest.New(t)
 	newSession(t, s, "ses_a")

@@ -137,12 +137,27 @@ func (s *Store) TreeSessions(ctx context.Context, rootID string) ([]Session, err
 	return out, rows.Err()
 }
 
+// RootCursor is where a page of ListRoots ends: the last listed root's
+// updated_at and id. The next page lists the roots after it.
+type RootCursor struct {
+	UpdatedAt time.Time
+	ID        string
+}
+
 // ListRoots lists a person's conversations (tree roots), most recently
-// updated first. Archived ones are included only when asked.
-func (s *Store) ListRoots(ctx context.Context, personID string, includeArchived bool, limit int) ([]Session, error) {
+// updated first, ties by id descending, after the cursor when one is given
+// (keyset paging, C1 GET /v1/sessions?after=). Archived ones are included
+// only when asked.
+func (s *Store) ListRoots(ctx context.Context, personID string, includeArchived bool, after *RootCursor, limit int) ([]Session, error) {
+	var afterAt *time.Time
+	afterID := ""
+	if after != nil {
+		afterAt, afterID = &after.UpdatedAt, after.ID
+	}
 	rows, err := s.pool.Query(ctx, `select `+sessionCols+` from sessions
 		where person_id = $1 and id = root_id and ($2 or archived_at is null)
-		order by updated_at desc, id limit $3`, personID, includeArchived, limit)
+			and ($3::timestamptz is null or (updated_at, id) < ($3::timestamptz, $4::text))
+		order by updated_at desc, id desc limit $5`, personID, includeArchived, afterAt, afterID, limit)
 	if err != nil {
 		return nil, err
 	}

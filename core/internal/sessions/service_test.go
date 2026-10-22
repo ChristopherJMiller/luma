@@ -563,7 +563,7 @@ func TestCreateRefusedByGate(t *testing.T) {
 			t.Fatalf("Create with a %s gate: err = %v, want a RefusedError with that code", code, err)
 		}
 	}
-	if roots, err := h.st.ListRoots(bg, family.ID, true, 100); err != nil || len(roots) != 0 {
+	if roots, err := h.st.ListRoots(bg, family.ID, true, nil, 100); err != nil || len(roots) != 0 {
 		t.Fatalf("session rows after refused creates = %d (%v), want 0", len(roots), err)
 	}
 	if n := h.prof.Calls(); n != 0 {
@@ -615,7 +615,7 @@ func TestCreateRefusesSubagentAndAudience(t *testing.T) {
 		}
 	}
 	for _, p := range []auth.Person{family, admin} {
-		if roots, err := h.st.ListRoots(bg, p.ID, true, 100); err != nil || len(roots) != 0 {
+		if roots, err := h.st.ListRoots(bg, p.ID, true, nil, 100); err != nil || len(roots) != 0 {
 			t.Fatalf("%s has %d session rows after refusals (%v)", p.ID, len(roots), err)
 		}
 	}
@@ -631,7 +631,7 @@ func TestDeepTierAdminOnly(t *testing.T) {
 	if _, err := h.svc.Create(bg, family, deep); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("family deep: err = %v, want ErrInvalid", err)
 	}
-	if roots, _ := h.st.ListRoots(bg, family.ID, true, 100); len(roots) != 0 {
+	if roots, _ := h.st.ListRoots(bg, family.ID, true, nil, 100); len(roots) != 0 {
 		t.Fatal("a refused deep create wrote a row")
 	}
 	ses := h.create(admin, deep)
