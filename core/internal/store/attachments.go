@@ -47,6 +47,20 @@ func (s *Store) Attachment(ctx context.Context, id string) (Attachment, error) {
 	return a, err
 }
 
+// AttachmentMeta returns a person's attachment without its bytes (Data is
+// nil). Another person's attachment, or a missing one, is ErrNotFound.
+func (s *Store) AttachmentMeta(ctx context.Context, personID, id string) (Attachment, error) {
+	var a Attachment
+	err := s.pool.QueryRow(ctx, `select id, person_id, root_id, media_type, filename, size_bytes, width,
+		height, pages, sha256, created_at from attachments where id = $1 and person_id = $2`, id, personID).
+		Scan(&a.ID, &a.PersonID, &a.RootID, &a.MediaType, &a.Filename, &a.SizeBytes, &a.Width,
+			&a.Height, &a.Pages, &a.SHA256, &a.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Attachment{}, ErrNotFound
+	}
+	return a, err
+}
+
 // BindAttachments binds a person's unbound attachments to a tree. It returns
 // ErrNotFound (and binds nothing) if any id is missing, not the person's, or
 // already bound to another tree. Duplicate ids count once.

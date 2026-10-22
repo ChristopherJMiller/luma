@@ -141,6 +141,23 @@ func (s *Store) Migrate(ctx context.Context) error {
 	return nil
 }
 
+// execer is the pool or a transaction, so one statement helper serves both.
+type execer interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+// execOne runs a statement that must touch a row; none is ErrNotFound.
+func execOne(ctx context.Context, db execer, sql string, args ...any) error {
+	tag, err := db.Exec(ctx, sql, args...)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // inTx runs fn in a transaction, rolling back on error.
 func (s *Store) inTx(ctx context.Context, fn func(tx pgx.Tx) error) error {
 	tx, err := s.pool.Begin(ctx)

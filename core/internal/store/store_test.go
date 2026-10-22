@@ -744,3 +744,22 @@ func TestCompleteTurnIsOneTransaction(t *testing.T) {
 		t.Fatalf("last_totals after a failed CompleteTurn = %+v, %v; want the earlier 0.5 (rolled back)", ses.LastTotals, err)
 	}
 }
+
+func TestAttachmentMetaOwnerOnlyWithoutBytes(t *testing.T) {
+	s := storetest.New(t)
+	w := 640
+	if err := s.InsertAttachment(ctx, store.Attachment{ID: "att_1", PersonID: "chris", MediaType: "image/png",
+		Filename: "kite.png", SizeBytes: 3, Width: &w, SHA256: "s1", Data: []byte{1, 2, 3}}); err != nil {
+		t.Fatal(err)
+	}
+	a, err := s.AttachmentMeta(ctx, "chris", "att_1")
+	if err != nil || a.ID != "att_1" || a.MediaType != "image/png" || a.Filename != "kite.png" || a.SizeBytes != 3 ||
+		a.Width == nil || *a.Width != 640 || a.Data != nil || a.CreatedAt.IsZero() {
+		t.Fatalf("AttachmentMeta = %+v, %v; want the metadata and no bytes", a, err)
+	}
+	for _, c := range []struct{ person, id string }{{"erin", "att_1"}, {"chris", "att_missing"}} {
+		if _, err := s.AttachmentMeta(ctx, c.person, c.id); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("AttachmentMeta(%s, %s) = %v, want ErrNotFound", c.person, c.id, err)
+		}
+	}
+}

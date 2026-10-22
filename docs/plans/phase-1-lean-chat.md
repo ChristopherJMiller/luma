@@ -287,7 +287,7 @@ The tasks refer to these by name. Each is defined once, here. Task 4 Step 5 may 
 | `POST /v1/sessions/{id}/archive` and `/unarchive` | `Session` |
 | `GET /v1/sessions/{root}/tree` | `{messages:[{message: Message, parent_id: string\|null, session_id}], head_id, last_event_ids:{[session_id]: number}, pending_writes: MemoryWrite[]}` |
 | `POST /v1/sessions/{id}/fork` | `{at_message}` → `Session` (P4) |
-| `POST /v1/sessions/{id}/events` | `ClientEvent` → `{message?: Message}`; 409 `busy`, 503 `maintenance`, 402 `budget_exhausted` |
+| `POST /v1/sessions/{id}/events` | `ClientEvent` → `{message?: Message}`; 409 `busy`, 503 `maintenance`, 402 `budget_exhausted`. A `user.message` whose `client_id` (a UUID) was seen before returns that message and starts nothing; the id is reserved **before** the Gate on purpose, so a repeat returns its message even after the Gate closes, and an id refused before its message existed is reused by its retry (Task 9a) |
 | `GET /v1/sessions/{id}/stream?since=<id>` | WebSocket, server → client `Event` frames; ping every 25 s |
 | `POST /v1/attachments` (multipart `file`) | `Attachment{id,media_type,filename,size_bytes,width?,height?,pages?}` |
 | `GET /v1/attachments/{id}`, `DELETE` | bytes (owner only) / 204 |
@@ -356,10 +356,16 @@ Frames are JSON `{type, ...}`. Hand-written fixtures for every type live in `pro
 - `hello{conductor_version, sdk_version, cli_version, max_hosts}`
 - `host.state{session_id, state:"ready"|"closed", sdk_session_id?, reason?: "idle"|"evicted"|"capacity"|"error"|"shutdown"|"deleted"|"maintenance"}`. The host sends `ready` when it opens, and **`ready` again with `sdk_session_id` as soon as the SDK reports the session id** (a fresh session learns it from its first `system/init`); Core persists any `sdk_session_id` it receives (S2).
 - `event{session_id, turn_id, event: LinkEvent}`
-- `rpc{rpc_id, session_id, turn_id, method:"memory.remember"|"memory.forget", params:{text, untrusted}}`
+- `rpc{rpc_id, session_id, turn_id, method:"memory.remember"|"memory.forget", params:{text, untrusted}}`. A set `untrusted` taints the session through its actor, `sessions.Service.Taint`, the one taint writer (S47; Task 13 calls it)
 - `tree.purged{root_id}`: the ack of `tree.purge`, sent once `pool.purgeTree` has closed the tree's hosts, let their `SessionStore` appends settle and removed the dirs (also after a purge that failed, which is logged). Added by Task 10 to the Go and TS protocol packages with fixture `protocol/fixtures/link/tree-purged.json`; additive, so compatible (S37, S39)
 
 Core accepts `event` and `rpc` only for a session opened **on this link**, and only with the session's **running** `turn_id`. Anything else is dropped and counted in `luma_link_rejected_total{reason}`.
+
+**Turn lifecycle (S45).** A turn starts with `turn.send` and runs until exactly one of:
+- **`turn_result`**, the terminal frame of every turn that reached an SDK result, failed ones included: every API failure surfaces as a `success` result with `is_error: true` that carries real usage (Spike S11). Core completes the assistant message (its `sdk_uuid` is the fork point), writes `last_totals`, ledgers the usage and sets the session idle;
+- **`host.state{closed}`** under the turn, or **link loss**: no result will come. Core fails the turn (`capacity`, `maintenance`, `conductor_restarted` or `upstream_error` by reason) and nothing is ledgered.
+
+A link `error` **does not end the turn**. It marks the turn's assistant message `error` with its `code` (storing the message if `message_started` never came) and emits the client `error{code, retryable}`; the turn still ends on its `turn_result`, which keeps the message's `error` status. Only the turn's first error reaches the client. So the conductor sends `error`, then `turn_result`, for a failed result, and never `turn_result` before `error`.
 
 **LinkEvent** (the turn is implied by the envelope):
 - `message_started{model}`: the first main-loop assistant stream of the turn
@@ -368,7 +374,7 @@ Core accepts `event` and `rpc` only for a session opened **on this link**, and o
 - `main_request_usage{api_message_id, model, slo_exclusion:"none"|"first"|"cold_resume"|"post_compaction", input, cache_read, cache_creation}`: the API message's own usage fields, so `input` is the **uncached** `input_tokens` (unlike the gateway's token `input`; S28)
 - `model_switched{from, to}`
 - `turn_result{sdk_uuid, content: MessagePart[], usage: TurnUsage, totals: Totals, cost_basis: string|null}`: Core persists `totals` as `sessions.last_totals` (S2). `cost_basis` comes from the result's `modelUsage[model].costBasis` (Spike S6: `list`, `managed` or `unknown`, per model)
-- `error{code, retryable, detail?: "thinking_binding"}`: Core increments `luma_thinking_binding_errors_total` on `detail: "thinking_binding"` (S16)
+- `error{code, retryable, detail?: "thinking_binding"}`: marks the turn's message and tells the client; the turn ends on its `turn_result` (S45, above). Core increments `luma_thinking_binding_errors_total` on `detail: "thinking_binding"` (S16)
 
 **Usage types:**
 - `TurnUsage = {models:{[model]:{input,output,cache_read,cache_creation,web_search_requests,cost_usd}}, cost_usd}` is a per-turn **delta**.
@@ -1231,6 +1237,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
   func (s *Service) SweepOnStart(ctx) error
   func (s *Service) Sink() EventSink
   func (s *Service) Tainted(ctx, sessionID string) (bool, error)
+  func (s *Service) Taint(ctx, sessionID string) error   // S47: through the actor, the one taint writer; Task 13's rpc calls it for params.untrusted
   func (s *Service) RunningTurn(sessionID string) (turnID string, ok bool)
   func NowContext(t time.Time, loc *time.Location) string   // "<luma-now>2026-10-18 (Sunday) 19:30 PDT</luma-now>"
   ```
@@ -1266,7 +1273,8 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
     - tool events add parts;
     - `main_request_usage` → `led.RecordMainRequest` (S3);
     - `turn_result` completes it with `sdk_uuid` and `content`, emits `message.completed` and `usage`, and calls `led.RecordTurn`.
-  - **Errors:** a link `error` emits the client `error{code, retryable}`. With `detail: "thinking_binding"`, it also increments `m.ThinkingBindingErrorsTotal` (S16).
+  - **Errors:** a link `error` emits the client `error{code, retryable}`. With `detail: "thinking_binding"`, it also increments `m.ThinkingBindingErrorsTotal` (S16). It marks the message `error` but does not end the turn: `turn_result` does (C2 turn lifecycle, S45).
+  - **Taint writes (S46):** a failed taint write keeps the session tainted in memory (`turn.send.untrusted`, `Tainted`) and is retried at the next turn's start; if the retry fails, that turn is refused (fail closed).
   - **Taint (P9):** `tool_started` for a name in `agent.untrusted_inputs` sets `tainted_at` if it is null.
   - **Model switch:** `model_switched` → `model.switched` plus the switched message's `model`, and `to` is appended to `bound_models`. No retry.
   - **Capacity:** `host.state{closed, reason:"capacity"}` while a turn is pending → `error{capacity, retryable:true}`, the message status becomes `error`, and the session goes `idle`.

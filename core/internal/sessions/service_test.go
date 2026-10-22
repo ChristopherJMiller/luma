@@ -266,6 +266,16 @@ type harness struct {
 	svc  *Service
 }
 
+// sql runs a statement as the database superuser: tests inject store
+// failures with triggers.
+func (h *harness) sql(q string) {
+	h.t.Helper()
+	conn := storetest.ConnAs(h.t, h.st, storetest.Superuser)
+	if _, err := conn.Exec(bg, q); err != nil {
+		h.t.Fatalf("%s: %v", q, err)
+	}
+}
+
 // counter reads an unlabelled counter from the harness's registry.
 func (h *harness) counter(name string) float64 {
 	h.t.Helper()
@@ -906,6 +916,20 @@ func TestUserMessageCarriesAttachmentParts(t *testing.T) {
 	stored := h.messages(ses.ID, "user")
 	if len(stored) != 1 || !reflect.DeepEqual(stored[0].Content, want) {
 		t.Fatalf("stored user message = %+v", stored)
+	}
+
+	// Core checks the owner itself, whatever the resolver said.
+	h.finish(ses.ID)
+	if err := h.st.InsertAttachment(bg, store.Attachment{ID: "att_3", PersonID: other.ID, MediaType: "text/plain",
+		Filename: "theirs.txt", SizeBytes: 1, SHA256: "s3", Data: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+	h.att.blocks["att_3"] = txt
+	if _, err := h.svc.Send(bg, family, ses.ID, userMsg("and this", newClientID(), "att_3")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("another person's attachment: err = %v, want ErrNotFound", err)
+	}
+	if n := len(h.messages(ses.ID, "user")); n != 1 {
+		t.Fatalf("user messages = %d, want still 1", n)
 	}
 }
 

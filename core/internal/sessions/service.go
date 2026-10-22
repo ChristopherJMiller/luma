@@ -121,6 +121,10 @@ type Service struct {
 	clock func() time.Time
 	cfg   Config
 
+	// appendEvent is st.AppendEvent: every event of a session is written
+	// through it, by that session's actor (a test counts the writers).
+	appendEvent func(ctx context.Context, sessionID, typ string, payload any, d store.Durability) (int64, error)
+
 	hub hub
 
 	mu      sync.Mutex
@@ -137,9 +141,10 @@ func NewService(st *store.Store, live *agents.Live, c Conductor, prof ProfileSou
 	cfg.WebFetchDenyDomains = append([]string{}, cfg.WebFetchDenyDomains...)
 	return &Service{
 		st: st, live: live, cond: c, prof: prof, att: att, gate: gate, led: led, m: m, clock: clock, cfg: cfg,
-		hub:     hub{subs: map[string]map[chan protocol.Event]struct{}{}},
-		actors:  map[string]*actor{},
-		running: map[string]string{},
+		appendEvent: st.AppendEvent,
+		hub:         hub{subs: map[string]map[chan protocol.Event]struct{}{}},
+		actors:      map[string]*actor{},
+		running:     map[string]string{},
 	}
 }
 
@@ -288,20 +293,24 @@ func (s *Service) OnConductorLost(sessionIDs []string) {
 	}
 }
 
-// SweepOnStart fails every turn a previous Core left running: the session gets
-// error{conductor_restarted}, its running message is marked error, and it
-// goes idle.
+// SweepOnStart settles every turn a previous Core left running: the session
+// gets error{conductor_restarted}, its running message is marked error, and
+// it goes idle (a turn whose message had already settled only goes idle). A
+// session it cannot settle is logged and counted, and the sweep goes on; only
+// failing to list the running sessions is an error.
 func (s *Service) SweepOnStart(ctx context.Context) error {
 	ids, err := s.st.RunningSessions(ctx)
 	if err != nil {
 		return err
 	}
+	failed := 0
 	for _, id := range ids {
 		if err := s.call(ctx, id, func(ctx context.Context, a *actor) error { return a.sweep(ctx) }); err != nil {
-			return fmt.Errorf("sessions: sweep %s: %w", id, err)
+			failed++
+			slog.Error("sessions: startup sweep could not settle a session", "session", id, "err", err)
 		}
 	}
-	slog.Info("sessions: startup sweep", "failed_turns", len(ids))
+	slog.Info("sessions: startup sweep", "running", len(ids), "unsettled", failed)
 	return nil
 }
 
@@ -317,12 +326,25 @@ func (s *Service) Tainted(ctx context.Context, sessionID string) (bool, error) {
 		if err := a.reload(ctx); err != nil {
 			return err
 		}
-		tainted = a.sess.TaintedAt != nil
+		tainted = a.tainted()
 		return nil
 	}); err != nil {
 		return false, err
 	}
 	return tainted, nil
+}
+
+// Taint marks the session tainted (P9) through its actor, the only taint
+// writer: the memory rpc calls it when the conductor's untrusted flag is set
+// (S47). If the write fails the session stays tainted in memory (S46) and the
+// error is returned.
+func (s *Service) Taint(ctx context.Context, sessionID string) error {
+	return s.call(ctx, sessionID, func(ctx context.Context, a *actor) error {
+		if err := a.load(ctx); err != nil {
+			return err
+		}
+		return a.taint(ctx)
+	})
 }
 
 // RunningTurn returns the session's running turn id. The link accepts events

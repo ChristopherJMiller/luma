@@ -178,15 +178,12 @@ func (s *Store) RunningSessions(ctx context.Context) ([]string, error) {
 }
 
 func (s *Store) updateSession(ctx context.Context, id, set string, args ...any) error {
-	tag, err := s.pool.Exec(ctx, `update sessions set `+set+`, updated_at = now() where id = $1`,
+	return updateSessionOn(ctx, s.pool, id, set, args...)
+}
+
+func updateSessionOn(ctx context.Context, db execer, id, set string, args ...any) error {
+	return execOne(ctx, db, `update sessions set `+set+`, updated_at = now() where id = $1`,
 		append([]any{id}, args...)...)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
 }
 
 // SetSDKSessionID records the SDK session id a host reported (S2). Task 9a
@@ -198,11 +195,15 @@ func (s *Store) SetSDKSessionID(ctx context.Context, sessionID, sdkSessionID str
 // SetLastTotals records the SDK's running totals from turn_result (S2); they
 // are the next HostSpec.resume's baseline.
 func (s *Store) SetLastTotals(ctx context.Context, sessionID string, t protocol.Totals) error {
+	return setLastTotals(ctx, s.pool, sessionID, t)
+}
+
+func setLastTotals(ctx context.Context, db execer, sessionID string, t protocol.Totals) error {
 	b, err := json.Marshal(t)
 	if err != nil {
 		return err
 	}
-	return s.updateSession(ctx, sessionID, `last_totals = $2`, b)
+	return updateSessionOn(ctx, db, sessionID, `last_totals = $2`, b)
 }
 
 // SetSessionStatus sets the status (idle, running, requires_action, error).

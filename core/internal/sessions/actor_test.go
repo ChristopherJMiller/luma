@@ -1,13 +1,18 @@
 package sessions
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ChristopherJMiller/luma/core/internal/protocol"
+	"github.com/ChristopherJMiller/luma/core/internal/store"
 )
 
 func TestOneAssistantMessagePerTurn(t *testing.T) {
@@ -120,7 +125,8 @@ func TestThinkingBindingDetailCounted(t *testing.T) {
 	ses := h.newSession(family)
 	h.send(family, ses.ID, "one")
 	h.link(ses.ID, protocol.LinkMessageStarted{Model: haiku},
-		protocol.LinkError{Code: protocol.CodeUpstreamError, Retryable: true, Detail: "thinking_binding"})
+		protocol.LinkError{Code: protocol.CodeUpstreamError, Retryable: true, Detail: "thinking_binding"},
+		result("sdk-1", "", 0))
 	if got := h.counter("luma_thinking_binding_errors_total"); got != 1 {
 		t.Fatalf("thinking binding errors = %v, want 1", got)
 	}
@@ -129,7 +135,7 @@ func TestThinkingBindingDetailCounted(t *testing.T) {
 		t.Fatalf("error events = %+v", errs)
 	}
 	h.send(family, ses.ID, "two")
-	h.link(ses.ID, protocol.LinkError{Code: protocol.CodeRateLimited, Retryable: true})
+	h.link(ses.ID, protocol.LinkError{Code: protocol.CodeRateLimited, Retryable: true}, result("sdk-2", "", 0))
 	if got := h.counter("luma_thinking_binding_errors_total"); got != 1 {
 		t.Fatalf("thinking binding errors after a plain error = %v, want still 1", got)
 	}
@@ -137,6 +143,177 @@ func TestThinkingBindingDetailCounted(t *testing.T) {
 	if len(asst) != 2 || asst[0].Status != "error" || *asst[0].ErrorCode != protocol.CodeUpstreamError ||
 		asst[1].Status != "error" || *asst[1].ErrorCode != protocol.CodeRateLimited {
 		t.Fatalf("assistant messages = %+v", asst)
+	}
+}
+
+// A link error marks the message and tells the client, but the turn ends on
+// its turn_result, whose spend is ledgered like any other (S45).
+func TestErrorThenTurnResultIsLedgered(t *testing.T) {
+	h := newHarness(t)
+	ses := h.newSession(family)
+	h.send(family, ses.ID, "hi")
+	turnID := h.lastSend().TurnID
+	h.link(ses.ID, protocol.LinkMessageStarted{Model: haiku}, protocol.LinkTextDelta{Text: "partial"},
+		protocol.LinkError{Code: protocol.CodeRateLimited, Retryable: true})
+	if _, running := h.svc.RunningTurn(ses.ID); !running || h.row(ses.ID).Status != "running" {
+		t.Fatal("a link error ended the turn; it ends on turn_result")
+	}
+	if asst := h.messages(ses.ID, "assistant"); len(asst) != 1 || asst[0].Status != "error" || *asst[0].ErrorCode != protocol.CodeRateLimited {
+		t.Fatalf("assistant message after the error = %+v", asst)
+	}
+	r := result("sdk-after-error", "partial", 0.004)
+	h.link(ses.ID, r)
+	m := h.messages(ses.ID, "assistant")[0]
+	if m.Status != "error" || *m.ErrorCode != protocol.CodeRateLimited || m.SDKUUID == nil || *m.SDKUUID != "sdk-after-error" {
+		t.Fatalf("assistant message = %+v; want status error, its code, and the result's sdk_uuid", m)
+	}
+	if len(h.led.turns) != 1 || h.led.turns[0].turnID != turnID || !reflect.DeepEqual(h.led.turns[0].usage, r.Usage) {
+		t.Fatalf("ledger turns = %+v, want the failed turn's spend", h.led.turns)
+	}
+	if got := h.row(ses.ID).LastTotals; got == nil || !reflect.DeepEqual(*got, r.Totals) {
+		t.Fatalf("last_totals = %+v", got)
+	}
+	if _, running := h.svc.RunningTurn(ses.ID); running || h.row(ses.ID).Status != "idle" {
+		t.Fatal("turn_result did not end the turn")
+	}
+	completed := h.events(ses.ID, "message.completed")
+	if len(completed) != 1 || completed[0].Body.(protocol.MessageCompleted).Message.Status != "error" {
+		t.Fatalf("message.completed = %+v", completed)
+	}
+	if n := len(h.events(ses.ID, "error")); n != 1 {
+		t.Fatalf("error events = %d, want 1", n)
+	}
+}
+
+// When no result will come, the host closing ends an errored turn; there is
+// no spend to ledger and the client is not told twice.
+func TestErrorThenHostCloseEndsTurn(t *testing.T) {
+	h := newHarness(t)
+	ses := h.newSession(family)
+	h.send(family, ses.ID, "hi")
+	h.link(ses.ID, protocol.LinkMessageStarted{Model: haiku}, protocol.LinkError{Code: protocol.CodeOverloaded, Retryable: true})
+	h.hostState(protocol.HostState{SessionID: ses.ID, State: "closed", Reason: "error"})
+	if _, running := h.svc.RunningTurn(ses.ID); running || h.row(ses.ID).Status != "idle" {
+		t.Fatal("the turn is still running after its host closed")
+	}
+	if len(h.led.turns) != 0 {
+		t.Fatalf("ledger turns = %+v, want none", h.led.turns)
+	}
+	if asst := h.messages(ses.ID, "assistant"); len(asst) != 1 || asst[0].Status != "error" || *asst[0].ErrorCode != protocol.CodeOverloaded {
+		t.Fatalf("assistant message = %+v, want the link error's code kept", asst)
+	}
+	errs := h.events(ses.ID, "error")
+	if len(errs) != 1 || errs[0].Body != (protocol.ErrorEvent{Code: protocol.CodeOverloaded, Retryable: true}) {
+		t.Fatalf("error events = %+v, want only the link's", errs)
+	}
+	if completed := h.events(ses.ID, "message.completed"); len(completed) != 1 {
+		t.Fatalf("message.completed events = %d, want 1", len(completed))
+	}
+}
+
+// A store failure on the assistant message fails the turn instead of
+// completing it (minor 7): no message.completed with status complete.
+func TestStoreFailureFailsTurnNotCompletes(t *testing.T) {
+	h := newHarness(t)
+	h.sql(`create function luma_fail() returns trigger language plpgsql as $$ begin raise exception 'injected failure'; end $$`)
+
+	// The assistant message cannot be inserted.
+	h.sql(`create trigger fail_asst_insert before insert on messages for each row when (new.role = 'assistant') execute function luma_fail()`)
+	a := h.newSession(family)
+	h.send(family, a.ID, "one")
+	h.link(a.ID, protocol.LinkMessageStarted{Model: haiku})
+	if _, running := h.svc.RunningTurn(a.ID); running || h.row(a.ID).Status != "idle" {
+		t.Fatal("the turn survived a failed assistant insert")
+	}
+	if n := len(h.events(a.ID, "message.started")); n != 0 {
+		t.Fatalf("message.started emitted for a message that was not stored (%d)", n)
+	}
+	if errs := h.events(a.ID, "error"); len(errs) != 1 || errs[0].Body != (protocol.ErrorEvent{Code: protocol.CodeUpstreamError, Retryable: true}) {
+		t.Fatalf("error events = %+v", errs)
+	}
+	if got := h.cond.Interrupts(); !reflect.DeepEqual(got, []string{a.ID}) {
+		t.Fatalf("interrupts = %v, want the abandoned turn interrupted", got)
+	}
+	h.sql(`drop trigger fail_asst_insert on messages`)
+
+	// The completion cannot be written.
+	b := h.newSession(family)
+	h.send(family, b.ID, "two")
+	h.link(b.ID, protocol.LinkMessageStarted{Model: haiku})
+	h.sql(`create trigger fail_complete before update on messages for each row when (new.status = 'complete') execute function luma_fail()`)
+	h.link(b.ID, result("sdk-b", "hello", 0.01))
+	for _, e := range h.events(b.ID, "message.completed") {
+		if st := e.Body.(protocol.MessageCompleted).Message.Status; st == "complete" {
+			t.Fatal("message.completed{complete} emitted for a completion that was not stored")
+		}
+	}
+	if errs := h.events(b.ID, "error"); len(errs) != 1 || errs[0].Body != (protocol.ErrorEvent{Code: protocol.CodeUpstreamError, Retryable: true}) {
+		t.Fatalf("error events = %+v", errs)
+	}
+	if asst := h.messages(b.ID, "assistant"); len(asst) != 1 || asst[0].Status != "error" {
+		t.Fatalf("assistant message = %+v, want error", asst)
+	}
+	if len(h.led.turns) != 1 || h.led.turns[0].sessionID != b.ID {
+		t.Fatalf("ledger turns = %+v, want the real spend recorded", h.led.turns)
+	}
+	if row := h.row(b.ID); row.LastTotals != nil || row.Status != "idle" {
+		t.Fatalf("row last_totals = %+v, status %q; want none (rolled back) and idle", row.LastTotals, row.Status)
+	}
+}
+
+// A taint that could not be written stays in force in memory, is retried at
+// the next turn's start, and fails that turn closed if it still cannot be
+// written (S46).
+func TestTaintWriteFailureIsStickyAndFailsClosed(t *testing.T) {
+	h := newHarness(t)
+	h.sql(`create function luma_fail() returns trigger language plpgsql as $$ begin raise exception 'injected failure'; end $$`)
+	h.sql(`create trigger fail_taint before update on sessions for each row when (old.tainted_at is distinct from new.tainted_at) execute function luma_fail()`)
+	ses := h.newSession(family)
+	h.send(family, ses.ID, "fetch it")
+	h.link(ses.ID, protocol.LinkMessageStarted{Model: haiku}, protocol.LinkToolStarted{ToolUseID: "tu1", Name: "WebFetch", Summary: "example.test"})
+	if h.row(ses.ID).TaintedAt != nil {
+		t.Fatal("the injected failure did not stop the taint write")
+	}
+	if tainted, err := h.svc.Tainted(bg, ses.ID); err != nil || !tainted {
+		t.Fatalf("Tainted = %v, %v; want true from memory", tainted, err)
+	}
+	h.link(ses.ID, result("sdk-1", "done", 0.01))
+	h.hostState(protocol.HostState{SessionID: ses.ID, State: "closed", Reason: "idle"})
+
+	sends := len(h.cond.Sends())
+	if _, err := h.svc.Send(bg, family, ses.ID, userMsg("again", newClientID())); err == nil || errors.Is(err, ErrBusy) {
+		t.Fatalf("Send with an unwritable taint: err = %v, want the turn failed closed", err)
+	}
+	if n := len(h.cond.Sends()); n != sends {
+		t.Fatalf("turn.sends went from %d to %d; a turn ran with its taint unwritten", sends, n)
+	}
+	if tainted, _ := h.svc.Tainted(bg, ses.ID); !tainted {
+		t.Fatal("the in-memory taint was lost")
+	}
+
+	h.sql(`drop trigger fail_taint on sessions`)
+	h.send(family, ses.ID, "third")
+	if h.row(ses.ID).TaintedAt == nil || !h.lastSend().Untrusted {
+		t.Fatal("the retried taint was not written, or the turn was not untrusted")
+	}
+}
+
+// The conductor's untrusted flag taints through the actor (S47).
+func TestTaintFromConductorFlag(t *testing.T) {
+	h := newHarness(t)
+	ses := h.newSession(family)
+	if err := h.svc.Taint(bg, ses.ID); err != nil {
+		t.Fatal(err)
+	}
+	if tainted, err := h.svc.Tainted(bg, ses.ID); err != nil || !tainted || h.row(ses.ID).TaintedAt == nil {
+		t.Fatalf("after Taint: tainted = %v, %v", tainted, err)
+	}
+	h.send(family, ses.ID, "hi")
+	if !h.lastSend().Untrusted {
+		t.Fatal("the turn after Taint was not untrusted")
+	}
+	if err := h.svc.Taint(bg, "ses_missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Taint of an unknown session = %v, want ErrNotFound", err)
 	}
 }
 
@@ -174,11 +351,38 @@ func TestSweepOnStartFailsStuckTurns(t *testing.T) {
 	done := h.newSession(family)
 	h.send(family, done.ID, "three")
 	h.finish(done.ID)
+	// Core died after completing the message but before going idle.
+	finished := h.newSession(family)
+	h.send(family, finished.ID, "four")
+	h.finish(finished.ID)
+	if err := h.st.SetSessionStatus(bg, finished.ID, "running"); err != nil {
+		t.Fatal(err)
+	}
+	// Core died after a link error, waiting for the turn_result (S45).
+	errored := h.newSession(family)
+	h.send(family, errored.ID, "five")
+	h.link(errored.ID, protocol.LinkMessageStarted{Model: haiku}, protocol.LinkError{Code: protocol.CodeOverloaded, Retryable: true})
 
 	// Core restarts: a new Service over the same store.
 	restarted := h.service(&fakeConductor{})
 	if err := restarted.SweepOnStart(bg); err != nil {
 		t.Fatal(err)
+	}
+	// A turn whose message already settled only goes idle: no restart error.
+	for _, c := range []struct {
+		id     string
+		errs   int
+		status string
+	}{{finished.ID, 0, "complete"}, {errored.ID, 1, "error"}} {
+		if st := h.row(c.id).Status; st != "idle" {
+			t.Errorf("session %s status = %q, want idle", c.id, st)
+		}
+		if n := len(h.events(c.id, "error")); n != c.errs {
+			t.Errorf("session %s error events = %d, want %d (none from the sweep)", c.id, n, c.errs)
+		}
+		if asst := h.messages(c.id, "assistant"); len(asst) != 1 || asst[0].Status != c.status {
+			t.Errorf("session %s assistant messages = %+v, want one left %s", c.id, asst, c.status)
+		}
 	}
 	for _, id := range []string{streamed.ID, queued.ID} {
 		if st := h.row(id).Status; st != "idle" {
@@ -198,6 +402,25 @@ func TestSweepOnStartFailsStuckTurns(t *testing.T) {
 	}
 	if n := len(h.events(done.ID, "error")); n != 0 {
 		t.Errorf("an idle session got %d error events", n)
+	}
+}
+
+// One session the sweep cannot handle does not stop it (minor 9).
+func TestSweepOnStartContinuesPastABadSession(t *testing.T) {
+	h := newHarness(t)
+	bad := h.newSession(family)
+	h.send(family, bad.ID, "one")
+	good := h.newSession(family)
+	h.send(family, good.ID, "two")
+	h.sql(`update sessions set agent_snapshot = '[1]' where id = '` + bad.ID + `'`) // no longer decodes
+	if err := h.service(&fakeConductor{}).SweepOnStart(bg); err != nil {
+		t.Fatalf("SweepOnStart = %v, want it to log the bad session and go on", err)
+	}
+	if st := h.row(good.ID).Status; st != "idle" {
+		t.Fatalf("the good session's status = %q, want idle", st)
+	}
+	if st := h.row(bad.ID).Status; st != "running" {
+		t.Fatalf("the bad session's status = %q; it could not be swept", st)
 	}
 }
 
@@ -279,8 +502,25 @@ func TestTaintFromWebFetchToolStarted(t *testing.T) {
 	}
 }
 
+// Sink emits and turn events are written by the session's one actor: no two
+// appends of the session ever overlap, and every stored event was appended
+// through that path. Each append is slowed so an overlap would show.
 func TestSinkEventsSerialisedWithTurnEvents(t *testing.T) {
 	h := newHarness(t)
+	var inflight, maxInflight, appends atomic.Int64
+	direct := h.svc.appendEvent
+	h.svc.appendEvent = func(ctx context.Context, sessionID, typ string, payload any, d store.Durability) (int64, error) {
+		n := inflight.Add(1)
+		defer inflight.Add(-1)
+		for {
+			if m := maxInflight.Load(); n <= m || maxInflight.CompareAndSwap(m, n) {
+				break
+			}
+		}
+		appends.Add(1)
+		time.Sleep(200 * time.Microsecond)
+		return direct(ctx, sessionID, typ, payload, d)
+	}
 	ses := h.newSession(family)
 	h.send(family, ses.ID, "hi")
 	turnID := h.lastSend().TurnID
@@ -342,6 +582,12 @@ func TestSinkEventsSerialisedWithTurnEvents(t *testing.T) {
 	}
 	if deltas != n {
 		t.Fatalf("text deltas stored = %d, want %d", deltas, n)
+	}
+	if got := maxInflight.Load(); got != 1 {
+		t.Fatalf("%d appends of the session overlapped; the actor is its only writer", got)
+	}
+	if got := appends.Load(); got != int64(len(all)) {
+		t.Fatalf("appends through the actor = %d, stored events = %d; something wrote around it", got, len(all))
 	}
 }
 
