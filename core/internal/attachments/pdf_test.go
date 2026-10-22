@@ -117,27 +117,29 @@ func TestPdfChildFailuresAreUnsupported(t *testing.T) {
 }
 
 // The real child runs under a 256 MiB committed-memory limit: a child that
-// allocates 512 MiB dies, and the parent's heap never sees it. A race build
-// cannot run under such a limit (see race_on.go), so this runs without
-// -race: make test-go runs it so.
+// commits 320 MiB dies, and the parent's heap never sees it. The same
+// allocation without the limit succeeds, so the limit is what kills it (the
+// runtime dies on whichever mapping is refused first, with an OOM throw, a
+// failed pthread_create in a cgo test binary, or a fault in the GC, so its
+// message is not checked). A race build cannot run under such a limit (see
+// race_on.go), so this runs without -race: make test-go runs it so.
 func TestPdfChildMemoryLimit(t *testing.T) {
 	if raceBuild {
 		t.Skip("RLIMIT_DATA cannot apply under the race detector; `make test-go` runs this test without -race")
 	}
-	cmd := exec.CommandContext(t.Context(), os.Args[0], PDFPagesCommand)
-	cmd.Env = []string{testChildEnv + "=alloc"}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	var exit *exec.ExitError
-	// The runtime dies on whichever mapping the limit refuses first: the
-	// heap, or (in a cgo test binary) a thread's stack.
-	oom := false
-	for _, s := range []string{"out of memory", "cannot allocate memory", "pthread_create failed"} {
-		oom = oom || strings.Contains(stderr.String(), s)
+	child := func(mode string) (string, error) {
+		cmd := exec.CommandContext(t.Context(), os.Args[0], PDFPagesCommand)
+		cmd.Env = []string{testChildEnv + "=" + mode}
+		out, err := cmd.Output()
+		return strings.TrimSpace(string(out)), err
 	}
-	if !errors.As(err, &exit) || exit.ExitCode() == 0 || !oom {
-		t.Fatalf("a child allocating 512 MiB = %v, stderr %.200q; want it killed by its memory limit", err, stderr.String())
+	if out, err := child("alloc-unlimited"); err != nil || out != "335544320" {
+		t.Fatalf("committing 320 MiB without the limit = %q, %v; want it to succeed", out, err)
+	}
+	out, err := child("alloc")
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() == 0 || out != "" {
+		t.Fatalf("committing 320 MiB under the limit = %q, %v; want the child killed", out, err)
 	}
 	// The real counter still works under the limit.
 	if n, err := pageCount(t.Context(), pdfBytes(t, 3, 1<<20)); err != nil || n != 3 {

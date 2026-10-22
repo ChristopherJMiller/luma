@@ -27,11 +27,19 @@ func TestMain(m *testing.M) {
 		if err := limitChildMemory(); err != nil {
 			os.Exit(3)
 		}
-		b := make([]byte, 512<<20)
-		for i := 0; i < len(b); i += 4096 {
-			b[i] = 1
-		}
-		fmt.Println(len(b))
+		allocate()
+	case "alloc-unlimited": // the same allocation without the limit
+		allocate()
 	}
 	os.Exit(0)
+}
+
+// allocate commits 320 MiB, past the child's 256 MiB limit, and prints its
+// size if it got it.
+func allocate() {
+	b := make([]byte, 320<<20)
+	for i := 0; i < len(b); i += 4096 {
+		b[i] = 1
+	}
+	fmt.Println(len(b))
 }
