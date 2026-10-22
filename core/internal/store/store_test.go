@@ -707,3 +707,40 @@ func TestListWebSessions(t *testing.T) {
 		t.Fatalf("ListWebSessions = %+v", got)
 	}
 }
+
+// CompleteTurn settles the assistant message and stores the running totals in
+// one transaction (S2, Task 9a): a message that is not there leaves the
+// session's last_totals untouched.
+func TestCompleteTurnIsOneTransaction(t *testing.T) {
+	s := storetest.New(t)
+	newSession(t, s, "ses_a")
+	if _, err := s.InsertMessage(ctx, protocol.Message{ID: "msg_1", SessionID: "ses_a", TurnID: "turn_1",
+		Role: "assistant", Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	totals := protocol.Totals{Models: map[string]protocol.ModelUsage{"claude-haiku-5-5": {Input: 7, Output: 3, CostUSD: 0.5}}, CostUSD: 0.5}
+	uuid := "sdk-uuid-9"
+	done := protocol.Message{ID: "msg_1", SessionID: "ses_a", TurnID: "turn_1", Role: "assistant", Status: "complete",
+		SDKUUID: &uuid, Content: []protocol.MessagePart{{Type: "text", Text: "done"}}}
+	if err := s.CompleteTurn(ctx, done, totals); err != nil {
+		t.Fatal(err)
+	}
+	m, err := s.Message(ctx, "msg_1")
+	if err != nil || m.Status != "complete" || m.SDKUUID == nil || *m.SDKUUID != uuid || len(m.Content) != 1 || m.Content[0].Text != "done" {
+		t.Fatalf("message = %+v, %v", m, err)
+	}
+	ses, err := s.Session(ctx, "ses_a")
+	if err != nil || ses.LastTotals == nil || ses.LastTotals.CostUSD != 0.5 || ses.LastTotals.Models["claude-haiku-5-5"].Input != 7 {
+		t.Fatalf("last_totals = %+v, %v", ses.LastTotals, err)
+	}
+
+	later := protocol.Totals{Models: map[string]protocol.ModelUsage{}, CostUSD: 9}
+	missing := protocol.Message{ID: "msg_missing", SessionID: "ses_a", Role: "assistant", Status: "complete"}
+	if err := s.CompleteTurn(ctx, missing, later); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("missing message: %v, want ErrNotFound", err)
+	}
+	ses, err = s.Session(ctx, "ses_a")
+	if err != nil || ses.LastTotals == nil || ses.LastTotals.CostUSD != 0.5 {
+		t.Fatalf("last_totals after a failed CompleteTurn = %+v, %v; want the earlier 0.5 (rolled back)", ses.LastTotals, err)
+	}
+}

@@ -95,6 +95,22 @@ type AgentFile struct {
 	Version string
 }
 
+// Admits reports whether a person of personTier may use the agent: audience
+// tier "" admits everyone, "family" admits family and admin, and "admin"
+// admits admin only. Session create (Task 9a) and /v1/agents (Task 15) both
+// filter with it.
+func (a AgentFile) Admits(personTier string) bool {
+	switch a.Audience.Tier {
+	case "":
+		return true
+	case "family":
+		return personTier == "family" || personTier == "admin"
+	case "admin":
+		return personTier == "admin"
+	}
+	return false
+}
+
 // ParseAgent parses one AGENT.md: strict YAML frontmatter, then the body.
 func ParseAgent(b []byte) (AgentFile, error) {
 	fm, body, err := splitFrontmatter(b)

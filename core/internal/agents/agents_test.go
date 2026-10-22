@@ -453,3 +453,23 @@ func TestGoldenTaskCount(t *testing.T) {
 		}
 	}
 }
+
+func TestAdmits(t *testing.T) {
+	cases := []struct {
+		audience, person string
+		want             bool
+	}{
+		{"", "admin", true},
+		{"", "family", true},
+		{"family", "admin", true},
+		{"family", "family", true},
+		{"admin", "admin", true},
+		{"admin", "family", false},
+	}
+	for _, c := range cases {
+		a := AgentFile{Name: "x", Audience: Audience{Tier: c.audience}}
+		if got := a.Admits(c.person); got != c.want {
+			t.Errorf("audience %q, person tier %q: Admits = %v, want %v", c.audience, c.person, got, c.want)
+		}
+	}
+}

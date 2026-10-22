@@ -108,6 +108,39 @@ func (s *Store) FinishMessage(ctx context.Context, m protocol.Message) error {
 	return nil
 }
 
+// CompleteTurn settles a turn's assistant message (as FinishMessage does) and
+// records the SDK's running totals as the session's last_totals, in one
+// transaction (S2): a message that is not there changes neither.
+func (s *Store) CompleteTurn(ctx context.Context, m protocol.Message, t protocol.Totals) error {
+	content, err := marshalContent(m.Content)
+	if err != nil {
+		return err
+	}
+	totals, err := json.Marshal(t)
+	if err != nil {
+		return err
+	}
+	return s.inTx(ctx, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `update sessions set last_totals = $2, updated_at = now() where id = $1`, m.SessionID, totals)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrNotFound
+		}
+		tag, err = tx.Exec(ctx, `update messages set content = $3, status = $4, sdk_uuid = $5,
+			model = $6, error_code = $7 where id = $1 and session_id = $2`,
+			m.ID, m.SessionID, content, m.Status, m.SDKUUID, m.Model, errorCodeArg(m.ErrorCode))
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
 // RecordClientEvent makes a client's user.message idempotent: the first call
 // for (session, client_id) stores messageID and reports inserted; a repeat
 // returns the message id stored the first time and inserted false.
