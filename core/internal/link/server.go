@@ -652,7 +652,8 @@ func (s *Server) reject(reason, what string, kv ...any) {
 // serveRPC runs a memory rpc and answers it on the link it came on. Anything
 // but a result is upstream_error; the error is logged with ids only.
 func (s *Server) serveRPC(c *conn, f protocol.RPC) {
-	res := protocol.RPCResult{RPCID: f.RPCID, OK: true, Result: &protocol.MemoryResult{Status: "disabled"}}
+	disabled := memoryDisabled
+	res := protocol.RPCResult{RPCID: f.RPCID, OK: true, Result: &disabled}
 	if s.h.RPC != nil {
 		params, err := json.Marshal(f.Params)
 		var r protocol.MemoryResult
@@ -681,6 +682,10 @@ func upstreamError() *protocol.ErrorInfo {
 
 // ---- memory rpc routing ----
 
+// memoryDisabled answers a memory rpc that reads and writes nothing, as
+// Task 13's memory does (C2, fixture link/rpc-result-disabled.json).
+var memoryDisabled = protocol.MemoryResult{Status: "disabled", Code: protocol.CodeMemoryDisabled}
+
 // SessionRows reads a session row; *store.Store implements it.
 type SessionRows interface {
 	Session(ctx context.Context, id string) (store.Session, error)
@@ -705,7 +710,7 @@ func MemoryRPC(rows SessionRows, mem Memory) RPCHandler {
 		if err := json.Unmarshal(params, &p); err != nil {
 			return protocol.MemoryResult{}, fmt.Errorf("link: rpc params: %w", err)
 		}
-		disabled := protocol.MemoryResult{Status: "disabled"}
+		disabled := memoryDisabled
 		sess, err := rows.Session(ctx, sessionID)
 		if errors.Is(err, store.ErrNotFound) {
 			return disabled, nil

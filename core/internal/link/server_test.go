@@ -1180,13 +1180,28 @@ func TestRPCRefusedForIncognito(t *testing.T) {
 		for _, method := range []string{"memory.remember", "memory.forget"} {
 			c.send(protocol.RPC{RPCID: id + method, SessionID: id, TurnID: "turn_1", Method: method, Params: protocol.RPCParams{Text: "something"}})
 			got, ok := c.next().(protocol.RPCResult)
-			if !ok || !got.OK || got.RPCID != id+method || got.Result == nil || *got.Result != (protocol.MemoryResult{Status: "disabled"}) {
-				t.Fatalf("%d %s %s: rpc.result = %#v, want disabled", i, id, method, got)
+			want := protocol.MemoryResult{Status: "disabled", Code: protocol.CodeMemoryDisabled}
+			if !ok || !got.OK || got.RPCID != id+method || got.Result == nil || *got.Result != want {
+				t.Fatalf("%d %s %s: rpc.result = %#v, want disabled with memory_disabled", i, id, method, got)
 			}
 		}
 	}
 	if got := mem.Calls(); len(got) != 0 {
 		t.Fatalf("memory was called: %v", got)
+	}
+}
+
+// With no memory handler wired, an rpc is answered disabled, with its code.
+func TestRPCWithoutMemoryIsDisabled(t *testing.T) {
+	h := newHarness(t)
+	c := h.connect(false)
+	h.open(c, "ses_A")
+	h.sess.setRunning("ses_A", "turn_1")
+	c.send(protocol.RPC{RPCID: "rpc_1", SessionID: "ses_A", TurnID: "turn_1", Method: "memory.remember", Params: protocol.RPCParams{Text: "something"}})
+	got, ok := c.next().(protocol.RPCResult)
+	want := protocol.MemoryResult{Status: "disabled", Code: protocol.CodeMemoryDisabled}
+	if !ok || !got.OK || got.Result == nil || *got.Result != want {
+		t.Fatalf("rpc.result = %#v, want disabled with memory_disabled", got)
 	}
 }
 
