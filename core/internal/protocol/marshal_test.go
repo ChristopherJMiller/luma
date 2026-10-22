@@ -128,9 +128,10 @@ func TestMarshalCarriesTheTypeTag(t *testing.T) {
 		protocol.HostOpen{}, protocol.TurnSend{}, protocol.TurnInterrupt{}, protocol.HostClose{},
 		protocol.TreePurge{}, protocol.RPCResult{}, protocol.Shutdown{}, protocol.Hello{},
 		protocol.HostState{}, protocol.EventFrame{Event: protocol.LinkTextDelta{}}, protocol.RPC{},
+		protocol.TreePurged{},
 	}
 	wantTypes := []string{"host.open", "turn.send", "turn.interrupt", "host.close", "tree.purge",
-		"rpc.result", "shutdown", "hello", "host.state", "event", "rpc"}
+		"rpc.result", "shutdown", "hello", "host.state", "event", "rpc", "tree.purged"}
 	for i, f := range frames {
 		b, err := json.Marshal(f)
 		if err != nil {

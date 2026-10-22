@@ -187,6 +187,16 @@ export interface Rpc {
   params: { text: string; untrusted: boolean }
 }
 
+/**
+ * The ack of `tree.purge`: sent once the tree's hosts are closed and its
+ * project dirs removed, also after a purge that failed (logged). Core deletes
+ * the tree's rows after it (S39).
+ */
+export interface TreePurged {
+  type: 'tree.purged'
+  root_id: string
+}
+
 export type LinkFrame =
   | HostOpen
   | TurnSend
@@ -199,6 +209,7 @@ export type LinkFrame =
   | HostState
   | EventFrame
   | Rpc
+  | TreePurged
 
 // ---- LinkEvent (the turn is implied by the envelope) ----
 

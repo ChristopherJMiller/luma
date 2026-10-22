@@ -509,6 +509,7 @@ export const LINK_FRAME_FIELD = union({
     method: str,
     params: obj({ text: str, untrusted: bool } satisfies Spec<Of<LinkFrame, 'rpc'>['params']>),
   } satisfies Spec<Of<LinkFrame, 'rpc'>>,
+  'tree.purged': { type: lit('tree.purged'), root_id: str } satisfies Spec<Of<LinkFrame, 'tree.purged'>>,
 })
 
 // ---- C10: internal endpoints ----

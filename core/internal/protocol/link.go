@@ -106,6 +106,13 @@ type RPC struct {
 	Params    RPCParams `json:"params"`
 }
 
+// TreePurged is `tree.purged`, the ack of tree.purge, sent once the tree's
+// hosts are closed and its project dirs removed (or the purge failed and was
+// logged). Core deletes the tree's rows after it (S39).
+type TreePurged struct {
+	RootID string `json:"root_id"`
+}
+
 func (HostOpen) FrameType() string      { return "host.open" }
 func (TurnSend) FrameType() string      { return "turn.send" }
 func (TurnInterrupt) FrameType() string { return "turn.interrupt" }
@@ -117,6 +124,7 @@ func (Hello) FrameType() string         { return "hello" }
 func (HostState) FrameType() string     { return "host.state" }
 func (EventFrame) FrameType() string    { return "event" }
 func (RPC) FrameType() string           { return "rpc" }
+func (TreePurged) FrameType() string    { return "tree.purged" }
 
 type eventFrameJSON struct {
 	SessionID string          `json:"session_id"`
@@ -174,6 +182,8 @@ func newFrame(typ string) LinkFrame {
 		return &EventFrame{}
 	case "rpc":
 		return &RPC{}
+	case "tree.purged":
+		return &TreePurged{}
 	}
 	return nil
 }

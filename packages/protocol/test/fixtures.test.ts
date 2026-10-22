@@ -137,6 +137,7 @@ const frames: [string, string][] = [
   ['host-close.json', 'host.close'],
   ['host-close-error.json', 'host.close'],
   ['tree-purge.json', 'tree.purge'],
+  ['tree-purged.json', 'tree.purged'],
   ['rpc-result-applied.json', 'rpc.result'],
   ['rpc-result-full.json', 'rpc.result'],
   ['rpc-result-rejected.json', 'rpc.result'],
@@ -237,6 +238,19 @@ describe('round-trips every fixture', () => {
       })
     }
   }
+})
+
+// tree.purged is the conductor's ack of tree.purge (S39).
+describe('tree.purged', () => {
+  it('tree-purged.json decodes to the ack of its root and re-encodes unchanged', () => {
+    const raw = load('link', 'tree-purged.json')
+    const f = decodeLinkFrame(raw)
+    expect(f).toEqual({ type: 'tree.purged', root_id: 'ses_01J9ZQ3M5K7N8P2R4T6V8W0XYA' })
+    expect(JSON.parse(JSON.stringify(f))).toEqual({ type: 'tree.purged', root_id: 'ses_01J9ZQ3M5K7N8P2R4T6V8W0XYA' })
+  })
+  it('a tree.purged without root_id is rejected', () => {
+    expect(() => decodeLinkFrame({ type: 'tree.purged' })).toThrow(/missing key root_id/)
+  })
 })
 
 describe('fixture table', () => {

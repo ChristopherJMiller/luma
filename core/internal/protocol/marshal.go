@@ -169,6 +169,11 @@ func (f RPC) MarshalJSON() ([]byte, error) {
 	return marshalTyped(f.FrameType(), plain(f))
 }
 
+func (f TreePurged) MarshalJSON() ([]byte, error) {
+	type plain TreePurged
+	return marshalTyped(f.FrameType(), plain(f))
+}
+
 // ---- C10 ----
 
 func (s EvalSpec) MarshalJSON() ([]byte, error) {

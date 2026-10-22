@@ -96,6 +96,7 @@ var linkFixtures = []fixture{
 	{"host-close.json", "host.close", linkFrame},
 	{"host-close-error.json", "host.close", linkFrame},
 	{"tree-purge.json", "tree.purge", linkFrame},
+	{"tree-purged.json", "tree.purged", linkFrame},
 	{"rpc-result-applied.json", "rpc.result", linkFrame},
 	{"rpc-result-full.json", "rpc.result", linkFrame},
 	{"rpc-result-rejected.json", "rpc.result", linkFrame},
@@ -210,7 +211,7 @@ func TestEveryWireTypeHasAFixture(t *testing.T) {
 		"tool.started", "tool.finished", "message.completed", "model.switched", "memory.write", "usage", "error"}
 	wantClient := []string{"user.message", "user.interrupt"}
 	wantFrames := []string{"host.open", "turn.send", "turn.interrupt", "host.close", "tree.purge", "rpc.result",
-		"shutdown", "hello", "host.state", "event", "rpc"}
+		"shutdown", "hello", "host.state", "event", "rpc", "tree.purged"}
 	wantLinkEvents := []string{"message_started", "text_delta", "tool_started", "tool_finished",
 		"main_request_usage", "model_switched", "turn_result", "error"}
 
@@ -350,6 +351,27 @@ func TestDecodedValuesAreWhatTheFixtureSays(t *testing.T) {
 	if !ok || e.ID != 110 || u.TurnID != "turn_01J9ZQ3M5K7N8P2R4T6V8W0XYT" || u.CostUSD != 0.0125 {
 		t.Fatalf("event = %#v", e)
 	}
+}
+
+// tree.purged is the conductor's ack of tree.purge (S39): it decodes to
+// TreePurged with the fixture's root and re-encodes to the same JSON.
+func TestTreePurgedFixtureRoundTrips(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join(fixtureDir(t, "link"), "tree-purged.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := protocol.DecodeLinkFrame(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (protocol.TreePurged{RootID: "ses_01J9ZQ3M5K7N8P2R4T6V8W0XYA"}); f != want {
+		t.Fatalf("decoded %#v, want %#v", f, want)
+	}
+	out, err := protocol.EncodeLinkFrame(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jsonEqual(t, []byte(`{"type":"tree.purged","root_id":"ses_01J9ZQ3M5K7N8P2R4T6V8W0XYA"}`), out)
 }
 
 func TestMaxAttachmentBytes(t *testing.T) {
