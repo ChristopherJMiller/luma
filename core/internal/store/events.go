@@ -64,6 +64,14 @@ func (s *Store) appendEvent(ctx context.Context, db txBeginner, sessionID, typ s
 	return id, tx.Commit(ctx)
 }
 
+// LastEventID returns the id of a session's newest event, or 0 when it has
+// none: a stream opened with since=<it> replays every later event (C1 /tree).
+func (s *Store) LastEventID(ctx context.Context, sessionID string) (int64, error) {
+	var id int64
+	err := s.pool.QueryRow(ctx, `select coalesce(max(id), 0) from events where session_id = $1`, sessionID).Scan(&id)
+	return id, err
+}
+
 // EventsSince returns up to limit events of a session with id > since, oldest
 // first, decoded into protocol events. A stored event that cannot be decoded
 // ends the read with an *EventDecodeError, returned together with the events

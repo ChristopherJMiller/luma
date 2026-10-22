@@ -859,3 +859,68 @@ func TestAttachmentMetaOwnerOnlyWithoutBytes(t *testing.T) {
 		}
 	}
 }
+
+// GET /tree reads each session's newest event id (0 before any) and the
+// pending memory writes of the tree's sessions, oldest first (Task 11).
+func TestLastEventIDAndPendingTreeWrites(t *testing.T) {
+	s := storetest.New(t)
+	newSession(t, s, "ses_a")
+	newFork(t, s, "ses_a_fork", "ses_a", "ses_a")
+	newSession(t, s, "ses_b")
+
+	if id, err := s.LastEventID(ctx, "ses_a"); err != nil || id != 0 {
+		t.Fatalf("LastEventID before any event = %d, %v; want 0", id, err)
+	}
+	var last int64
+	for range 3 {
+		id, err := s.AppendEvent(ctx, "ses_a", "session.status", protocol.SessionStatus{Status: "idle"}, store.Durable)
+		if err != nil {
+			t.Fatal(err)
+		}
+		last = id
+		if _, err := s.AppendEvent(ctx, "ses_b", "session.status", protocol.SessionStatus{Status: "idle"}, store.Durable); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if id, err := s.LastEventID(ctx, "ses_a"); err != nil || id != last {
+		t.Fatalf("LastEventID = %d, %v; want %d (ses_a's newest, not ses_b's)", id, err, last)
+	}
+
+	sid := func(id string) *string { return &id }
+	for _, w := range []store.MemoryWrite{
+		{ID: "mem_1", SessionID: sid("ses_a_fork"), Status: "pending"},
+		{ID: "mem_2", SessionID: sid("ses_a"), Status: "applied"},
+		{ID: "mem_3", SessionID: sid("ses_a"), Status: "pending"},
+		{ID: "mem_4", SessionID: sid("ses_b"), Status: "pending"},
+		{ID: "mem_5", SessionID: nil, Status: "pending"},
+		{ID: "mem_6", SessionID: sid("ses_a"), Status: "pending"},
+	} {
+		w.PersonID, w.TurnID, w.Op, w.Text = "chris", "turn_1", "remember", "synthetic"
+		if _, err := s.InsertMemoryWrite(ctx, w); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.DecideMemoryWrite(ctx, "mem_6", "rejected"); err != nil {
+		t.Fatal(err)
+	}
+	su := storetest.ConnAs(t, s, storetest.Superuser)
+	if _, err := su.Exec(ctx, `update memory_writes set created_at = case id
+		when 'mem_3' then timestamptz '2026-10-20 12:00:01Z'
+		else timestamptz '2026-10-20 12:00:02Z' end`); err != nil {
+		t.Fatal(err)
+	}
+	ws, err := s.PendingTreeWrites(ctx, "ses_a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := []string{}
+	for _, w := range ws {
+		got = append(got, w.ID+":"+*w.SessionID+":"+w.Status)
+	}
+	if fmt.Sprint(got) != "[mem_3:ses_a:pending mem_1:ses_a_fork:pending]" {
+		t.Fatalf("PendingTreeWrites = %v; want the tree's pending writes, oldest first", got)
+	}
+	if ws, err := s.PendingTreeWrites(ctx, "ses_none"); err != nil || len(ws) != 0 {
+		t.Fatalf("PendingTreeWrites of no tree = %v, %v; want none", ws, err)
+	}
+}

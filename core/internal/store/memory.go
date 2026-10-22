@@ -106,6 +106,22 @@ func (s *Store) MemoryWrites(ctx context.Context, personID string, limit int) ([
 	if err != nil {
 		return nil, err
 	}
+	return scanMemoryWrites(rows)
+}
+
+// PendingTreeWrites lists the pending writes of a conversation tree's
+// sessions, oldest first (C1 /tree's pending_writes).
+func (s *Store) PendingTreeWrites(ctx context.Context, rootID string) ([]MemoryWrite, error) {
+	rows, err := s.pool.Query(ctx, `select `+memoryWriteCols+` from memory_writes
+		where status = 'pending' and session_id in (select id from sessions where root_id = $1)
+		order by created_at, id`, rootID)
+	if err != nil {
+		return nil, err
+	}
+	return scanMemoryWrites(rows)
+}
+
+func scanMemoryWrites(rows pgx.Rows) ([]MemoryWrite, error) {
 	defer rows.Close()
 	var out []MemoryWrite
 	for rows.Next() {
