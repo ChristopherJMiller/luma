@@ -160,8 +160,12 @@ func middleware(r Reviewer, audience string, principals map[string]Principal, al
 					deny(http.StatusServiceUnavailable, "review_saturated")
 					return
 				}
-				id, err := r.Review(req.Context(), tok)
-				<-sem
+				// The slot is released by defer so a panicking Reviewer (net/http
+				// recovers it per request) can't leak slots into a permanent 503.
+				id, err := func() (Identity, error) {
+					defer func() { <-sem }()
+					return r.Review(req.Context(), tok)
+				}()
 				switch {
 				case errors.Is(err, ErrUnauthenticated):
 					deny(http.StatusUnauthorized, "unauthenticated")

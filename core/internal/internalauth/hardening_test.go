@@ -72,6 +72,29 @@ func TestSaturatedReviewSemaphore503(t *testing.T) {
 	}
 }
 
+type panickingReviewer struct{}
+
+func (panickingReviewer) Review(context.Context, string) (Identity, error) {
+	panic("reviewer bug")
+}
+
+// A panicking Reviewer (net/http recovers it per request) must give its
+// semaphore slot back. With more panics than slots, a leak would make a later
+// request a 503 before it reaches the reviewer, instead of panicking again.
+func TestPanickingReviewerReleasesItsSlot(t *testing.T) {
+	h, _ := serve(t, panickingReviewer{}, PrincipalConductor)
+	for i := range maxConcurrentReviews + 2 {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("request %d did not reach the reviewer (slot leaked)", i)
+				}
+			}()
+			do(h, "Bearer p"+string(rune('a'+i))+".b.c")
+		}()
+	}
+}
+
 func TestFailClosedLogsReasonNotToken(t *testing.T) {
 	var buf bytes.Buffer
 	old := slog.Default()
