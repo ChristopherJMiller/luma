@@ -17,7 +17,7 @@
 - **A nightly CronJob** reconciles the ledger against Anthropic's Usage & Cost API with an Admin key that only it can read.
 
 **Tech Stack:**
-- **Go 1.26:** `net/http`, `pgx/v5` with `goose/v3` migrations, `coder/websocket`, `go-oidc/v3`, `x/oauth2`, `x/crypto` (chacha20poly1305, hkdf), `x/image`, `rwcarlsen/goexif`, `pdfcpu/pdfcpu` (page counts only), `fsnotify`, `prometheus/client_golang`. TokenReview goes over plain `net/http`, with no client-go.
+- **Go 1.26:** `net/http`, `pgx/v5` with `goose/v3` migrations, `coder/websocket`, `go-oidc/v3`, `x/oauth2`, `x/crypto` (chacha20poly1305, hkdf), `x/image`, `pdfcpu/pdfcpu` (page counts only, in a child process; S57d), with the EXIF orientation read in-house (goexif was dropped, S57a), `fsnotify`, `prometheus/client_golang`. TokenReview goes over plain `net/http`, with no client-go.
 - **Node 24 + TypeScript:** `@anthropic-ai/claude-agent-sdk` **0.3.303** and Claude Code CLI **2.1.303**, both pinned exactly. Also `@modelcontextprotocol/sdk`, `pg`, `ws`, `prom-client`, `pino`, `vitest`.
 - **Web:** React 19, Vite, `@assistant-ui/react` **0.15.29**, `@assistant-ui/react-markdown`, Tailwind, `vite-plugin-pwa`, and shadcn run at an exact version.
 - **Services:**
@@ -289,8 +289,8 @@ The tasks refer to these by name. Each is defined once, here. Task 4 Step 5 may 
 | `POST /v1/sessions/{id}/fork` | `{at_message}` → `Session` (P4); 503 `maintenance`, 402 `budget_exhausted` (the same Gate as Create: a fork is a new session, S53) |
 | `POST /v1/sessions/{id}/events` | `ClientEvent` → `{message?: Message}`; 409 `busy`, 503 `maintenance`, 402 `budget_exhausted`. A `user.message` whose `client_id` (a UUID) was seen before returns that message and starts nothing; the id is reserved **before** the Gate on purpose, so a repeat returns its message even after the Gate closes, and an id refused before its message existed is reused by its retry (Task 9a) |
 | `GET /v1/sessions/{id}/stream?since=<id>` | WebSocket, server → client `Event` frames, every event with id > `since` once, in id order; ping every 25 s. The handshake needs exactly one allowed `Origin` and the cookie. Refused before the upgrade: 403/401 (auth layer), 404 `not_found`, 400 `invalid_request`. **Close codes:** **4401** the web session ended (sign in again); **4404** the conversation's tree was deleted (drop the thread); **1013** too far behind (1000 events) or the log could not be read for now (reconnect with `since`); **1011** a stored event cannot be read, and never will be (do not reconnect). Any other close (1006, a network drop) means reconnect with `since` |
-| `POST /v1/attachments` (multipart `file`) | `Attachment{id,media_type,filename,size_bytes,width?,height?,pages?}` |
-| `GET /v1/attachments/{id}`, `DELETE` | bytes (owner only) / 204 |
+| `POST /v1/attachments` (multipart `file`) | `Attachment{id,media_type,filename,size_bytes,width?,height?,pages?}`; 413 `attachment_too_large` or `image_too_large`, 415 `unsupported_attachment`, 400 `invalid_request` (no `file` part, a malformed body). **503 `rate_limited` with `Retry-After: 5`** when 4 uploads are in flight, or 2 of the person's: refused before the body is read (Task 12 security review, S57) |
+| `GET /v1/attachments/{id}`, `DELETE` | bytes (owner only; `X-Content-Type-Options: nosniff`, `Content-Security-Policy: sandbox`, `Cache-Control: private, no-store`; images `inline`, everything else `attachment`) / 204. DELETE removes an upload no message has taken; one a message has taken is 400 `invalid_request`, deleted only with its tree |
 | `GET /v1/memory/profile` / `PUT {content,version}` / `DELETE` | `Profile{content,version,updated_at,pending: MemoryWrite[]}` |
 | `POST /v1/memory/writes/{id}/accept`, `/reject` | `MemoryWrite` (owner only) |
 
@@ -412,7 +412,7 @@ A `turn_result` that arrives in time ends the turn normally and cancels both. Af
 
 | code | HTTP / when | Copy |
 |---|---|---|
-| `rate_limited` | upstream 429 | "Luma is getting a lot of requests right now. Wait a moment and try again." |
+| `rate_limited` | upstream 429; 503 on `POST /v1/attachments` while the upload slots are full (S57) | "Luma is getting a lot of requests right now. Wait a moment and try again." |
 | `overloaded` | upstream 529 | "Claude is overloaded right now. Try again in a minute." |
 | `conductor_restarted` | link lost mid-turn, or a Core restart found the turn running | "Luma restarted while answering. Your conversation is safe — send your message again." |
 | `budget_exhausted` | ledger ≥ cap, or an upstream spend-limit error | "Luma has used this month's budget. It will be back on {resets_at, local date}." |
@@ -421,10 +421,10 @@ A `turn_result` that arrives in time ends the turn normally and cancels both. Af
 | `capacity` | 4 busy hosts (`host.state{closed, reason:"capacity"}`) | "Luma is busy with other conversations. Try again in a minute." |
 | `busy` | 409 | "Luma is still answering in this conversation." |
 | `attachment_too_large` | > `MaxAttachmentBytes` (20 MiB) | "That file is over 20 MB." |
-| `image_too_large` | > 40 MP decoded | "That image is too large. Photos up to 40 megapixels work." |
+| `image_too_large` | from the header, before decoding: > 40 MP decoded, a side > 20,000 px, an estimated decode > 192 MiB, or a JPEG of > 100 scans (S57) | "That image is too large. Photos up to 40 megapixels work." |
 | `pdf_too_long` | pages > the tier's `pdf_max_pages` | "That PDF has more than {max} pages, the most Luma reads in this mode." |
-| `conversation_attachments_full` | > 20 MiB per tree | "This conversation already holds 20 MB of files. Start a new chat to add more." |
-| `unsupported_attachment` | sniffed type not allowed, or unparseable | "Luma can read photos, PDFs and text files." |
+| `conversation_attachments_full` | > 20 MiB per tree, counting each message's attachments (one sent again counts again, S57) | "This conversation already holds 20 MB of files. Start a new chat to add more." |
+| `unsupported_attachment` | sniffed type not allowed, or unparseable: text that is not UTF-8, holds a C0 control other than tab/LF/CR, or is > 1 MiB; a PDF whose page counter fails, crashes or runs past 30 s (S57) | "Luma can read photos, PDFs and text files." |
 | `memory_full` | tool result text | "The profile is full. Ask the person to tidy it in Luma's profile page." |
 | `memory_disabled` | tool result text | "Memory is off in this conversation." |
 | `memory_pending_limit` | tool result text (4th pending write in a turn) | "Several memory changes are already waiting for the person's review. Don't save more in this turn." |

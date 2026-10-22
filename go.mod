@@ -10,7 +10,6 @@ require (
 	github.com/pdfcpu/pdfcpu v0.16.2
 	github.com/pressly/goose/v3 v3.29.0
 	github.com/prometheus/client_golang v1.25.0
-	github.com/rwcarlsen/goexif v0.0.0-20190401172101-9e8deecbddbd
 	golang.org/x/crypto v0.58.0
 	golang.org/x/image v0.47.0
 	golang.org/x/oauth2 v0.37.0

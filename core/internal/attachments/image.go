@@ -24,6 +24,15 @@ const (
 	// PNG, a progressive JPEG or a lossless WebP fits up to about 25 MP.
 	// Two decodes at a time plus the scaler stay near half of Core's 768Mi.
 	maxDecodeBytes = 192 << 20
+	// maxSide bounds each side (S57b). Under the pixel cap a 40,000,000x1
+	// image is a few KB of PNG, and scaling it builds kernel weights for a
+	// 25,000:1 reduction: gigabytes. At 20,000 px the reduction is at most
+	// about 13:1.
+	maxSide = 20_000
+	// maxScans bounds a JPEG's scans (S57c). A progressive JPEG has about
+	// ten; each scan revisits every coefficient, so thousands of tiny scans
+	// would hold a decode slot for an hour.
+	maxScans = 100
 	// scratchPixels bounds the scratch buffer of one CatmullRom call, which
 	// costs 32 bytes a pixel: 8 MiB.
 	scratchPixels = 1 << 18
@@ -43,23 +52,21 @@ func acquireDecode(ctx context.Context) (release func(), err error) {
 	}
 }
 
-// normalizeImage checks the header against the pixel and decode-cost caps
-// before anything is decoded, then decodes (one slot of two), turns the
-// picture upright, downscales it to the long-edge limit and re-encodes it:
-// PNG when it has transparency, otherwise JPEG at quality 85. Nothing of the
-// original file but its pixels survives: no EXIF, GPS, ICC profile or text.
+// normalizeImage checks the header before anything is decoded (pixels,
+// sides, the decoder's memory, a JPEG's scans), then decodes (one slot of
+// two), turns the picture upright, downscales it to the long-edge limit and
+// re-encodes it: PNG when it has transparency, otherwise JPEG at quality
+// 85. Nothing of the original file but its pixels survives: no EXIF, GPS,
+// ICC profile or text.
 func normalizeImage(ctx context.Context, mt string, data []byte) (Normalized, error) {
 	cfg, err := decodeConfig(mt, data)
 	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 {
 		return Normalized{}, refused(protocol.CodeUnsupportedAttachment)
 	}
-	if int64(cfg.Width)*int64(cfg.Height) > maxPixels || decodeCost(mt, cfg, data) > maxDecodeBytes {
+	if tooCostly(mt, cfg, data) {
 		return Normalized{}, refused(protocol.CodeImageTooLarge)
 	}
-	orientation := 1
-	if mt == "image/jpeg" {
-		orientation = jpegOrientation(data)
-	}
+	orientation := imageOrientation(mt, data)
 
 	release, err := acquireDecode(ctx)
 	if err != nil {
@@ -123,10 +130,23 @@ func recoverInto(err *error) {
 	}
 }
 
+// tooCostly reports, from the header alone, an image Core will not decode:
+// over 40 MP, a side over 20,000 px, more than the decoder may allocate, or
+// a JPEG of more than 100 scans. All of it is image_too_large (C3).
+func tooCostly(mt string, cfg image.Config, data []byte) bool {
+	switch {
+	case int64(cfg.Width)*int64(cfg.Height) > maxPixels, cfg.Width > maxSide, cfg.Height > maxSide:
+		return true
+	case decodeCost(mt, cfg, data) > maxDecodeBytes:
+		return true
+	}
+	return mt == "image/jpeg" && jpegScans(data) > maxScans
+}
+
 // decodeCost estimates, from the header alone, the bytes the decoder will
-// allocate: the bitmap at its native depth, an interlaced PNG's pass
-// images, a progressive JPEG's coefficients (256 bytes per 8x8 block per
-// component), a CMYK JPEG's conversion.
+// allocate: the bitmap at its native depth, an interlaced PNG's pass images
+// and a PNG's two row buffers, a progressive JPEG's coefficients (256 bytes
+// per 8x8 block per component), a CMYK JPEG's conversion.
 func decodeCost(mt string, cfg image.Config, data []byte) int64 {
 	px := int64(cfg.Width) * int64(cfg.Height)
 	switch mt {
@@ -135,7 +155,7 @@ func decodeCost(mt string, cfg image.Config, data []byte) int64 {
 		if pngInterlaced(data) {
 			n *= 2
 		}
-		return n
+		return n + 2*pngRowBytes(cfg.Width, data)
 	case "image/jpeg":
 		return jpegCost(cfg, data)
 	case "image/gif":
@@ -169,6 +189,25 @@ func bytesPerPixel(m color.Model) int64 {
 // IHDR comes first).
 func pngInterlaced(data []byte) bool {
 	return len(data) > 28 && string(data[12:16]) == "IHDR" && data[28] == 1
+}
+
+// pngRowBytes is one row of a PNG as the decoder buffers it (it keeps the
+// current and the previous row): a filter byte plus the row's bits, from
+// IHDR's bit depth and colour type.
+func pngRowBytes(width int, data []byte) int64 {
+	if len(data) <= 25 {
+		return 0
+	}
+	channels := int64(4) // RGBA (colour type 6), and the most for an unknown type
+	switch data[25] {
+	case 0, 3: // grey, palette index
+		channels = 1
+	case 4: // grey and alpha
+		channels = 2
+	case 2: // RGB
+		channels = 3
+	}
+	return 1 + (int64(width)*channels*int64(data[24])+7)/8
 }
 
 // jpegCost follows image/jpeg's allocations: a plane per component, padded

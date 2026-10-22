@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -29,17 +30,48 @@ const (
 	bodyRoom = 64 << 10
 	// maxNameBytes bounds a stored filename.
 	maxNameBytes = 255
+	// maxUploads and maxUploadsPerPerson bound the uploads in flight, each
+	// holding up to 20 MiB while it is read, waits for a decode slot and is
+	// stored. Past them an upload is refused before its body is read.
+	maxUploads          = 4
+	maxUploadsPerPerson = 2
+	// uploadRetryAfter is the Retry-After of a refused upload, in seconds.
+	uploadRetryAfter = "5"
 )
 
 // Handler serves C1's attachment routes.
 type Handler struct {
 	st    *store.Store
 	clock func() time.Time
+
+	mu        sync.Mutex
+	uploads   int            // in flight
+	perPerson map[string]int // in flight, by person id
 }
 
 // NewHandler returns the attachment routes' handler.
 func NewHandler(st *store.Store) *Handler {
-	return &Handler{st: st, clock: time.Now}
+	return &Handler{st: st, clock: time.Now, perPerson: map[string]int{}}
+}
+
+// takeUpload claims an upload slot for p: one of four in all and two per
+// person. It reports false when none is free.
+func (h *Handler) takeUpload(personID string) (release func(), ok bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.uploads >= maxUploads || h.perPerson[personID] >= maxUploadsPerPerson {
+		return nil, false
+	}
+	h.uploads++
+	h.perPerson[personID]++
+	return func() {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		h.uploads--
+		if h.perPerson[personID]--; h.perPerson[personID] == 0 {
+			delete(h.perPerson, personID)
+		}
+	}, true
 }
 
 // Routes registers POST /v1/attachments, GET and DELETE
@@ -65,8 +97,17 @@ func (h *Handler) Routes(mux *http.ServeMux, requirePerson func(http.Handler) ht
 // handleUpload streams the multipart body: it never calls
 // ParseMultipartForm, the body is capped at MaxAttachmentBytes plus framing
 // room, and the "file" part itself at MaxAttachmentBytes exactly. Other
-// parts are skipped. The file is normalised, then stored unbound.
+// parts are skipped. The file is normalised, then stored unbound. With the
+// upload slots full it answers 503 rate_limited with Retry-After, before
+// reading anything (C1).
 func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request, p auth.Person) {
+	release, ok := h.takeUpload(p.ID)
+	if !ok {
+		w.Header().Set("Retry-After", uploadRetryAfter)
+		writeErrorInfo(w, r, http.StatusServiceUnavailable, protocol.CodeRateLimited)
+		return
+	}
+	defer release()
 	r.Body = http.MaxBytesReader(w, r.Body, protocol.MaxAttachmentBytes+bodyRoom)
 	mr, err := r.MultipartReader()
 	if err != nil {
@@ -170,6 +211,7 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request, p auth.Perso
 	hd.Set("Content-Length", strconv.Itoa(len(a.Data)))
 	hd.Set("X-Content-Type-Options", "nosniff")
 	hd.Set("Content-Security-Policy", "sandbox")
+	hd.Set("Cache-Control", "private, no-store")
 	if v := mime.FormatMediaType(disposition, map[string]string{"filename": a.Filename}); v != "" {
 		hd.Set("Content-Disposition", v)
 	} else {

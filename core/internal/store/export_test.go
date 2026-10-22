@@ -15,7 +15,7 @@ import (
 func (s *Store) SetAppendHook(f func(ctx context.Context, tx pgx.Tx)) { s.appendHook = f }
 
 // SetBindHook installs a function that BindAttachments runs inside its
-// transaction, after the update. Tests only.
+// transaction, after its checks and before the update. Tests only.
 func (s *Store) SetBindHook(f func(ctx context.Context, tx pgx.Tx)) { s.bindHook = f }
 
 // Pool exposes the pool to tests.

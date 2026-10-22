@@ -1,6 +1,8 @@
 // Command luma-core is Core. `serve` runs the server (Task 15 wires it);
 // `maintenance on|off|status` switches maintenance mode through the loopback
-// admin API, run inside the pod with `kubectl exec` (S12).
+// admin API, run inside the pod with `kubectl exec` (S12). The hidden
+// `pdf-pages` is Core's PDF page counter, which Core starts as a child of
+// itself (S57d): a PDF on stdin, its page count on stdout.
 package main
 
 import (
@@ -16,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ChristopherJMiller/luma/core/internal/attachments"
 	"github.com/ChristopherJMiller/luma/core/internal/maintenance"
 )
 
@@ -60,6 +63,8 @@ func run(ctx context.Context, args []string, env func(string) string, stdout, st
 			return 1
 		}
 		return 0
+	case attachments.PDFPagesCommand:
+		return attachments.RunPDFPages(os.Stdin, stdout)
 	}
 	fmt.Fprint(stderr, usage)
 	return 2

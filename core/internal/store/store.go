@@ -94,7 +94,7 @@ type Store struct {
 	// AppendEvent's transaction after the insert.
 	appendHook func(ctx context.Context, tx pgx.Tx)
 	// bindHook, set only by tests (export_test.go), runs inside
-	// BindAttachments' transaction after the update.
+	// BindAttachments' transaction after its checks, before the update.
 	bindHook func(ctx context.Context, tx pgx.Tx)
 }
 

@@ -2,9 +2,14 @@ package attachments
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/ChristopherJMiller/luma/core/internal/protocol"
 )
@@ -57,15 +62,85 @@ func TestPdfUnparseableIsUnsupported(t *testing.T) {
 // user's config dir; Core's root filesystem is read-only, and nothing may
 // be written.
 func TestPdfReadsNoConfigDir(t *testing.T) {
-	home := t.TempDir()
+	home, tmp := t.TempDir(), t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	normalizeOK(t, pdfBytes(t, 2, 10), "a.pdf")
-	entries, err := os.ReadDir(home)
-	if err != nil {
-		t.Fatal(err)
+	t.Setenv("TMPDIR", tmp) // pdfcpu's fallback when there is no config dir
+	// In this process, so the directories are the ones set above.
+	if n, err := countPages(t.Context(), pdfBytes(t, 2, 10)); err != nil || n != 2 {
+		t.Fatalf("countPages = %d, %v", n, err)
 	}
-	if len(entries) != 0 {
-		t.Fatalf("counting pages wrote %v into the home directory", entries[0].Name())
+	for _, dir := range []string{home, tmp} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 0 {
+			t.Fatalf("counting pages wrote %s into %s", entries[0].Name(), dir)
+		}
+	}
+}
+
+// withChild points the page counter at one of TestMain's misbehaving
+// children, with a short timeout.
+func withChild(t *testing.T, mode string) {
+	t.Helper()
+	env, timeout := pdfChildEnv, pdfTimeout
+	pdfChildEnv, pdfTimeout = testChildEnv+"="+mode, 2*time.Second
+	t.Cleanup(func() { pdfChildEnv, pdfTimeout = env, timeout })
+}
+
+// The page counter is a child process (S57d): a child that hangs, crashes
+// or answers nonsense is unsupported_attachment, and a hung one is killed.
+func TestPdfChildFailuresAreUnsupported(t *testing.T) {
+	good := pdfBytes(t, 2, 10)
+	for _, mode := range []string{"hang", "crash", "noise", "zero"} {
+		t.Run(mode, func(t *testing.T) {
+			withChild(t, mode)
+			start := time.Now()
+			_, err := pageCount(t.Context(), good)
+			if codeOf(err) != protocol.CodeUnsupportedAttachment {
+				t.Fatalf("a %s child = %v, want unsupported_attachment", mode, err)
+			}
+			if d := time.Since(start); d > 6*time.Second {
+				t.Fatalf("a %s child took %v; the 2 s timer should have killed it", mode, d)
+			}
+		})
+	}
+	// A client that leaves takes its count down with it.
+	withChild(t, "hang")
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	if _, err := pageCount(ctx, good); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a count whose client left = %v, want the context's error", err)
+	}
+}
+
+// The real child runs under a 256 MiB committed-memory limit: a child that
+// allocates 512 MiB dies, and the parent's heap never sees it. A race build
+// cannot run under such a limit (see race_on.go), so this runs without
+// -race: make test-go runs it so.
+func TestPdfChildMemoryLimit(t *testing.T) {
+	if raceBuild {
+		t.Skip("RLIMIT_DATA cannot apply under the race detector; `make test-go` runs this test without -race")
+	}
+	cmd := exec.CommandContext(t.Context(), os.Args[0], PDFPagesCommand)
+	cmd.Env = []string{testChildEnv + "=alloc"}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	var exit *exec.ExitError
+	// The runtime dies on whichever mapping the limit refuses first: the
+	// heap, or (in a cgo test binary) a thread's stack.
+	oom := false
+	for _, s := range []string{"out of memory", "cannot allocate memory", "pthread_create failed"} {
+		oom = oom || strings.Contains(stderr.String(), s)
+	}
+	if !errors.As(err, &exit) || exit.ExitCode() == 0 || !oom {
+		t.Fatalf("a child allocating 512 MiB = %v, stderr %.200q; want it killed by its memory limit", err, stderr.String())
+	}
+	// The real counter still works under the limit.
+	if n, err := pageCount(t.Context(), pdfBytes(t, 3, 1<<20)); err != nil || n != 3 {
+		t.Fatalf("pageCount under the limit = %d, %v", n, err)
 	}
 }

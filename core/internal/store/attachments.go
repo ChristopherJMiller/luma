@@ -71,12 +71,19 @@ func (s *Store) AttachmentMeta(ctx context.Context, personID, id string) (Attach
 	return a, err
 }
 
-// BindAttachments binds a person's attachments to a tree, each unbound or
-// already bound to this tree, as long as the tree's stored bytes stay
-// within maxTreeBytes. It binds nothing and returns ErrNotFound if any id
-// is missing, not the person's, or bound to another tree, and ErrTreeFull
-// if the tree would go past the cap. Duplicate ids count once, and an id
-// already in the tree is not counted again.
+// BindAttachments binds a person's attachments to a tree for one new
+// message, each unbound or already bound to this tree, as long as the tree
+// stays within maxTreeBytes. It binds nothing and returns ErrNotFound if
+// any id is missing, not the person's, or bound to another tree (also when
+// another tree takes one meanwhile), and ErrTreeFull past the cap.
+// Duplicate ids count once.
+//
+// The cap is on what the tree's requests carry, so every message counts
+// its attachments: the tree's use is the attachments its user messages
+// reference, once per message (a re-sent attachment is in the transcript
+// again), plus the ones bound to it that no message references yet (a
+// send whose message was never stored), other than this message's own,
+// which count with it.
 //
 // Binds into one tree are serialised until commit by an advisory lock:
 // two sessions of a tree (a fork and its parent) send through different
@@ -88,30 +95,53 @@ func (s *Store) BindAttachments(ctx context.Context, personID, rootID string, id
 		if _, err := tx.Exec(ctx, `select pg_advisory_xact_lock(hashtextextended('attachments:' || $1, 0))`, rootID); err != nil {
 			return err
 		}
-		var found int
-		var inTree, adding int64
-		if err := tx.QueryRow(ctx, `select count(*)::int,
-				coalesce(sum(size_bytes) filter (where root_id is null), 0)::bigint,
-				(select coalesce(sum(size_bytes), 0)::bigint from attachments where root_id = $3)
+		var found, unbound int
+		var adding, used int64
+		if err := tx.QueryRow(ctx, `select count(*)::int, (count(*) filter (where root_id is null))::int,
+				coalesce(sum(size_bytes), 0)::bigint
 			from attachments where id = any($2) and person_id = $1 and (root_id is null or root_id = $3)`,
-			personID, ids, rootID).Scan(&found, &adding, &inTree); err != nil {
+			personID, ids, rootID).Scan(&found, &unbound, &adding); err != nil {
 			return err
 		}
 		if found != len(ids) {
 			return ErrNotFound
 		}
-		if inTree+adding > maxTreeBytes {
-			return ErrTreeFull
-		}
-		if _, err := tx.Exec(ctx, `update attachments set root_id = $2 where id = any($1) and root_id is null`, ids, rootID); err != nil {
+		if err := tx.QueryRow(ctx, treeUseSQL, rootID, ids).Scan(&used); err != nil {
 			return err
+		}
+		if used+adding > maxTreeBytes {
+			return ErrTreeFull
 		}
 		if s.bindHook != nil {
 			s.bindHook(ctx, tx)
 		}
+		tag, err := tx.Exec(ctx, `update attachments set root_id = $2 where id = any($1) and root_id is null`, ids, rootID)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != int64(unbound) {
+			return ErrNotFound // another tree bound one of them after the check
+		}
 		return nil
 	})
 }
+
+// treeUseSQL is a tree's attachment bytes ($1 the root): each user
+// message's attachment parts (MessagePart {type:"attachment", id}), plus the
+// tree's attachments no message references, but those in $2.
+const treeUseSQL = `select
+	coalesce((select sum(a.size_bytes)
+		from messages m
+		join sessions s on s.id = m.session_id
+		cross join lateral jsonb_array_elements(m.content) as part
+		join attachments a on a.id = part->>'id'
+		where s.root_id = $1 and m.role = 'user' and part->>'type' = 'attachment'), 0)::bigint
+	+ coalesce((select sum(a.size_bytes)
+		from attachments a
+		where a.root_id = $1 and a.id <> all($2)
+			and not exists (select 1 from messages m join sessions s on s.id = m.session_id
+				where s.root_id = $1 and m.role = 'user'
+					and m.content @> jsonb_build_array(jsonb_build_object('type', 'attachment', 'id', a.id)))), 0)::bigint`
 
 // DeleteUnboundAttachment deletes a person's upload that no message has
 // taken yet. Another person's attachment, or a missing one, is ErrNotFound;

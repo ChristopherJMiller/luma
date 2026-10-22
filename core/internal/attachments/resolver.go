@@ -46,7 +46,9 @@ func NewResolver(st *store.Store, tiers Tiers) *Resolver {
 // sessions.ErrInvalid (400). A PDF past the tier's pdf_max_pages is
 // pdf_too_long, and a tree past 20 MiB of attachments
 // conversation_attachments_full: every later request resends them, so a
-// fuller tree could never be answered again. Refusals are
+// fuller tree could never be answered again. Each message counts its
+// attachments, so one sent again counts again (store.BindAttachments,
+// S57); the retry of a message that was never stored does not. Refusals are
 // *sessions.RefusedError, so their C3 copy reaches the client; neither
 // binds anything.
 func (r *Resolver) Bind(ctx context.Context, p auth.Person, rootID string, ids []string, tier string) ([]protocol.ContentBlock, error) {

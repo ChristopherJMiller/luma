@@ -124,10 +124,20 @@ func TestCumulativeTreeCap(t *testing.T) {
 	if _, err := h.r.Bind(bg, chris, fresh, []string{c}, "fast"); err != nil {
 		t.Fatalf("the refused attachment in a new chat: %v", err)
 	}
-	// Sending the tree's own attachments again (an edit of their message
-	// forks the tree) counts nothing twice.
+	// Their messages were never stored here, so binding them again (the
+	// retry of a send that failed after its bind) counts them once.
 	if _, err := h.r.Bind(bg, chris, root, []string{a, b}, "fast"); err != nil {
-		t.Fatalf("re-sending the tree's attachments: %v", err)
+		t.Fatalf("retrying the tree's attachments: %v", err)
+	}
+	// Once a message carries them, sending one again in a later message puts
+	// it in the transcript twice, and it counts twice: 20 + 8 MiB.
+	if _, err := h.st.InsertMessage(bg, protocol.Message{ID: "msg_1", SessionID: root, TurnID: "turn_1", Role: "user", Status: "complete",
+		Content: []protocol.MessagePart{{Type: "attachment", ID: a}, {Type: "attachment", ID: b}}}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = h.r.Bind(bg, chris, root, []string{b}, "fast")
+	if info := refusal(t, err); info.Code != protocol.CodeConversationAttachmentsFull {
+		t.Fatalf("re-sending 8 MiB into a full tree = %+v", info)
 	}
 	// Two files that fit alone but not together, in one message.
 	other := h.tree(chris, "ses_other")

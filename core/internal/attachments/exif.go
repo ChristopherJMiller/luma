@@ -3,53 +3,141 @@ package attachments
 import (
 	"bytes"
 	"encoding/binary"
-
-	"github.com/rwcarlsen/goexif/exif"
 )
 
-// decodeExif is goexif's decoder; a test replaces it with one that panics.
-var decodeExif = exif.Decode
+const (
+	// maxIFDEntries bounds the entries read from IFD0 (a camera writes a few
+	// dozen); a larger IFD is treated as having no orientation.
+	maxIFDEntries = 512
+	// maxEXIFBytes bounds an EXIF block (a JPEG's APP1 holds at most 64 KiB).
+	maxEXIFBytes = 1 << 20
+	// tagOrientation is TIFF tag 274.
+	tagOrientation = 0x0112
+)
 
-// jpegOrientation is the EXIF orientation of a JPEG, 1 to 8, or 1 when it
-// has none or its EXIF cannot be read safely.
-func jpegOrientation(data []byte) int {
-	var app1 []byte
+// imageOrientation is the EXIF orientation of an image, 1 to 8: from a
+// JPEG's APP1, a PNG's eXIf chunk or a WebP's EXIF chunk. It is 1 when
+// there is none, or when the EXIF cannot be read.
+func imageOrientation(mt string, data []byte) int {
+	switch mt {
+	case "image/jpeg":
+		return tiffOrientation(jpegEXIF(data))
+	case "image/png":
+		return tiffOrientation(pngEXIF(data))
+	case "image/webp":
+		return tiffOrientation(webpEXIF(data))
+	}
+	return 1
+}
+
+// tiffOrientation reads the Orientation tag from IFD0 of a TIFF block, and
+// nothing else: no next-IFD chain, sub-IFD, thumbnail or maker note, and no
+// value array (Orientation is one SHORT, held in the entry itself). It
+// allocates nothing and reads at most 512 entries, so no block, however
+// built, costs more than a few microseconds. goexif, which this replaces
+// (S57a), parsed every tag of every IFD it could reach: a cycle of IFDs
+// never ended, and many tags aliasing one value area cost gigabytes.
+func tiffOrientation(t []byte) int {
+	if len(t) < 8 || len(t) > maxEXIFBytes {
+		return 1
+	}
+	var bo binary.ByteOrder
+	switch string(t[:2]) {
+	case "II":
+		bo = binary.LittleEndian
+	case "MM":
+		bo = binary.BigEndian
+	default:
+		return 1
+	}
+	if bo.Uint16(t[2:]) != 42 {
+		return 1
+	}
+	size := uint64(len(t))
+	off := uint64(bo.Uint32(t[4:]))
+	if off+2 > size {
+		return 1
+	}
+	n := uint64(bo.Uint16(t[off:]))
+	if n > maxIFDEntries || off+2+12*n > size {
+		return 1
+	}
+	for e := off + 2; e < off+2+12*n; e += 12 {
+		if bo.Uint16(t[e:]) != tagOrientation {
+			continue
+		}
+		if bo.Uint32(t[e+4:]) != 1 { // the count
+			return 1
+		}
+		var v uint32
+		switch bo.Uint16(t[e+2:]) { // the type
+		case 3: // SHORT, as the standard says
+			v = uint32(bo.Uint16(t[e+8:]))
+		case 4: // LONG, from a lenient writer
+			v = bo.Uint32(t[e+8:])
+		default:
+			return 1
+		}
+		if v < 1 || v > 8 {
+			return 1
+		}
+		return int(v)
+	}
+	return 1
+}
+
+// jpegEXIF is the TIFF block of a JPEG's first APP1 "Exif\0\0" segment, or
+// nil.
+func jpegEXIF(data []byte) []byte {
+	var t []byte
 	jpegSegments(data, func(m byte, p []byte) bool {
 		if m == 0xe1 && bytes.HasPrefix(p, []byte("Exif\x00\x00")) {
-			app1 = p
+			t = p[6:]
 			return false
 		}
 		return true
 	})
-	if app1 == nil || !tiffSane(app1[6:]) {
-		return 1
-	}
-	return exifOrientation(app1)
+	return t
 }
 
-// exifOrientation parses an APP1 payload ("Exif\0\0" + TIFF) with goexif,
-// inside recover(): a panic means no orientation.
-func exifOrientation(app1 []byte) (o int) {
-	defer func() {
-		if recover() != nil {
-			o = 1
+// pngEXIF is the payload of a PNG's eXIf chunk (a TIFF block), or nil.
+func pngEXIF(data []byte) []byte {
+	if !bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")) {
+		return nil
+	}
+	for i := 8; i+12 <= len(data); {
+		n := int(binary.BigEndian.Uint32(data[i:]))
+		if n < 0 || n > len(data)-i-12 {
+			return nil
 		}
-	}()
-	x, err := decodeExif(bytes.NewReader(app1))
-	// A failed sub-IFD (Exif, GPS, Interop) is not critical: IFD0, which
-	// holds the orientation, was read.
-	if x == nil || (err != nil && exif.IsCriticalError(err)) {
-		return 1
+		switch string(data[i+4 : i+8]) {
+		case "eXIf":
+			return data[i+8 : i+8+n]
+		case "IEND":
+			return nil
+		}
+		i += 12 + n
 	}
-	tag, err := x.Get(exif.Orientation)
-	if err != nil {
-		return 1
+	return nil
+}
+
+// webpEXIF is the payload of a WebP's EXIF chunk, a TIFF block (some
+// writers prefix "Exif\0\0"), or nil.
+func webpEXIF(data []byte) []byte {
+	if len(data) < 12 || string(data[:4]) != "RIFF" || string(data[8:12]) != "WEBP" {
+		return nil
 	}
-	v, err := tag.Int(0)
-	if err != nil || v < 1 || v > 8 {
-		return 1
+	for i := 12; i+8 <= len(data); {
+		n := int(binary.LittleEndian.Uint32(data[i+4:]))
+		if n < 0 || n > len(data)-i-8 {
+			return nil
+		}
+		if string(data[i:i+4]) == "EXIF" {
+			return bytes.TrimPrefix(data[i+8:i+8+n], []byte("Exif\x00\x00"))
+		}
+		i += 8 + n + n%2 // chunks are padded to an even size
 	}
-	return v
+	return nil
 }
 
 // jpegSegments walks a JPEG's marker segments up to its first scan (SOS),
@@ -86,6 +174,47 @@ func jpegSegments(data []byte, fn func(marker byte, payload []byte) bool) {
 	}
 }
 
+// jpegScans counts a JPEG's scans (SOS segments), walking every segment by
+// its length and each scan's entropy-coded data to the next marker. Inside
+// that data a 0xFF byte is followed by 0x00 (stuffing) or an RST marker,
+// never by 0xDA, and a 0xDA inside another segment (an EXIF thumbnail, an
+// ICC profile) is skipped with that segment, so the count is exact.
+func jpegScans(data []byte) int {
+	if len(data) < 2 || data[0] != 0xff || data[1] != 0xd8 {
+		return 0
+	}
+	scans := 0
+	for i := 2; i+4 <= len(data); {
+		if data[i] != 0xff {
+			return scans // malformed: the decoder refuses it
+		}
+		m := data[i+1]
+		switch {
+		case m == 0xff:
+			i++
+			continue
+		case m == 0x01 || (m >= 0xd0 && m <= 0xd8):
+			i += 2
+			continue
+		case m == 0xd9:
+			return scans
+		}
+		n := int(binary.BigEndian.Uint16(data[i+2:]))
+		if n < 2 || i+2+n > len(data) {
+			return scans
+		}
+		i += 2 + n
+		if m != 0xda {
+			continue
+		}
+		scans++
+		for i+1 < len(data) && (data[i] != 0xff || data[i+1] == 0x00 || (data[i+1] >= 0xd0 && data[i+1] <= 0xd7)) {
+			i++
+		}
+	}
+	return scans
+}
+
 // jpegFrame is what a JPEG's SOF segment says about its decoding.
 type jpegFrame struct {
 	progressive bool
@@ -110,133 +239,4 @@ func readJPEGFrame(data []byte) (f jpegFrame, ok bool) {
 		return false
 	})
 	return f, ok
-}
-
-const (
-	maxIFDs    = 8 // IFD0 and its next-IFD chain (a photo has two)
-	maxSubIFDs = 8 // the Exif, GPS and Interoperability IFDs
-)
-
-// tiffTypeSize is the byte size of each TIFF field type, 1 to 12.
-var tiffTypeSize = [...]uint64{0, 1, 1, 2, 4, 8, 1, 1, 2, 4, 8, 4, 8}
-
-// tiffSane reports whether goexif can parse an EXIF block in bounded time
-// and memory. goexif follows the next-IFD chain until an offset repeats the
-// previous one, so an A→B→A cycle never ends; and it sizes each tag's value
-// array by the declared count, after a uint32 product that can overflow,
-// so a 12-byte tag can ask for gigabytes. Neither is a panic, so recover()
-// cannot help. This checks every IFD goexif reads (IFD0's chain, and the
-// IFDs that the Exif, GPS and Interoperability pointers name): no repeated
-// IFD, and every value inside the block. A block that fails is read as no
-// orientation, the same as one goexif rejects.
-func tiffSane(t []byte) bool {
-	if len(t) < 8 {
-		return false
-	}
-	var bo binary.ByteOrder
-	switch string(t[:2]) {
-	case "II":
-		bo = binary.LittleEndian
-	case "MM":
-		bo = binary.BigEndian
-	default:
-		return false
-	}
-	if bo.Uint16(t[2:]) != 42 {
-		return false
-	}
-	seen := map[int64]bool{}
-	var subs []int64
-	off := int64(int32(bo.Uint32(t[4:])))
-	for n := 0; off != 0; n++ {
-		if n == maxIFDs || seen[off] {
-			return false
-		}
-		seen[off] = true
-		next, ptrs, ok := saneIFD(t, bo, off)
-		if !ok {
-			return false
-		}
-		subs = append(subs, ptrs...)
-		off = next
-	}
-	checked := 0
-	for i := 0; i < len(subs); i++ {
-		o := subs[i]
-		// goexif reads one IFD at a pointer, never its chain. One outside
-		// the block fails to read and goexif goes on without it.
-		if o < 0 || o >= int64(len(t)) || seen[o] {
-			continue
-		}
-		if checked == maxSubIFDs {
-			return false
-		}
-		checked++
-		seen[o] = true
-		_, ptrs, ok := saneIFD(t, bo, o)
-		if !ok {
-			return false
-		}
-		subs = append(subs, ptrs...)
-	}
-	return true
-}
-
-// saneIFD checks the IFD at off: its entries lie inside t, each of a known
-// type with its value inside t. It returns the next-IFD offset and the
-// values of any sub-IFD pointer tags.
-func saneIFD(t []byte, bo binary.ByteOrder, off int64) (next int64, subs []int64, ok bool) {
-	size := int64(len(t))
-	if off < 0 || off+2 > size {
-		return 0, nil, false
-	}
-	n := int64(int16(bo.Uint16(t[off:]))) // goexif reads an int16, and loops zero times when it is negative
-	n = max(n, 0)
-	end := off + 2 + 12*n
-	if end+4 > size {
-		return 0, nil, false
-	}
-	for e := off + 2; e < end; e += 12 {
-		id, typ, count := bo.Uint16(t[e:]), bo.Uint16(t[e+2:]), bo.Uint32(t[e+4:])
-		if typ == 0 || int(typ) >= len(tiffTypeSize) {
-			return 0, nil, false
-		}
-		total := tiffTypeSize[typ] * uint64(count)
-		if total == 0 || total > uint64(size) {
-			return 0, nil, false
-		}
-		at := e + 8
-		if total > 4 {
-			at = int64(bo.Uint32(t[e+8:]))
-			if uint64(at)+total > uint64(size) {
-				return 0, nil, false
-			}
-		}
-		if id == 0x8769 || id == 0x8825 || id == 0xa005 { // Exif, GPS, Interoperability
-			if v, ok := firstInt(t[at:], typ, bo); ok {
-				subs = append(subs, v)
-			}
-		}
-	}
-	return int64(int32(bo.Uint32(t[end:]))), subs, true
-}
-
-// firstInt is a tag's first value as goexif's Int64(0) reads it, for the
-// integer types; other types make goexif skip the pointer.
-func firstInt(v []byte, typ uint16, bo binary.ByteOrder) (int64, bool) {
-	switch typ {
-	case 1: // BYTE
-		return int64(v[0]), true
-	case 3: // SHORT
-		return int64(bo.Uint16(v)), true
-	case 4: // LONG
-		return int64(bo.Uint32(v)), true
-	case 6: // SBYTE
-		return int64(int8(v[0])), true
-	case 8: // SSHORT
-		return int64(int16(bo.Uint16(v))), true
-	case 9: // SLONG
-		return int64(int32(bo.Uint32(v))), true
-	}
-	return 0, false
 }

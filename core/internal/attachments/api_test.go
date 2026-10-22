@@ -51,9 +51,17 @@ const webRegistry = `people:
     tier: family
     emails:
       mock: [erin@example.test]
+  pers-sam:
+    display_name: Synthetic Sam
+    tier: family
+    emails:
+      mock: [sam@example.test]
 `
 
-var webEmail = map[string]string{chris.ID: "chris@example.test", erin.ID: "erin@example.test"}
+var (
+	sam      = auth.Person{ID: "pers-sam", DisplayName: "Synthetic Sam", Tier: "family"}
+	webEmail = map[string]string{chris.ID: "chris@example.test", erin.ID: "erin@example.test", sam.ID: "sam@example.test"}
+)
 
 type web struct {
 	t      *testing.T
@@ -61,6 +69,7 @@ type web struct {
 	srv    *httptest.Server
 	origin string
 	cond   *fakeConductor
+	att    *Handler
 }
 
 // newWeb serves the attachment routes and the session routes (over the real
@@ -95,7 +104,8 @@ func newWeb(t *testing.T) *web {
 		sessions.NopLedger{}, lumametrics.NewCore(prometheus.NewRegistry()), time.Now, sessions.Config{})
 	mux := http.NewServeMux()
 	bff.Routes(mux)
-	NewHandler(w.st).Routes(mux, bff.RequirePerson)
+	w.att = NewHandler(w.st)
+	w.att.Routes(mux, bff.RequirePerson)
 	svc.Routes(mux, bff.RequirePerson)
 	w.srv.Config.Handler = auth.UnsafeRequestGuard([]string{w.origin})(mux)
 	w.srv.Start()
@@ -366,6 +376,97 @@ func TestSniffNotDeclaredType(t *testing.T) {
 	wantError(t, w.upload(c, "huge.png", "image/png", pngHeader(20000, 20000, 8, 6, 0)), http.StatusRequestEntityTooLarge, protocol.CodeImageTooLarge)
 }
 
+// slowUpload starts an upload whose file arrives only when finish is
+// called; the handler holds its slot while it waits.
+func (w *web) slowUpload(c *http.Cookie) (finish func(), status <-chan int) {
+	pr, pw := io.Pipe()
+	// A failed test still ends the body, so the server's Close can return.
+	w.t.Cleanup(func() { _ = pw.CloseWithError(io.ErrUnexpectedEOF) })
+	body, n, ct := multipartBody("slow.txt", "text/plain", pr, 5)
+	req, err := http.NewRequest(http.MethodPost, w.srv.URL+"/v1/attachments", body)
+	if err != nil {
+		w.t.Fatal(err)
+	}
+	req.ContentLength = n
+	req.Header.Set("Content-Type", ct)
+	req.Header.Set("Origin", w.origin)
+	req.AddCookie(c)
+	ch := make(chan int, 1)
+	go func() {
+		resp, err := w.srv.Client().Do(req)
+		if err != nil {
+			ch <- -1
+			return
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		ch <- resp.StatusCode
+	}()
+	return func() { _, _ = pw.Write([]byte("hello")); _ = pw.Close() }, ch
+}
+
+func (w *web) waitUploads(n int) {
+	w.t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		w.att.mu.Lock()
+		got := w.att.uploads
+		w.att.mu.Unlock()
+		if got == n {
+			return
+		}
+		if time.Now().After(deadline) {
+			w.t.Fatalf("uploads in flight = %d, want %d", got, n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// At most four uploads are in flight, two per person, each holding up to
+// 20 MiB; past that an upload is refused before its body is read: 503
+// rate_limited with Retry-After.
+func TestUploadSlots(t *testing.T) {
+	w := newWeb(t)
+	a, b, c := w.login(chris), w.login(erin), w.login(sam)
+	busy := func(r response) {
+		t.Helper()
+		wantError(t, r, http.StatusServiceUnavailable, protocol.CodeRateLimited)
+		if r.header.Get("Retry-After") != "5" {
+			t.Fatalf("Retry-After = %q, want 5", r.header.Get("Retry-After"))
+		}
+	}
+	finishA1, a1 := w.slowUpload(a)
+	finishA2, a2 := w.slowUpload(a)
+	w.waitUploads(2)
+	busy(w.upload(a, "third.txt", "text/plain", []byte("hi"))) // a third for one person
+	finishB1, b1 := w.slowUpload(b)
+	finishB2, b2 := w.slowUpload(b)
+	w.waitUploads(4)
+	busy(w.upload(c, "fifth.txt", "text/plain", []byte("hi"))) // a fifth in all
+	finishA1()
+	if s := <-a1; s != http.StatusOK {
+		t.Fatalf("the first slow upload = %d", s)
+	}
+	w.waitUploads(3)
+	if r := w.upload(c, "now.txt", "text/plain", []byte("hi")); r.status != http.StatusOK {
+		t.Fatalf("an upload once a slot freed = %d %s", r.status, r.body)
+	}
+	for _, f := range []func(){finishA2, finishB1, finishB2} {
+		f()
+	}
+	for _, ch := range []<-chan int{a2, b1, b2} {
+		if s := <-ch; s != http.StatusOK {
+			t.Fatalf("a slow upload = %d", s)
+		}
+	}
+	w.waitUploads(0)
+	w.att.mu.Lock()
+	defer w.att.mu.Unlock()
+	if len(w.att.perPerson) != 0 {
+		t.Fatalf("per-person slots left: %v", w.att.perPerson)
+	}
+}
+
 func TestUploadNeedsAFilePart(t *testing.T) {
 	w := newWeb(t)
 	c := w.login(chris)
@@ -412,6 +513,7 @@ func TestOwnerOnlyGet(t *testing.T) {
 	r := w.do(http.MethodGet, "/v1/attachments/"+img.ID, mine, "")
 	if r.status != http.StatusOK || r.header.Get("Content-Type") != "image/jpeg" ||
 		r.header.Get("X-Content-Type-Options") != "nosniff" || r.header.Get("Content-Security-Policy") != "sandbox" ||
+		r.header.Get("Cache-Control") != "private, no-store" ||
 		r.header.Get("Content-Disposition") != `inline; filename=kite.png` {
 		t.Fatalf("GET image = %d %v", r.status, r.header)
 	}

@@ -84,8 +84,9 @@ lint: check-chart-sync ## golangci-lint, tsc typecheck, then helm lint over ever
 test: test-go test-ts ## Go and TypeScript unit tests (never the spikes).
 
 .PHONY: test-go
-test-go: ## Go tests with the race detector.
+test-go: ## Go tests with the race detector, then the PDF page counter's memory limit (it cannot apply under -race).
 	go test $(GO_TEST_FLAGS) ./...
+	go test -count=1 -run '^TestPdfChildMemoryLimit$$' ./core/internal/attachments/
 
 .PHONY: test-ts
 test-ts: ## TypeScript tests in every workspace package (spike files are excluded by their packages' configs).

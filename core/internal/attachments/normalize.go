@@ -60,7 +60,7 @@ func normalize(ctx context.Context, r io.Reader, sizeHint int64) (Normalized, er
 		}
 		return Normalized{MediaType: mt, Data: data, Pages: pages}, nil
 	case "text/plain":
-		if len(data) > maxTextBytes || !utf8.Valid(data) {
+		if !plainText(data) {
 			return Normalized{}, refused(protocol.CodeUnsupportedAttachment)
 		}
 		return Normalized{MediaType: mt, Data: data}, nil
@@ -68,15 +68,35 @@ func normalize(ctx context.Context, r io.Reader, sizeHint int64) (Normalized, er
 	return Normalized{}, refused(protocol.CodeUnsupportedAttachment)
 }
 
+// plainText reports a text attachment Luma reads: at most 1 MiB of valid
+// UTF-8 with no C0 control character but tab, line feed and carriage
+// return, anywhere (the sniffer looks only at the first 512 bytes).
+func plainText(b []byte) bool {
+	if len(b) > maxTextBytes || !utf8.Valid(b) {
+		return false
+	}
+	for _, c := range b {
+		if c < 0x20 && c != '\t' && c != '\n' && c != '\r' {
+			return false
+		}
+	}
+	return true
+}
+
+// maxPresize bounds the read buffer allocated before the bytes arrive: a
+// Content-Length is the client's claim, so a larger file grows the buffer
+// as it comes in.
+const maxPresize = 1 << 20
+
 // readFile reads at most MaxAttachmentBytes, and refuses one byte more
 // without reading on. sizeHint (the request's Content-Length, which frames
-// the file) presizes the buffer, so a large upload is held once and never
-// copied as the buffer grows.
+// the file) presizes the buffer up to 1 MiB; past that it doubles as bytes
+// arrive, never beyond the limit.
 func readFile(r io.Reader, sizeHint int64) ([]byte, error) {
 	const limit = protocol.MaxAttachmentBytes
 	size := int64(64 << 10)
 	if sizeHint > 0 {
-		size = min(sizeHint, limit+1)
+		size = min(sizeHint, maxPresize)
 	}
 	buf := make([]byte, 0, size)
 	lr := io.LimitReader(r, limit+1)
@@ -85,7 +105,9 @@ func readFile(r io.Reader, sizeHint int64) ([]byte, error) {
 			return nil, refused(protocol.CodeAttachmentTooLarge)
 		}
 		if len(buf) == cap(buf) {
-			buf = append(buf, 0)[:len(buf)]
+			grown := make([]byte, len(buf), min(2*cap(buf), limit+1))
+			copy(grown, buf)
+			buf = grown
 		}
 		n, err := lr.Read(buf[len(buf):cap(buf)])
 		buf = buf[:len(buf)+n]

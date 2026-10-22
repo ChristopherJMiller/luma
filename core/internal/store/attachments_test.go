@@ -62,9 +62,10 @@ func TestBindAttachmentsTreeCap(t *testing.T) {
 			t.Fatalf("%s bound to %s by a refused bind", id, *r)
 		}
 	}
-	// Ids already bound to this tree are not counted twice.
+	// No message references them yet (their sends were never stored), so
+	// binding them again for one message, a retry, counts them once.
 	if err := s.BindAttachments(ctx, "chris", "ses_a", []string{"att_12", "att_8"}, limit); err != nil {
-		t.Fatalf("re-binding the tree's own attachments: %v", err)
+		t.Fatalf("re-binding the tree's own unreferenced attachments: %v", err)
 	}
 	if n, _ := s.TreeAttachmentBytes(ctx, "ses_a"); n != 20*mib {
 		t.Fatalf("tree bytes = %d, want %d", n, 20*mib)
@@ -94,7 +95,7 @@ func TestBindAttachmentsSerialisedPerTree(t *testing.T) {
 	s.SetBindHook(func(context.Context, pgx.Tx) {
 		if calls.Add(1) == 1 {
 			close(entered)
-			<-release // the first bind is checked and written, not committed
+			<-release // the first bind has passed its checks, holding the tree
 		}
 	})
 	first, second := make(chan error, 1), make(chan error, 1)
@@ -131,6 +132,93 @@ func TestBindAttachmentsSerialisedPerTree(t *testing.T) {
 	}
 	if r := rootOf(t, s, "att_y"); r != nil {
 		t.Fatalf("att_y bound to %s", *r)
+	}
+}
+
+// The tree lock does not hold another tree's bind: if another tree takes an
+// unbound attachment between this bind's check and its update, the update
+// misses it, and the bind must fail rather than report it bound here.
+func TestBindAttachmentsLosesARaceToAnotherTree(t *testing.T) {
+	s := storetest.New(t)
+	newSession(t, s, "ses_a")
+	newSession(t, s, "ses_b")
+	insertSized(t, s, "att_x", 1)
+	entered, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	s.SetBindHook(func(context.Context, pgx.Tx) {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+	})
+	first := make(chan error, 1)
+	go func() { first <- s.BindAttachments(ctx, "chris", "ses_a", []string{"att_x"}, 20*mib) }()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the first bind never reached the bind hook")
+	}
+	if err := s.BindAttachments(ctx, "chris", "ses_b", []string{"att_x"}, 20*mib); err != nil {
+		close(release)
+		t.Fatalf("the other tree's bind: %v", err)
+	}
+	close(release)
+	if err := <-first; !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("the bind that lost the race = %v, want ErrNotFound", err)
+	}
+	if r := rootOf(t, s, "att_x"); r == nil || *r != "ses_b" {
+		t.Fatalf("att_x bound to %v, want ses_b", r)
+	}
+}
+
+// userMessage stores a user message in session sesID carrying the given
+// attachments as parts, as the sessions actor writes them (S15).
+func userMessage(t *testing.T, s *store.Store, id, sesID string, atts ...string) {
+	t.Helper()
+	parts := []protocol.MessagePart{{Type: "text", Text: "look"}}
+	for _, a := range atts {
+		parts = append(parts, protocol.MessagePart{Type: "attachment", ID: a, MediaType: "application/pdf", Filename: a + ".pdf"})
+	}
+	if _, err := s.InsertMessage(ctx, protocol.Message{ID: id, SessionID: sesID, TurnID: "turn_" + id, Role: "user",
+		Content: parts, Status: "complete"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The cap is on what the tree's requests carry: an attachment sent in a
+// later message again is in the transcript twice, and counts twice.
+func TestBindAttachmentsCountsEachMessage(t *testing.T) {
+	s := storetest.New(t)
+	newSession(t, s, "ses_root")
+	newFork(t, s, "ses_fork", "ses_root", "ses_root")
+	insertSized(t, s, "att_a", 8*mib)
+	insertSized(t, s, "att_b", 5*mib)
+	insertSized(t, s, "att_c", 1)
+	const limit = 20 * mib
+
+	if err := s.BindAttachments(ctx, "chris", "ses_root", []string{"att_a"}, limit); err != nil {
+		t.Fatal(err)
+	}
+	userMessage(t, s, "msg_1", "ses_root", "att_a")
+	// Sent again in the fork's message: 8 + 8 = 16 MiB.
+	if err := s.BindAttachments(ctx, "chris", "ses_root", []string{"att_a"}, limit); err != nil {
+		t.Fatalf("a first re-send (16 MiB): %v", err)
+	}
+	userMessage(t, s, "msg_2", "ses_fork", "att_a")
+	// A third time is 24 MiB.
+	if err := s.BindAttachments(ctx, "chris", "ses_root", []string{"att_a"}, limit); !errors.Is(err, store.ErrTreeFull) {
+		t.Fatalf("a third send of 8 MiB = %v, want ErrTreeFull", err)
+	}
+	// Bound, but its message never stored: 16 + 5 = 21 MiB with b counted.
+	if err := s.BindAttachments(ctx, "chris", "ses_root", []string{"att_c"}, limit); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BindAttachments(ctx, "chris", "ses_root", []string{"att_b"}, limit); !errors.Is(err, store.ErrTreeFull) {
+		t.Fatalf("16 MiB sent + 1 B pending + 5 MiB = %v, want ErrTreeFull", err)
+	}
+	// The retry of c's message counts c once, not twice.
+	if err := s.BindAttachments(ctx, "chris", "ses_root", []string{"att_c"}, limit); err != nil {
+		t.Fatalf("retrying a message whose attachment is bound: %v", err)
 	}
 }
 
