@@ -113,8 +113,8 @@ func TestInMemoryTxSerialisesOnePerson(t *testing.T) {
 	}
 }
 
-// A memory transaction sees and settles only its person's writes, counts the
-// turn's pending ones, and keeps or replaces matched on a decision.
+// A memory transaction sees and settles only its person's writes, and counts
+// the turn's held ones, decided or not (S58). A pending write is held.
 func TestMemoryTxScopesWritesToThePerson(t *testing.T) {
 	s := storetest.New(t)
 	ses := newSession(t, s, "ses_a")
@@ -134,33 +134,48 @@ func TestMemoryTxScopesWritesToThePerson(t *testing.T) {
 		}
 	}
 	err := s.InMemoryTx(ctx, "chris", func(m *store.MemoryTx) error {
-		if n, err := m.PendingInTurn(ctx, ses.ID, "turn_1"); err != nil || n != 2 {
-			t.Errorf("PendingInTurn = %d, %v; want 2 (mem_1, mem_5: pending, this session and turn)", n, err)
+		held := func(want int) {
+			t.Helper()
+			if n, err := m.HeldInTurn(ctx, ses.ID, "turn_1"); err != nil || n != want {
+				t.Errorf("HeldInTurn = %d, %v; want %d (mem_1, mem_5: held, this session and turn)", n, err, want)
+			}
 		}
+		held(2)
 		if _, err := m.Write(ctx, "mem_e"); !errors.Is(err, store.ErrNotFound) {
 			t.Errorf("Write(erin's) = %v, want ErrNotFound", err)
 		}
-		if _, err := m.DecideWrite(ctx, "mem_e", "applied", nil); !errors.Is(err, store.ErrNotFound) {
+		if _, err := m.DecideWrite(ctx, "mem_e", "applied"); !errors.Is(err, store.ErrNotFound) {
 			t.Errorf("DecideWrite(erin's) = %v, want ErrNotFound", err)
 		}
-		if _, err := m.DecideWrite(ctx, "mem_2", "rejected", nil); !errors.Is(err, store.ErrNotFound) {
+		if _, err := m.DecideWrite(ctx, "mem_2", "rejected"); !errors.Is(err, store.ErrNotFound) {
 			t.Errorf("DecideWrite(applied) = %v, want ErrNotFound", err)
 		}
-		if w, err := m.DecideWrite(ctx, "mem_1", "applied", []string{}); err != nil || w.Matched == nil || len(w.Matched) != 0 || w.DecidedAt == nil {
-			t.Errorf("DecideWrite(matched {}) = %+v, %v; want applied with matched {}", w, err)
+		if w, err := m.DecideWrite(ctx, "mem_1", "applied"); err != nil || w.Status != "applied" || !w.Held ||
+			!slices.Equal(w.Matched, []string{"- tea"}) || w.DecidedAt == nil {
+			t.Errorf("DecideWrite = %+v, %v; want applied, still held, matched kept", w, err)
 		}
-		if w, err := m.DecideWrite(ctx, "mem_3", "rejected", nil); err != nil || w.Status != "rejected" || w.Matched != nil {
-			t.Errorf("DecideWrite(nil matched) = %+v, %v; want rejected, matched kept (null)", w, err)
+		held(2) // a decided write still counts
+		if w, err := m.DecideWrite(ctx, "mem_3", "rejected"); err != nil || w.Status != "rejected" || w.Matched != nil {
+			t.Errorf("DecideWrite(rejected) = %+v, %v; want rejected, matched kept (null)", w, err)
 		}
 		w, err := m.InsertWrite(ctx, store.MemoryWrite{ID: "mem_6", PersonID: "erin", SessionID: &ses.ID, TurnID: "turn_3",
 			Op: "remember", Text: "likes kites", Status: "pending"})
-		if err != nil || w.PersonID != "chris" || w.DecidedAt != nil {
-			t.Errorf("InsertWrite = %+v, %v; want chris's (the transaction's person), undecided", w, err)
+		if err != nil || w.PersonID != "chris" || !w.Held || w.DecidedAt != nil {
+			t.Errorf("InsertWrite(pending) = %+v, %v; want chris's (the transaction's person), held, undecided", w, err)
 		}
+		w, err = m.InsertWrite(ctx, store.MemoryWrite{ID: "mem_7", SessionID: &ses.ID, TurnID: "turn_1",
+			Op: "remember", Text: "likes tea", Status: "applied"})
+		if err != nil || w.Held || w.DecidedAt == nil {
+			t.Errorf("InsertWrite(applied) = %+v, %v; want not held, decided", w, err)
+		}
+		held(2)
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if err := s.InMemoryTx(ctx, "", func(*store.MemoryTx) error { return nil }); err == nil {
+		t.Fatal("InMemoryTx with no person succeeded")
 	}
 	ws, err := s.PendingMemoryWrites(ctx, "chris")
 	if err != nil {

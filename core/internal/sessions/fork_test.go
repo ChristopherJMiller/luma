@@ -521,8 +521,11 @@ func TestTreeReturnsAllBranchesWithParents(t *testing.T) {
 		{ID: "mem_root_applied", SessionID: str(r.ID), Status: "applied"},
 		{ID: "mem_elsewhere_pending", SessionID: str(elsewhere.ID), Status: "pending"},
 	} {
-		w.PersonID, w.TurnID, w.Op, w.Text = family.ID, "turn_synthetic", "remember", "synthetic"
-		if _, err := h.st.InsertMemoryWrite(bg, w); err != nil {
+		w.TurnID, w.Op, w.Text = "turn_synthetic", "remember", "synthetic"
+		if err := h.st.InMemoryTx(bg, family.ID, func(m *store.MemoryTx) error {
+			_, err := m.InsertWrite(bg, w)
+			return err
+		}); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -43,3 +43,28 @@ func (s *Store) MigrateDownUp(ctx context.Context) error {
 	}
 	return s.Migrate(ctx)
 }
+
+// The unscoped memory writes, for store tests only: production code writes
+// memory through InMemoryTx, under the person's lock and scoped to them.
+
+// SetProfile replaces a profile if its version is still expectedVersion (0
+// for a person with none), and returns the new version.
+func (s *Store) SetProfile(ctx context.Context, personID, content string, expectedVersion int) (int, error) {
+	p, err := setProfileOn(ctx, s.pool, personID, content, expectedVersion)
+	return p.Version, err
+}
+
+// InsertMemoryWrite records a write as given (any person).
+func (s *Store) InsertMemoryWrite(ctx context.Context, w MemoryWrite) (MemoryWrite, error) {
+	return insertMemoryWriteOn(ctx, s.pool, w)
+}
+
+// DecideMemoryWrite settles a pending write of any person; one that is not
+// pending is ErrNotFound.
+func (s *Store) DecideMemoryWrite(ctx context.Context, id, status string) (MemoryWrite, error) {
+	w, err := s.MemoryWrite(ctx, id)
+	if err != nil {
+		return MemoryWrite{}, err
+	}
+	return decideMemoryWriteOn(ctx, s.pool, id, w.PersonID, status)
+}

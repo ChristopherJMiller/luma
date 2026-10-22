@@ -273,6 +273,18 @@ func TestPendingLimitPerTurn(t *testing.T) {
 	if evs := h.memoryEvents(sess.ID); len(evs) != 3 {
 		t.Fatalf("memory events = %d, want 3", len(evs))
 	}
+	// S58: the limit counts writes ever held in the turn; deciding them
+	// makes no room.
+	held := h.writes(erin)
+	if _, err := h.mem.Decide(bg, erin, held[0].ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.mem.Decide(bg, erin, held[1].ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if r := h.remember(sess, turn, "Fact 4.", false); r != limit {
+		t.Fatalf("a held remember after two decisions = %+v, want %+v", r, limit)
+	}
 	h.finish(sess.ID, turn)
 	_, next := h.turn(erin, sess.ID, "again")
 	if r := h.remember(sess, next, "Fact 5.", false); r.Status != "pending" {
@@ -350,22 +362,49 @@ func TestAcceptPendingApplies(t *testing.T) {
 	if err != nil || w.Status != "applied" {
 		t.Fatalf("accept forget = %+v, %v; want applied", w, err)
 	}
-	// Accepting a forget removes the lines that match now.
-	if p := h.profile(erin); p.Content != "- Likes kites." {
-		t.Fatalf("profile after the forget = %q, want both tea lines gone", p.Content)
+	// S59: the held line goes; the tea line added since the hold stays.
+	if p := h.profile(erin); p.Content != "- Iced tea in summer\n- Likes kites." {
+		t.Fatalf("profile after the forget = %q, want only the held line gone", p.Content)
 	}
-	if !slices.Equal(w.Matched, []string{"- Likes tea.", "- Iced tea in summer"}) {
-		t.Fatalf("matched = %q, want what the accepted forget removed", w.Matched)
+	if !slices.Equal(w.Matched, []string{"- Likes tea."}) {
+		t.Fatalf("matched = %q, want the held lines, unchanged", w.Matched)
 	}
 	// The same decision again is a retried click: the write comes back as is.
 	if again, err := h.mem.Decide(bg, erin, rem.WriteID, true); err != nil || again.Status != "applied" || !again.DecidedAt.Equal(*h.write(rem.WriteID).DecidedAt) {
 		t.Fatalf("accept again = %+v, %v; want the applied write unchanged", again, err)
 	}
-	if p := h.profile(erin); p.Content != "- Likes kites." {
+	if p := h.profile(erin); p.Content != "- Iced tea in summer\n- Likes kites." {
 		t.Fatalf("profile after a repeated accept = %q, want unchanged", p.Content)
 	}
 	if _, err := h.mem.Decide(bg, erin, rem.WriteID, false); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("reject after accept = %v, want ErrNotFound (nothing pending to decide)", err)
+	}
+}
+
+// S59: an accepted forget removes the held lines that are still in the
+// profile, one for each held, and nothing it would match now: not a line
+// added since the hold, not a second copy of a held line.
+func TestAcceptForgetRemovesOnlyTheHeldLines(t *testing.T) {
+	h := newHarness(t)
+	h.setProfile(erin, "- Likes tea.\n- Green tea, no sugar\n- Likes kites.")
+	sess := h.session(erin, false)
+	turn := h.taintedTurn(erin, sess.ID)
+	fgt := h.forget(sess, turn, "tea")
+	if w := h.write(fgt.WriteID); !slices.Equal(w.Matched, []string{"- Likes tea.", "- Green tea, no sugar"}) {
+		t.Fatalf("held matched = %q", w.Matched)
+	}
+	// The person edits while it waits: drops one held line, duplicates the
+	// other and adds a new tea line.
+	h.setProfile(erin, "- Likes tea.\n- Likes kites.\n- Likes tea.\n- Iced tea in summer")
+	w, err := h.mem.Decide(bg, erin, fgt.WriteID, true)
+	if err != nil || w.Status != "applied" {
+		t.Fatalf("accept = %+v, %v", w, err)
+	}
+	if p := h.profile(erin); p.Content != "- Likes kites.\n- Likes tea.\n- Iced tea in summer" {
+		t.Fatalf("profile = %q, want one held line removed and the rest kept", p.Content)
+	}
+	if !slices.Equal(w.Matched, []string{"- Likes tea.", "- Green tea, no sugar"}) {
+		t.Fatalf("matched = %q, want what the person saw", w.Matched)
 	}
 }
 

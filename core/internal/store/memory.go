@@ -11,6 +11,10 @@ import (
 	"github.com/ChristopherJMiller/luma/core/internal/protocol"
 )
 
+// Memory writes (profiles and memory_writes rows) go only through
+// InMemoryTx, which holds the person's lock and scopes every write to that
+// person (Task 13 review). The reads below are safe anywhere.
+
 // querier is what the memory SQL runs on: the pool, or one transaction.
 type querier interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
@@ -23,7 +27,7 @@ type Profile struct {
 	PersonID  string
 	Content   string
 	Version   int
-	UpdatedAt time.Time
+	UpdatedAt time.Time // zero for a person with no profile
 }
 
 // Profile returns a person's profile; a person with none yet gets an empty
@@ -44,13 +48,6 @@ func profileOn(ctx context.Context, db querier, personID string) (Profile, error
 
 // ErrProfileConflict means the profile changed since the caller read it.
 var ErrProfileConflict = errors.New("store: profile version conflict")
-
-// SetProfile replaces a profile if its version is still expectedVersion (0
-// for a person with none), and returns the new version.
-func (s *Store) SetProfile(ctx context.Context, personID, content string, expectedVersion int) (int, error) {
-	p, err := setProfileOn(ctx, s.pool, personID, content, expectedVersion)
-	return p.Version, err
-}
 
 func setProfileOn(ctx context.Context, db querier, personID, content string, expectedVersion int) (Profile, error) {
 	p := Profile{PersonID: personID, Content: content}
@@ -81,12 +78,14 @@ type MemoryWrite struct {
 	Text      string
 	Matched   []string
 	Untrusted bool
+	Held      bool   // it waited for the person's decision (pending when stored), S58
 	Status    string // applied | pending | rejected
 	CreatedAt time.Time
 	DecidedAt *time.Time
 }
 
-// Protocol is the client's MemoryWrite (C1): the row without person_id.
+// Protocol is the client's MemoryWrite (C1): the row without person_id and
+// held.
 func (w MemoryWrite) Protocol() protocol.MemoryWrite {
 	return protocol.MemoryWrite{
 		ID: w.ID, SessionID: w.SessionID, TurnID: w.TurnID, Op: w.Op, Text: w.Text, Matched: w.Matched,
@@ -94,28 +93,24 @@ func (w MemoryWrite) Protocol() protocol.MemoryWrite {
 	}
 }
 
-const memoryWriteCols = `id, person_id, session_id, turn_id, op, text, matched, untrusted, status, created_at, decided_at`
+const memoryWriteCols = `id, person_id, session_id, turn_id, op, text, matched, untrusted, held, status, created_at, decided_at`
 
 func scanMemoryWrite(row pgx.Row) (MemoryWrite, error) {
 	var w MemoryWrite
 	err := row.Scan(&w.ID, &w.PersonID, &w.SessionID, &w.TurnID, &w.Op, &w.Text, &w.Matched,
-		&w.Untrusted, &w.Status, &w.CreatedAt, &w.DecidedAt)
+		&w.Untrusted, &w.Held, &w.Status, &w.CreatedAt, &w.DecidedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return MemoryWrite{}, ErrNotFound
 	}
 	return w, err
 }
 
-// InsertMemoryWrite records a remember/forget request with its provenance. A
-// non-pending write is stamped decided.
-func (s *Store) InsertMemoryWrite(ctx context.Context, w MemoryWrite) (MemoryWrite, error) {
-	return insertMemoryWriteOn(ctx, s.pool, w)
-}
-
+// insertMemoryWriteOn records a write with its provenance. A pending write
+// is held; any other is stamped decided.
 func insertMemoryWriteOn(ctx context.Context, db querier, w MemoryWrite) (MemoryWrite, error) {
 	return scanMemoryWrite(db.QueryRow(ctx, `insert into memory_writes (id, person_id, session_id, turn_id,
-		op, text, matched, untrusted, status, decided_at)
-		values ($1,$2,$3,$4,$5,$6,$7,$8,$9, case when $9 = 'pending' then null else now() end)
+		op, text, matched, untrusted, held, status, decided_at)
+		values ($1,$2,$3,$4,$5,$6,$7,$8, $9 = 'pending', $9, case when $9 = 'pending' then null else now() end)
 		returning `+memoryWriteCols,
 		w.ID, w.PersonID, w.SessionID, w.TurnID, w.Op, w.Text, w.Matched, w.Untrusted, w.Status))
 }
@@ -125,20 +120,11 @@ func (s *Store) MemoryWrite(ctx context.Context, id string) (MemoryWrite, error)
 	return scanMemoryWrite(s.pool.QueryRow(ctx, `select `+memoryWriteCols+` from memory_writes where id = $1`, id))
 }
 
-// DecideMemoryWrite settles a pending write as applied or rejected. It
-// returns ErrNotFound if the write is not pending.
-func (s *Store) DecideMemoryWrite(ctx context.Context, id, status string) (MemoryWrite, error) {
-	return decideMemoryWriteOn(ctx, s.pool, id, "", status, nil)
-}
-
-// decideMemoryWriteOn settles a pending write. A non-empty personID also
-// requires the write to be that person's; a non-nil matched replaces the
-// stored one (the lines an accepted forget removed).
-func decideMemoryWriteOn(ctx context.Context, db querier, id, personID, status string, matched []string) (MemoryWrite, error) {
-	return scanMemoryWrite(db.QueryRow(ctx, `update memory_writes
-		set status = $2, decided_at = now(), matched = coalesce($4::text[], matched)
-		where id = $1 and status = 'pending' and ($3 = '' or person_id = $3) returning `+memoryWriteCols,
-		id, status, personID, matched))
+// decideMemoryWriteOn settles one of personID's pending writes.
+func decideMemoryWriteOn(ctx context.Context, db querier, id, personID, status string) (MemoryWrite, error) {
+	return scanMemoryWrite(db.QueryRow(ctx, `update memory_writes set status = $2, decided_at = now()
+		where id = $1 and status = 'pending' and person_id = $3 returning `+memoryWriteCols,
+		id, status, personID))
 }
 
 // MemoryWrites lists a person's writes, newest first.
@@ -194,8 +180,8 @@ func scanMemoryWrites(rows pgx.Rows) ([]MemoryWrite, error) {
 // to a person's profile or memory writes runs in one: a remember or forget,
 // a decision on a held write, an editor save. So a write's row and its
 // profile change commit together, and two writes of one turn cannot both
-// pass the per-turn pending limit. It is valid only inside InMemoryTx's
-// callback, and only for that person.
+// pass the per-turn limit. It is valid only inside InMemoryTx's callback,
+// and every read and write is scoped to its person.
 type MemoryTx struct {
 	tx       pgx.Tx
 	personID string
@@ -205,6 +191,9 @@ type MemoryTx struct {
 // transaction-scoped advisory lock, released at commit or rollback). An
 // error from fn rolls everything back.
 func (s *Store) InMemoryTx(ctx context.Context, personID string, fn func(m *MemoryTx) error) error {
+	if personID == "" {
+		return errors.New("store: a memory transaction needs a person")
+	}
 	return s.inTx(ctx, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `select pg_advisory_xact_lock(hashtextextended('memory:' || $1, 0))`, personID); err != nil {
 			return err
@@ -224,16 +213,17 @@ func (m *MemoryTx) SetProfile(ctx context.Context, content string, expectedVersi
 	return setProfileOn(ctx, m.tx, m.personID, content, expectedVersion)
 }
 
-// PendingInTurn counts the turn's writes that are pending now.
-func (m *MemoryTx) PendingInTurn(ctx context.Context, sessionID, turnID string) (int, error) {
+// HeldInTurn counts the turn's writes that were ever held, decided or not
+// (S58).
+func (m *MemoryTx) HeldInTurn(ctx context.Context, sessionID, turnID string) (int, error) {
 	var n int
 	err := m.tx.QueryRow(ctx, `select count(*) from memory_writes
-		where session_id = $1 and turn_id = $2 and status = 'pending'`, sessionID, turnID).Scan(&n)
+		where session_id = $1 and turn_id = $2 and held`, sessionID, turnID).Scan(&n)
 	return n, err
 }
 
 // InsertWrite records a write of the person's (its PersonID is the
-// transaction's); a non-pending one is stamped decided.
+// transaction's). A pending one is held; any other is stamped decided.
 func (m *MemoryTx) InsertWrite(ctx context.Context, w MemoryWrite) (MemoryWrite, error) {
 	w.PersonID = m.personID
 	return insertMemoryWriteOn(ctx, m.tx, w)
@@ -246,8 +236,8 @@ func (m *MemoryTx) Write(ctx context.Context, id string) (MemoryWrite, error) {
 }
 
 // DecideWrite settles one of the person's pending writes as applied or
-// rejected; a non-nil matched replaces the stored one. A write that is not
-// pending, or not the person's, is ErrNotFound.
-func (m *MemoryTx) DecideWrite(ctx context.Context, id, status string, matched []string) (MemoryWrite, error) {
-	return decideMemoryWriteOn(ctx, m.tx, id, m.personID, status, matched)
+// rejected. A write that is not pending, or not the person's, is
+// ErrNotFound.
+func (m *MemoryTx) DecideWrite(ctx context.Context, id, status string) (MemoryWrite, error) {
+	return decideMemoryWriteOn(ctx, m.tx, id, m.personID, status)
 }

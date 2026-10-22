@@ -21,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/ChristopherJMiller/luma/core/internal/auth"
+	"github.com/ChristopherJMiller/luma/core/internal/metrics"
 	"github.com/ChristopherJMiller/luma/core/internal/protocol"
 	"github.com/ChristopherJMiller/luma/core/internal/sessions"
 	"github.com/ChristopherJMiller/luma/core/internal/store"
@@ -66,15 +67,55 @@ type TaintSource interface {
 
 // Memory is the memory service.
 type Memory struct {
-	st    *store.Store
-	sink  sessions.EventSink
-	taint TaintSource
+	st      *store.Store
+	sink    sessions.EventSink
+	taint   TaintSource
+	metrics *metrics.Core // nil counts nothing
+}
+
+// Option configures a Memory.
+type Option func(*Memory)
+
+// WithMetrics counts every write's outcome in c's
+// luma_memory_writes_total{op,status} (C7): a remember or forget as its
+// result's status (applied, pending, full, rejected, disabled) or error; a
+// person's decision as accepted or discarded, or full for an accept that no
+// longer fits.
+func WithMetrics(c *metrics.Core) Option {
+	return func(m *Memory) { m.metrics = c }
 }
 
 // New returns the memory service. memory.write events go through sink, the
 // session service's EventSink, so they are serialised with the turn's own.
-func New(st *store.Store, sink sessions.EventSink, taint TaintSource) *Memory {
-	return &Memory{st: st, sink: sink, taint: taint}
+func New(st *store.Store, sink sessions.EventSink, taint TaintSource, opts ...Option) *Memory {
+	m := &Memory{st: st, sink: sink, taint: taint}
+	for _, o := range opts {
+		o(m)
+	}
+	return m
+}
+
+// writeStatuses is the fixed set of luma_memory_writes_total's status label.
+var writeStatuses = []string{"applied", "pending", "full", "rejected", "disabled", "error", "accepted", "discarded"}
+
+// count records one write outcome.
+func (m *Memory) count(op, status string) {
+	if m.metrics == nil {
+		return
+	}
+	m.metrics.MemoryWritesTotal.WithLabelValues(metrics.Label(op, "remember", "forget"),
+		metrics.Label(status, writeStatuses...)).Inc()
+}
+
+// counted records a remember or forget's outcome: its result's status, or
+// error.
+func (m *Memory) counted(op string, res protocol.MemoryResult, err error) (protocol.MemoryResult, error) {
+	status := res.Status
+	if err != nil {
+		status = "error"
+	}
+	m.count(op, status)
+	return res, err
 }
 
 // Snapshot returns the person's profile, fenced; "" for an empty profile
@@ -104,6 +145,11 @@ var (
 // is recorded with its provenance and emitted as memory.write. The row's
 // text is text as the conductor sent it; the bullet is text on one line.
 func (m *Memory) Remember(ctx context.Context, sess store.Session, turnID, text string, flagged bool) (protocol.MemoryResult, error) {
+	res, err := m.remember(ctx, sess, turnID, text, flagged)
+	return m.counted("remember", res, err)
+}
+
+func (m *Memory) remember(ctx context.Context, sess store.Session, turnID, text string, flagged bool) (protocol.MemoryResult, error) {
 	off, err := memoryOff(sess)
 	if err != nil {
 		return protocol.MemoryResult{}, err
@@ -163,6 +209,11 @@ func (m *Memory) Remember(ctx context.Context, sess store.Session, turnID, text 
 // rejected. Rejected forgets leave no row; the rest are recorded and
 // emitted as Remember's are.
 func (m *Memory) Forget(ctx context.Context, sess store.Session, turnID, query string, flagged bool) (protocol.MemoryResult, error) {
+	res, err := m.forget(ctx, sess, turnID, query, flagged)
+	return m.counted("forget", res, err)
+}
+
+func (m *Memory) forget(ctx context.Context, sess store.Session, turnID, query string, flagged bool) (protocol.MemoryResult, error) {
 	off, err := memoryOff(sess)
 	if err != nil {
 		return protocol.MemoryResult{}, err
@@ -216,14 +267,15 @@ func (m *Memory) Forget(ctx context.Context, sess store.Session, turnID, query s
 }
 
 // hold settles whether w applies now or waits for the person: a held write
-// is pending if its turn has room for one more, and otherwise rejected
-// (no row). It gives w its id and status, and returns the result so far.
+// is pending if its turn has held fewer than MaxPendingPerTurn, decided or
+// not (S58: deciding one does not make room), and otherwise rejected (no
+// row). It gives w its id and status, and returns the result so far.
 func hold(ctx context.Context, tx *store.MemoryTx, held bool, w *store.MemoryWrite) (protocol.MemoryResult, error) {
 	if !held {
 		w.ID, w.Status = newID("mem_", time.Now()), "applied"
 		return protocol.MemoryResult{Status: "applied"}, nil
 	}
-	n, err := tx.PendingInTurn(ctx, *w.SessionID, w.TurnID)
+	n, err := tx.HeldInTurn(ctx, *w.SessionID, w.TurnID)
 	if err != nil {
 		return protocol.MemoryResult{}, err
 	}
@@ -235,16 +287,17 @@ func hold(ctx context.Context, tx *store.MemoryTx, held bool, w *store.MemoryWri
 }
 
 // Decide settles one of the person's pending writes: accept applies it to
-// the profile as it is now (a forget removes the lines that match now, and
-// records them as matched); reject leaves the profile alone. Another
-// person's write, or one already decided the other way, is ErrNotFound; the
-// same decision again returns the write unchanged (a retried click). An
-// accept that would take the profile past the cap is ErrFull, and the write
-// stays pending.
+// the profile as it is now, and reject leaves the profile alone. An accepted
+// forget removes only its held `matched` lines that are still in the
+// profile, what the person saw, never a fresh match (S59); matched stays as
+// held. Another person's write, or one already decided the other way, is
+// ErrNotFound; the same decision again returns the write unchanged (a
+// retried click). An accept that would take the profile past the cap is
+// ErrFull, and the write stays pending.
 func (m *Memory) Decide(ctx context.Context, p auth.Person, writeID string, accept bool) (protocol.MemoryWrite, error) {
-	want := "rejected"
+	want, outcome := "rejected", "discarded"
 	if accept {
-		want = "applied"
+		want, outcome = "applied", "accepted"
 	}
 	var (
 		out     store.MemoryWrite
@@ -265,13 +318,16 @@ func (m *Memory) Decide(ctx context.Context, p auth.Person, writeID string, acce
 			out = w
 			return nil
 		}
-		var matched []string
 		if accept {
-			if matched, err = apply(ctx, tx, w); err != nil {
+			err := apply(ctx, tx, w)
+			if errors.Is(err, ErrFull) {
+				m.count(w.Op, "full")
+			}
+			if err != nil {
 				return err
 			}
 		}
-		out, err = tx.DecideWrite(ctx, w.ID, want, matched)
+		out, err = tx.DecideWrite(ctx, w.ID, want)
 		decided = err == nil
 		return err
 	})
@@ -279,42 +335,39 @@ func (m *Memory) Decide(ctx context.Context, p auth.Person, writeID string, acce
 		return protocol.MemoryWrite{}, err
 	}
 	if decided {
+		m.count(out.Op, outcome)
 		m.emit(ctx, out)
 	}
 	return out.Protocol(), nil
 }
 
-// apply changes the profile as accepting w does, and returns what a forget
-// removed (nil for a remember).
-func apply(ctx context.Context, tx *store.MemoryTx, w store.MemoryWrite) ([]string, error) {
+// apply changes the profile as accepting w does.
+func apply(ctx context.Context, tx *store.MemoryTx, w store.MemoryWrite) error {
 	p, err := tx.Profile(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	var (
-		next    string
-		matched []string
-	)
+	var next string
 	switch w.Op {
 	case "remember":
 		fact, ok := oneLine(w.Text)
 		if !ok {
-			return nil, fmt.Errorf("memory: stored write %s has no valid fact", w.ID)
+			return fmt.Errorf("memory: stored write %s has no valid fact", w.ID)
 		}
 		if next = appendBullet(p.Content, fact); len(next) > protocol.MaxProfileBytes {
-			return nil, ErrFull
+			return ErrFull
 		}
 	case "forget":
-		next, matched = forgetLines(p.Content, strings.TrimSpace(w.Text))
+		next = removeLines(p.Content, w.Matched)
 	default:
-		return nil, fmt.Errorf("memory: stored write %s has op %q", w.ID, w.Op)
+		return fmt.Errorf("memory: stored write %s has op %q", w.ID, w.Op)
 	}
 	if next != p.Content {
 		if _, err := tx.SetProfile(ctx, next, p.Version); err != nil {
-			return nil, err
+			return err
 		}
 	}
-	return matched, nil
+	return nil
 }
 
 // untrusted reports whether a write in sess is held for taint: the
@@ -340,6 +393,12 @@ func (m *Memory) untrusted(ctx context.Context, sess store.Session, flagged bool
 // emit appends the write's memory.write to its session's log through the
 // sink. The write has committed, so a failure is logged, not returned: the
 // row is the record, and the client sees it in /tree and the profile.
+//
+// Emitting after the commit, outside the person's lock, lets two events of
+// one write land out of order: a decision made within milliseconds of the
+// held write can emit `applied` before `pending`. That is accepted: the
+// row stays the truth, and the PWA's reducer keys each write by id and
+// lets a decided status win over `pending` (Tasks 21/24).
 func (m *Memory) emit(ctx context.Context, w store.MemoryWrite) {
 	slog.Info("memory: write", "write", w.ID, "op", w.Op, "status", w.Status, "untrusted", w.Untrusted)
 	if w.SessionID == nil { // its conversation was deleted
@@ -418,6 +477,25 @@ func bulletFact(line string) (string, bool) {
 		return "", false
 	}
 	return t[2:], true
+}
+
+// removeLines removes, top to bottom, one profile line for each of lines
+// (compared without its line ending): the held lines of an accepted forget
+// that are still there (S59). Every other line is kept byte for byte.
+func removeLines(content string, lines []string) string {
+	left := make(map[string]int, len(lines))
+	for _, l := range lines {
+		left[l]++
+	}
+	var b strings.Builder
+	for _, line := range strings.SplitAfter(content, "\n") {
+		if text := strings.TrimRight(line, "\r\n"); left[text] > 0 {
+			left[text]--
+			continue
+		}
+		b.WriteString(line)
+	}
+	return b.String()
 }
 
 const crockford = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"

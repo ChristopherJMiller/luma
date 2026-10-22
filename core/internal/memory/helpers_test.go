@@ -52,10 +52,12 @@ var (
 // recording what Memory asks of it.
 type lateService struct {
 	*sessions.Service
-	mu      sync.Mutex
-	emits   []string // "<session>:<type>"
-	taints  int      // Taint calls
-	queries int      // Tainted calls
+	mu         sync.Mutex
+	emits      []string // "<session>:<type>"
+	taints     int      // Taint calls
+	queries    int      // Tainted calls
+	taintErr   error    // when set, Taint fails with it
+	taintedErr error    // when set, Tainted fails with it
 }
 
 func (l *lateService) Emit(ctx context.Context, sessionID, typ string, payload any) (int64, error) {
@@ -68,15 +70,30 @@ func (l *lateService) Emit(ctx context.Context, sessionID, typ string, payload a
 func (l *lateService) Tainted(ctx context.Context, sessionID string) (bool, error) {
 	l.mu.Lock()
 	l.queries++
+	err := l.taintedErr
 	l.mu.Unlock()
+	if err != nil {
+		return false, err
+	}
 	return l.Service.Tainted(ctx, sessionID)
 }
 
 func (l *lateService) Taint(ctx context.Context, sessionID string) error {
 	l.mu.Lock()
 	l.taints++
+	err := l.taintErr
 	l.mu.Unlock()
+	if err != nil {
+		return err
+	}
 	return l.Service.Taint(ctx, sessionID)
+}
+
+// fail makes Taint and Tainted fail with the given errors (nil: work).
+func (l *lateService) fail(taintErr, taintedErr error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.taintErr, l.taintedErr = taintErr, taintedErr
 }
 
 // calls returns the recorded emits and the Taint and Tainted call counts.
@@ -112,10 +129,12 @@ type harness struct {
 	svc  *sessions.Service
 	late *lateService
 	mem  *Memory
+	reg  *prometheus.Registry
 }
 
 // newHarness runs Memory over a real store and session service (the real
-// agent catalog, a conductor that accepts everything).
+// agent catalog, a conductor that accepts everything), counting into one
+// metrics registry.
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 	t.Parallel()
@@ -124,11 +143,37 @@ func newHarness(t *testing.T) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
+	reg := prometheus.NewRegistry()
+	m := metrics.NewCore(reg)
 	late := &lateService{}
-	mem := New(st, late, late)
+	mem := New(st, late, late, WithMetrics(m))
 	late.Service = sessions.NewService(st, agents.NewLive(cat), fakeConductor{}, mem, noAttachments{}, openGate{},
-		sessions.NopLedger{}, metrics.NewCore(prometheus.NewRegistry()), time.Now, sessions.Config{})
-	return &harness{t: t, st: st, svc: late.Service, late: late, mem: mem}
+		sessions.NopLedger{}, m, time.Now, sessions.Config{})
+	return &harness{t: t, st: st, svc: late.Service, late: late, mem: mem, reg: reg}
+}
+
+// counted reads luma_memory_writes_total{op,status} (0 if never counted).
+func (h *harness) counted(op, status string) float64 {
+	h.t.Helper()
+	mfs, err := h.reg.Gather()
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "luma_memory_writes_total" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			labels := map[string]string{}
+			for _, l := range m.GetLabel() {
+				labels[l.GetName()] = l.GetValue()
+			}
+			if labels["op"] == op && labels["status"] == status {
+				return m.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
 }
 
 // session creates a conversation with the luma agent and returns its row.
@@ -212,10 +257,17 @@ func (h *harness) taintedTurn(p auth.Person, sessionID string) string {
 	return turnID
 }
 
+// setProfile replaces the person's profile, as the editor would.
 func (h *harness) setProfile(p auth.Person, content string) {
 	h.t.Helper()
-	cur := h.profile(p)
-	if _, err := h.st.SetProfile(bg, p.ID, content, cur.Version); err != nil {
+	if err := h.st.InMemoryTx(bg, p.ID, func(m *store.MemoryTx) error {
+		cur, err := m.Profile(bg)
+		if err != nil {
+			return err
+		}
+		_, err = m.SetProfile(bg, content, cur.Version)
+		return err
+	}); err != nil {
 		h.t.Fatal(err)
 	}
 }
