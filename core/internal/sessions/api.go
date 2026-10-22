@@ -33,7 +33,7 @@ const (
 )
 
 // Routes registers C1's session routes, each behind requirePerson (the BFF's
-// RequirePerson). Task 11 adds /fork and /tree here (S12). It does not apply
+// RequirePerson), /fork and /tree included (Task 11, S12). It does not apply
 // UnsafeRequestGuard: Task 15 wraps the whole public mux in it, outside every
 // RequirePerson (S17). A handler's error body is ErrorInfo (C1, C3); the
 // auth layer's 401/403/415 stay status-only (S41).
@@ -48,6 +48,8 @@ func (s *Service) Routes(mux *http.ServeMux, requirePerson func(http.Handler) ht
 	route("POST /v1/sessions/{id}/unarchive", s.handleArchive(false))
 	route("POST /v1/sessions/{id}/events", s.handleEvent)
 	route("GET /v1/sessions/{id}/stream", s.handleStream)
+	route("POST /v1/sessions/{id}/fork", s.handleFork)
+	route("GET /v1/sessions/{root}/tree", s.handleTree)
 }
 
 // personHandler is a handler for a request RequirePerson admitted.
@@ -213,6 +215,30 @@ func (s *Service) handleEvent(w http.ResponseWriter, r *http.Request, p auth.Per
 		return
 	}
 	writeJSON(w, http.StatusOK, protocol.SendResult{Message: m})
+}
+
+// handleFork is POST /fork: ForkRequest{at_message} → the new Session (P4).
+func (s *Service) handleFork(w http.ResponseWriter, r *http.Request, p auth.Person) {
+	var req protocol.ForkRequest
+	if !readJSON(w, r, &req) {
+		return
+	}
+	ses, err := s.Fork(r.Context(), p, r.PathValue("id"), req.AtMessage)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, ses)
+}
+
+// handleTree is GET /tree: the whole conversation tree (P3).
+func (s *Service) handleTree(w http.ResponseWriter, r *http.Request, p auth.Person) {
+	tree, err := s.Tree(r.Context(), p, r.PathValue("root"))
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, tree)
 }
 
 // owned reads a session the person owns; anyone else's is ErrNotFound.

@@ -277,14 +277,18 @@ func (a *actor) send(ctx context.Context, p auth.Person, um protocol.UserMessage
 }
 
 // newestMessage is the parent of the next message: the session's newest
-// message, or none. A fork's first parent is Task 11's.
+// message; for a fork with none yet, the last message before its fork point
+// (forkParent); otherwise none.
 func (a *actor) newestMessage(ctx context.Context) (*string, error) {
 	if a.lastMsg != nil {
 		return a.lastMsg, nil
 	}
 	msgs, err := a.s.st.Messages(ctx, a.id)
-	if err != nil || len(msgs) == 0 {
+	if err != nil {
 		return nil, err
+	}
+	if len(msgs) == 0 {
+		return a.forkParent(ctx)
 	}
 	a.lastMsg = &msgs[len(msgs)-1].ID
 	return a.lastMsg, nil
@@ -410,27 +414,36 @@ func (a *actor) hostSpec(ctx context.Context) (protocol.HostSpec, error) {
 	if err != nil {
 		return protocol.HostSpec{}, err
 	}
+	resume, err := a.resume(ctx)
+	if err != nil {
+		return protocol.HostSpec{}, err
+	}
 	return protocol.HostSpec{
 		SessionID: a.id, RootID: a.sess.RootID, Person: protocol.HostPerson{Ref: ref}, Agent: a.spec,
 		Model: a.sess.Model, HelperModel: a.sess.HelperModel, Effort: a.sess.Effort, CacheTTL: a.sess.CacheTTL,
 		Workspace: a.sess.APIWorkspace, Source: a.sess.Source, Timezone: a.s.cfg.Location.String(),
 		ProfileContext: a.sess.ProfileSnapshot, WebfetchDenyDomains: slices.Clone(a.s.cfg.WebFetchDenyDomains),
-		Resume: a.resume(),
+		Resume: resume,
 	}, nil
 }
 
 // resume is set on every open of a session the SDK has reported, with the
-// last totals as the (informational, S31) baseline; null for a fresh one.
-func (a *actor) resume() *protocol.Resume {
+// last totals as the (informational, S31) baseline. A fork the SDK has not
+// seen yet resumes its fork point (forkResume); any other session the SDK
+// has not seen is fresh (null).
+func (a *actor) resume(ctx context.Context) (*protocol.Resume, error) {
 	if a.sess.SDKSessionID == nil {
-		return nil
+		if a.sess.ForkAtMessageID != nil {
+			return a.forkResume(ctx)
+		}
+		return nil, nil
 	}
 	r := &protocol.Resume{SDKSessionID: *a.sess.SDKSessionID}
 	if a.sess.LastTotals != nil {
 		t := *a.sess.LastTotals
 		r.BaselineTotals = &t
 	}
-	return r
+	return r, nil
 }
 
 func (a *actor) interrupt(ctx context.Context, p auth.Person) error {
