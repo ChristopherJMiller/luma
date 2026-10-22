@@ -528,6 +528,133 @@ func TestConductorLostFailsRunningTurn(t *testing.T) {
 	}
 }
 
+// S63: a turn Core ended without its result (here the S48 cap) still has
+// that result's cost ledgered when it comes, and nothing else changes.
+func TestLateTurnResultAfterTheCapIsLedgeredOnly(t *testing.T) {
+	h := newHarness(t)
+	ses := h.newSession(family)
+	h.send(family, ses.ID, "a long one")
+	turnID, _ := h.svc.RunningTurn(ses.ID)
+	h.link(ses.ID, protocol.LinkMessageStarted{Model: haiku}, protocol.LinkTextDelta{Text: "partial"})
+	h.advance(ses.ID, 15*time.Minute) // the cap: interrupt
+	h.advance(ses.ID, 30*time.Second) // no result: host.close{error}, the turn fails
+	if _, running := h.svc.RunningTurn(ses.ID); running {
+		t.Fatal("the turn is still running after the cap's grace")
+	}
+	before := h.messages(ses.ID, "assistant")
+	events := len(h.events(ses.ID, ""))
+	totals := h.row(ses.ID).LastTotals
+
+	late := result("sdk-late", "the answer, too late", 0.07)
+	h.svc.OnLinkEvent(ses.ID, turnID, late)
+	h.flush(ses.ID)
+	if len(h.led.turns) != 1 || h.led.turns[0].turnID != turnID || h.led.turns[0].usage.CostUSD != 0.07 {
+		t.Fatalf("ledger turns = %+v, want the late result's $0.07 for %s", h.led.turns, turnID)
+	}
+	if v := h.counter("luma_late_turn_results_total"); v != 1 {
+		t.Errorf("luma_late_turn_results_total = %v, want 1", v)
+	}
+	// The turn stays as it ended.
+	if after := h.messages(ses.ID, "assistant"); !reflect.DeepEqual(after, before) {
+		t.Errorf("assistant message changed:\n%+v\nwant\n%+v", after, before)
+	}
+	if before[0].Status != "error" || *before[0].ErrorCode != protocol.CodeUpstreamError {
+		t.Errorf("assistant message = %+v, want error upstream_error", before[0])
+	}
+	if n := len(h.events(ses.ID, "")); n != events {
+		t.Errorf("%d events after the late result, want %d", n, events)
+	}
+	row := h.row(ses.ID)
+	if !reflect.DeepEqual(row.LastTotals, totals) || row.Status != "idle" {
+		t.Errorf("session after the late result: last_totals %+v (want %+v), status %s", row.LastTotals, totals, row.Status)
+	}
+	// Once only.
+	h.svc.OnLinkEvent(ses.ID, turnID, late)
+	h.flush(ses.ID)
+	if len(h.led.turns) != 1 || h.counter("luma_late_turn_results_total") != 1 {
+		t.Errorf("a second late result was ledgered too: %d turns", len(h.led.turns))
+	}
+}
+
+func TestLateTurnResultAfterALostLink(t *testing.T) {
+	h := newHarness(t)
+	ses := h.newSession(family)
+	h.send(family, ses.ID, "hi")
+	turnID, _ := h.svc.RunningTurn(ses.ID)
+	h.svc.OnConductorLost([]string{ses.ID})
+	h.flush(ses.ID)
+	if !h.svc.EndedTurn(ses.ID, turnID) {
+		t.Fatal("a turn failed by a lost link is not an ended turn")
+	}
+	// A new turn runs meanwhile; the old one's result ledgers only itself.
+	h.send(family, ses.ID, "again")
+	newTurn, _ := h.svc.RunningTurn(ses.ID)
+	h.svc.OnLinkEvent(ses.ID, turnID, result("sdk-old", "old", 0.02))
+	h.flush(ses.ID)
+	if len(h.led.turns) != 1 || h.led.turns[0].turnID != turnID {
+		t.Fatalf("ledger turns = %+v, want the lost turn's", h.led.turns)
+	}
+	if running, ok := h.svc.RunningTurn(ses.ID); !ok || running != newTurn {
+		t.Fatalf("running turn = %q %v, want the new one untouched", running, ok)
+	}
+	if n := len(h.messages(ses.ID, "assistant")); n != 1 {
+		t.Errorf("%d assistant messages, want only the lost turn's (the late result stores none)", n)
+	}
+}
+
+func TestLateTurnResultWindow(t *testing.T) {
+	h := newHarness(t)
+
+	// Older than 30 minutes: dropped.
+	old := h.newSession(family)
+	h.send(family, old.ID, "hi")
+	oldTurn, _ := h.svc.RunningTurn(old.ID)
+	h.svc.OnConductorLost([]string{old.ID})
+	h.flush(old.ID)
+	h.clk.Advance(30 * time.Minute)
+	if h.svc.EndedTurn(old.ID, oldTurn) {
+		t.Error("an ended turn is still accepted after 30 minutes")
+	}
+	h.svc.OnLinkEvent(old.ID, oldTurn, result("sdk-x", "x", 0.01))
+	h.flush(old.ID)
+
+	// Ended by its host closing, not by a backstop or the link: no result can
+	// come, and none is ledgered.
+	closed := h.newSession(family)
+	h.send(family, closed.ID, "hi")
+	closedTurn, _ := h.svc.RunningTurn(closed.ID)
+	h.hostState(protocol.HostState{SessionID: closed.ID, State: "closed", Reason: "capacity"})
+	if h.svc.EndedTurn(closed.ID, closedTurn) {
+		t.Error("a turn its host closed under is an ended turn")
+	}
+	h.svc.OnLinkEvent(closed.ID, closedTurn, result("sdk-y", "y", 0.01))
+	h.flush(closed.ID)
+
+	if len(h.led.turns) != 0 {
+		t.Errorf("ledger turns = %+v, want none", h.led.turns)
+	}
+	if v := h.counter("luma_late_turn_results_total"); v != 0 {
+		t.Errorf("luma_late_turn_results_total = %v, want 0", v)
+	}
+}
+
+func TestEndedTurnsAreBoundedPerSession(t *testing.T) {
+	h := newHarness(t)
+	for i := range maxEndedTurns + 4 {
+		h.svc.noteEnded("ses_x", fmt.Sprintf("turn_%02d", i))
+		h.clk.Advance(time.Second)
+	}
+	h.svc.mu.Lock()
+	n := len(h.svc.ended["ses_x"])
+	h.svc.mu.Unlock()
+	if n != maxEndedTurns {
+		t.Errorf("%d ended turns kept, want %d", n, maxEndedTurns)
+	}
+	if h.svc.EndedTurn("ses_x", "turn_00") || !h.svc.EndedTurn("ses_x", fmt.Sprintf("turn_%02d", maxEndedTurns+3)) {
+		t.Error("the oldest ended turns were not the ones dropped")
+	}
+}
+
 func TestSweepOnStartFailsStuckTurns(t *testing.T) {
 	h := newHarness(t)
 	streamed := h.newSession(family)

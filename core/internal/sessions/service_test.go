@@ -309,6 +309,14 @@ func (l *fakeLedger) RecordTurn(_ context.Context, sess store.Session, turnID st
 	return nil
 }
 
+// count is the number of turns ledgered, for tests that wait on another
+// goroutine's actor.
+func (l *fakeLedger) count() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.turns)
+}
+
 func (l *fakeLedger) RecordMainRequest(sess store.Session, u protocol.MainRequestUsage) {
 	l.mu.Lock()
 	defer l.mu.Unlock()

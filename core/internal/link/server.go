@@ -67,6 +67,10 @@ type Sessions interface {
 	OnHostState(hs protocol.HostState)
 	OnConductorLost(sessionIDs []string)
 	RunningTurn(sessionID string) (turnID string, ok bool)
+	// EndedTurn: Core ended the turn without its turn_result (an S48
+	// backstop or a lost link) less than 30 minutes ago, so its late
+	// turn_result is let through for its cost (S63).
+	EndedTurn(sessionID, turnID string) bool
 	Barrier(ctx context.Context) error
 }
 
@@ -94,7 +98,12 @@ type Server struct {
 	// newTimer starts a timer of the purge and closing waits (tests inject a
 	// fake clock).
 	newTimer func(d time.Duration) (<-chan time.Time, func() bool)
-	accepted atomic.Int64 // links taken over, for tests
+	// now and newTicker are the keep-alive's clock: when a pong came, and the
+	// ping ticks (tests inject a fake clock, so a slow pong under load is
+	// waited for, not timed out).
+	now       func() time.Time
+	newTicker func(d time.Duration) (<-chan time.Time, func())
+	accepted  atomic.Int64 // links taken over, for tests
 
 	// mu guards cur, every conn's maps, and the two link gauges.
 	mu  sync.Mutex
@@ -141,6 +150,11 @@ func NewServer(h Handlers) *Server {
 		pongWait:  pongTimeout,
 		newTimer: func(d time.Duration) (<-chan time.Time, func() bool) {
 			t := time.NewTimer(d)
+			return t.C, t.Stop
+		},
+		now: time.Now,
+		newTicker: func(d time.Duration) (<-chan time.Time, func()) {
+			t := time.NewTicker(d)
 			return t.C, t.Stop
 		},
 	}
@@ -415,7 +429,7 @@ func (s *Server) serveLink(w http.ResponseWriter, r *http.Request) {
 		queue:  make(chan protocol.LinkFrame, queueSize),
 		opened: map[string]bool{}, closing: map[string]chan struct{}{}, purges: map[string]*purge{},
 	}
-	c.lastPong.Store(time.Now().UnixNano())
+	c.lastPong.Store(s.now().UnixNano())
 	s.takeOver(c)
 	slog.Info("link: conductor connected", "pod", id.PodName)
 
@@ -483,15 +497,15 @@ func (s *Server) end(c *conn, code websocket.StatusCode, reason string) {
 
 // keepAlive pings every pingEvery; a link with no pong for pongWait is lost.
 func (s *Server) keepAlive(c *conn) {
-	t := time.NewTicker(s.pingEvery)
-	defer t.Stop()
+	tick, stop := s.newTicker(s.pingEvery)
+	defer stop()
 	for {
 		select {
 		case <-c.done:
 			return
-		case <-t.C:
+		case <-tick:
 		}
-		if since := time.Since(time.Unix(0, c.lastPong.Load())); since >= s.pongWait {
+		if since := s.now().Sub(time.Unix(0, c.lastPong.Load())); since >= s.pongWait {
 			slog.Warn("link: no pong from the conductor; the link is lost", "since_pong", since.String())
 			s.end(c, websocket.StatusGoingAway, "no pong")
 			return
@@ -500,7 +514,7 @@ func (s *Server) keepAlive(c *conn) {
 			ctx, cancel := context.WithTimeout(c.ctx, s.pongWait)
 			defer cancel()
 			if c.ws.Ping(ctx) == nil {
-				c.lastPong.Store(time.Now().UnixNano())
+				c.lastPong.Store(s.now().UnixNano())
 			}
 		}()
 	}
@@ -565,11 +579,12 @@ func (s *Server) dispatch(c *conn, f protocol.LinkFrame) {
 			s.h.Sessions.OnHostState(f)
 		}
 	case protocol.EventFrame:
-		if s.bound(c, "event", f.SessionID, f.TurnID) {
+		_, result := f.Event.(protocol.TurnResult)
+		if s.bound(c, "event", f.SessionID, f.TurnID, result) {
 			s.h.Sessions.OnLinkEvent(f.SessionID, f.TurnID, f.Event)
 		}
 	case protocol.RPC:
-		if !s.bound(c, "rpc", f.SessionID, f.TurnID) {
+		if !s.bound(c, "rpc", f.SessionID, f.TurnID, false) {
 			go s.answer(c, protocol.RPCResult{RPCID: f.RPCID, Error: upstreamError()})
 			return
 		}
@@ -623,20 +638,29 @@ func (s *Server) hostState(c *conn, f protocol.HostState) bool {
 }
 
 // bound reports whether an event or rpc belongs to a session opened on this
-// link and to its running turn; anything else is counted and dropped.
-func (s *Server) bound(c *conn, what, sessionID, turnID string) bool {
+// link and to its running turn; anything else is counted and dropped. The
+// one exception is a turn_result (late) of a turn Core ended without it, by
+// an S48 backstop or a lost link: it goes on, from this link or a newer one,
+// so its cost is ledgered (S63).
+func (s *Server) bound(c *conn, what, sessionID, turnID string, late bool) bool {
 	s.mu.Lock()
 	open := c.opened[sessionID]
 	s.mu.Unlock()
+	reason := ""
 	if !open {
-		s.reject(rejectUnopened, what, "session", sessionID, "turn", turnID)
-		return false
+		reason = rejectUnopened
+	} else if running, ok := s.h.Sessions.RunningTurn(sessionID); !ok || running != turnID {
+		reason = rejectStaleTurn
 	}
-	if running, ok := s.h.Sessions.RunningTurn(sessionID); !ok || running != turnID {
-		s.reject(rejectStaleTurn, what, "session", sessionID, "turn", turnID)
-		return false
+	switch {
+	case reason == "":
+		return true
+	case late && s.h.Sessions.EndedTurn(sessionID, turnID):
+		slog.Info("link: a turn_result of a turn Core ended; passing it on for its cost", "session", sessionID, "turn", turnID)
+		return true
 	}
-	return true
+	s.reject(reason, what, "session", sessionID, "turn", turnID)
+	return false
 }
 
 func (s *Server) reject(reason, what string, kv ...any) {

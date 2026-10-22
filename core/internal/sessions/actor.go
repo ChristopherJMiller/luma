@@ -402,6 +402,7 @@ func (a *actor) onDeadline(ctx context.Context, turnID string, kind deadline) {
 			a.warn("host.close failed", err)
 		}
 		a.hostOpen = false
+		a.s.noteEnded(a.id, t.id) // its result may still come: its cost is ledgered (S63)
 		a.failTurn(ctx, protocol.CodeUpstreamError)
 	}
 }
@@ -466,6 +467,10 @@ func (a *actor) interrupt(ctx context.Context, p auth.Person) error {
 // store failure (S45).
 func (a *actor) onLink(ctx context.Context, turnID string, ev protocol.LinkEvent) {
 	if a.turn == nil || a.turn.id != turnID {
+		if r, ok := ev.(protocol.TurnResult); ok && a.s.takeEnded(a.id, turnID) {
+			a.lateResult(ctx, turnID, r)
+			return
+		}
 		slog.Debug("sessions: dropped a link event for a turn that is not running", "session", a.id, "turn", turnID, "type", ev.LinkEventType())
 		return
 	}
@@ -656,6 +661,23 @@ func (a *actor) turnResult(ctx context.Context, r protocol.TurnResult) {
 	a.endTurn(ctx, outcome)
 }
 
+// lateResult ledgers the cost of a turn_result that came after Core ended its
+// turn without it, by an S48 backstop or a lost link (S63): the spend is real
+// and must reach the budget, but the turn stays as it ended, so no message,
+// last_totals, status or event changes.
+func (a *actor) lateResult(ctx context.Context, turnID string, r protocol.TurnResult) {
+	if err := a.load(ctx); err != nil {
+		a.warn("a late turn_result for a session that cannot be read", err, "late_turn", turnID)
+		return
+	}
+	a.s.m.LateTurnResultsTotal.Inc()
+	slog.Info("sessions: a turn_result after its turn ended; ledgering its cost only", "session", a.id,
+		"late_turn", turnID, "cost_usd", r.Usage.CostUSD)
+	if err := a.s.led.RecordTurn(ctx, *a.sess, turnID, r.Usage, r.CostBasis); err != nil {
+		a.warn("ledger record of a late turn_result failed", err, "late_turn", turnID)
+	}
+}
+
 func (a *actor) recordTurn(ctx context.Context, r protocol.TurnResult) {
 	if err := a.s.led.RecordTurn(ctx, *a.sess, a.turn.id, r.Usage, r.CostBasis); err != nil {
 		a.warn("ledger record failed", err)
@@ -780,6 +802,9 @@ func closedCode(reason string) protocol.ErrorCode {
 
 func (a *actor) onConductorLost(ctx context.Context) {
 	a.hostOpen = false
+	if a.turn != nil {
+		a.s.noteEnded(a.id, a.turn.id) // its result may still come: its cost is ledgered (S63)
+	}
 	a.failTurn(ctx, protocol.CodeConductorRestarted)
 }
 

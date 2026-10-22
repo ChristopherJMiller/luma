@@ -75,6 +75,7 @@ type linkEvent struct {
 type fakeSessions struct {
 	mu       sync.Mutex
 	running  map[string]string
+	ended    map[string]string // session -> a turn Core ended without its result (S63)
 	events   []linkEvent
 	states   []protocol.HostState
 	lost     [][]string
@@ -89,7 +90,21 @@ type fakeSessions struct {
 	slow time.Duration
 }
 
-func newFakeSessions() *fakeSessions { return &fakeSessions{running: map[string]string{}} }
+func newFakeSessions() *fakeSessions {
+	return &fakeSessions{running: map[string]string{}, ended: map[string]string{}}
+}
+
+func (f *fakeSessions) EndedTurn(sessionID, turnID string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.ended[sessionID] == turnID
+}
+
+func (f *fakeSessions) setEnded(sessionID, turnID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ended[sessionID] = turnID
+}
 
 func (f *fakeSessions) OnLinkEvent(sessionID, turnID string, ev protocol.LinkEvent) {
 	f.mu.Lock()
@@ -250,12 +265,71 @@ type option struct {
 
 func withRPC(r RPCHandler) option { return option{handlers: func(h *Handlers) { h.RPC = r }} }
 
-func withLiveness(ping, pong time.Duration) option {
-	return option{server: func(s *Server) { s.pingEvery, s.pongWait = ping, pong }}
-}
-
 func withClock(c *fakeClock) option {
 	return option{server: func(s *Server) { s.newTimer = c.newTimer }}
+}
+
+// liveClock is the keep-alive's fake clock. Time moves, and a ping tick is
+// delivered, only when the test steps it, so a test can wait for each pong
+// however long the machine takes: a slow pong is never a timeout (the
+// liveness tests failed under the full -race suite with real 150 ms timeouts).
+type liveClock struct {
+	mu   sync.Mutex
+	now  time.Time
+	tick chan time.Time
+}
+
+func newLiveClock() *liveClock {
+	return &liveClock{now: time.Unix(1_800_000_000, 0), tick: make(chan time.Time)}
+}
+
+func (c *liveClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *liveClock) newTicker(time.Duration) (<-chan time.Time, func()) { return c.tick, func() {} }
+
+// step moves the clock by d and hands the keep-alive one tick. It returns the
+// new time, and false when no keep-alive took the tick (its link has ended).
+func (c *liveClock) step(d time.Duration) (time.Time, bool) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	now := c.now
+	c.mu.Unlock()
+	select {
+	case c.tick <- now:
+		return now, true
+	case <-time.After(10 * time.Second):
+		return now, false
+	}
+}
+
+func withLiveClock(c *liveClock) option {
+	return option{server: func(s *Server) { s.now, s.newTicker = c.Now, c.newTicker }}
+}
+
+// waitPong waits, as long as the machine needs, until the current link's
+// last pong is the one recorded at t.
+func (h *harness) waitPong(t time.Time) {
+	h.t.Helper()
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		h.srv.mu.Lock()
+		var last int64
+		if h.srv.cur != nil {
+			last = h.srv.cur.lastPong.Load()
+		}
+		h.srv.mu.Unlock()
+		if last == t.UnixNano() {
+			return
+		}
+		if time.Now().After(deadline) {
+			h.t.Fatalf("no pong recorded at %v", t)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func newHarness(t *testing.T, opts ...option) *harness {
@@ -590,26 +664,40 @@ func TestLinkPingTimeoutCallsOnConductorLost(t *testing.T) {
 		t.Fatalf("liveness = ping %v, pong %v; want 10s and 30s", pingInterval, pongTimeout)
 	}
 
-	// A conductor that answers pings stays up across many pong timeouts.
-	h := newHarness(t, withLiveness(20*time.Millisecond, 150*time.Millisecond))
+	// A conductor that answers pings stays up across many pong timeouts: two
+	// minutes of the fake clock, each tick taken only once the last ping's
+	// pong is in.
+	clk := newLiveClock()
+	h := newHarness(t, withLiveClock(clk))
 	alive := h.connect(false)
 	h.open(alive, "ses_A")
-	time.Sleep(750 * time.Millisecond)
+	for i := range 12 {
+		now, ok := clk.step(pingInterval)
+		if !ok {
+			t.Fatalf("tick %d was not taken: the keep-alive stopped (lost %v)", i+1, h.sess.Lost())
+		}
+		h.waitPong(now)
+	}
 	if !h.srv.Connected() || len(h.sess.Lost()) != 0 {
 		t.Fatalf("a responsive link was dropped: connected %v, lost %v", h.srv.Connected(), h.sess.Lost())
 	}
 
-	// A conductor that never reads never answers a ping: lost after the timeout.
-	h2 := newHarness(t, withLiveness(20*time.Millisecond, 150*time.Millisecond))
+	// A conductor that never reads never answers a ping: lost once 30 s have
+	// passed since its last pong (the accept), not before.
+	clk2 := newLiveClock()
+	h2 := newHarness(t, withLiveClock(clk2))
 	mute := h2.connect(true)
 	if err := h2.srv.Open(bg, spec("ses_M")); err != nil {
 		t.Fatal(err)
 	}
-	start := time.Now()
-	eventually(t, "the mute link is lost", func() bool { return len(h2.sess.Lost()) == 1 })
-	if took := time.Since(start); took < 100*time.Millisecond {
-		t.Fatalf("lost after %v, before the pong timeout", took)
+	for _, at := range []string{"10 s", "20 s", "30 s"} {
+		// The keep-alive takes a tick only after its check of the previous
+		// one, so taking the 30 s tick shows the 20 s check kept the link.
+		if _, ok := clk2.step(pingInterval); !ok {
+			t.Fatalf("the %s tick was not taken: lost before the pong timeout (lost %v)", at, h2.sess.Lost())
+		}
 	}
+	eventually(t, "the mute link is lost", func() bool { return len(h2.sess.Lost()) == 1 })
 	if got := h2.sess.Lost(); !reflect.DeepEqual(got, [][]string{{"ses_M"}}) {
 		t.Fatalf("OnConductorLost = %v, want [[ses_M]]", got)
 	}
@@ -774,6 +862,46 @@ func TestEventForStaleTurnRejected(t *testing.T) {
 	}
 }
 
+// S63: the turn_result of a turn Core ended without it (an S48 backstop or a
+// lost link) goes on to the sessions for its cost, from the link it ran on
+// or a newer one where the session is not open. Nothing else of that turn
+// does, and a turn_result of any other stale turn is still rejected.
+func TestLateTurnResultOfAnEndedTurnPassesThrough(t *testing.T) {
+	h := newHarness(t)
+	c := h.connect(false)
+	h.open(c, "ses_A")
+	h.sess.setEnded("ses_A", "turn_1") // the backstop gave up on it; nothing runs now
+
+	late := protocol.EventFrame{SessionID: "ses_A", TurnID: "turn_1", Event: protocol.TurnResult{SDKUUID: "u1"}}
+	c.send(textDelta("ses_A", "turn_1", "a late delta"))
+	c.send(protocol.EventFrame{SessionID: "ses_A", TurnID: "turn_0", Event: protocol.TurnResult{SDKUUID: "u0"}})
+	c.send(late)
+	eventually(t, "the late turn_result is forwarded", func() bool { return len(h.sess.Events()) == 1 })
+	if got := h.sess.Events(); !reflect.DeepEqual(got, []linkEvent{{"ses_A", "turn_1", "turn_result"}}) {
+		t.Fatalf("events forwarded = %v, want only turn_1's turn_result", got)
+	}
+	if got := rejected(t, h, "stale_turn"); got != 2 {
+		t.Fatalf("stale_turn rejections = %v, want 2 (the delta and turn_0's result)", got)
+	}
+
+	// After a lost link, the result can only come on a newer one, where the
+	// session is not open.
+	h.sess.setEnded("ses_B", "turn_9")
+	c.send(protocol.EventFrame{SessionID: "ses_B", TurnID: "turn_9", Event: protocol.TurnResult{SDKUUID: "u9"}})
+	c.send(protocol.EventFrame{SessionID: "ses_B", TurnID: "turn_9", Event: protocol.LinkMessageStarted{Model: "m"}})
+	c.send(protocol.EventFrame{SessionID: "ses_C", TurnID: "turn_9", Event: protocol.TurnResult{SDKUUID: "u9"}})
+	eventually(t, "two unopened rejections", func() bool { return rejected(t, h, "unopened") == 2 })
+	want := []linkEvent{{"ses_A", "turn_1", "turn_result"}, {"ses_B", "turn_9", "turn_result"}}
+	if got := h.sess.Events(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("events forwarded = %v, want %v", got, want)
+	}
+	// An rpc of an ended turn is still refused.
+	c.send(protocol.RPC{RPCID: "rpc_9", SessionID: "ses_A", TurnID: "turn_1", Method: "memory.remember", Params: protocol.RPCParams{Text: "x"}})
+	if f, ok := c.next().(protocol.RPCResult); !ok || f.RPCID != "rpc_9" || f.OK {
+		t.Fatalf("answer to an ended turn's rpc = %#v", f)
+	}
+}
+
 func TestMalformedFramesRejected(t *testing.T) {
 	h := newHarness(t)
 	c := h.connect(false)
@@ -924,7 +1052,8 @@ func TestReopenWaitsForTheOldHostsClose(t *testing.T) {
 // The reader keeps reading while a slow actor holds the forwarder, so pongs
 // flow and the link stays up; the held frames are then forwarded in order.
 func TestSlowActorKeepsTheLinkAlive(t *testing.T) {
-	h := newHarness(t, withLiveness(20*time.Millisecond, 150*time.Millisecond))
+	clk := newLiveClock()
+	h := newHarness(t, withLiveClock(clk))
 	c := h.connect(false)
 	h.open(c, "ses_A")
 	h.sess.setRunning("ses_A", "turn_1")
@@ -933,7 +1062,15 @@ func TestSlowActorKeepsTheLinkAlive(t *testing.T) {
 		c.send(textDelta("ses_A", "turn_1", fmt.Sprint(i)))
 	}
 	<-held
-	time.Sleep(600 * time.Millisecond) // four pong timeouts
+	// Two minutes of the fake clock (four pong timeouts) while the forwarder
+	// is held: every pong still comes in.
+	for i := range 12 {
+		now, ok := clk.step(pingInterval)
+		if !ok {
+			t.Fatalf("tick %d was not taken: the keep-alive stopped while the actor was slow", i+1)
+		}
+		h.waitPong(now)
+	}
 	if !h.srv.Connected() || len(h.sess.Lost()) != 0 {
 		t.Fatalf("a slow actor dropped the link: connected %v, lost %v", h.srv.Connected(), h.sess.Lost())
 	}

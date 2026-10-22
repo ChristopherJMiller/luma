@@ -94,6 +94,14 @@ const (
 	errorGrace     = 120 * time.Second // after a link error, the wait for its turn_result
 )
 
+// Late results (S63): a turn Core ended without its turn_result, by an S48
+// backstop or a lost link, still has that result's cost ledgered when it
+// arrives within lateWindow. A session keeps at most maxEndedTurns of them.
+const (
+	lateWindow    = 30 * time.Minute
+	maxEndedTurns = 16
+)
+
 var (
 	// ErrNotFound: the session, or the agent, does not exist or is not the
 	// person's (404).
@@ -150,6 +158,10 @@ type Service struct {
 	mu      sync.Mutex
 	actors  map[string]*actor // live actors by session id
 	running map[string]string // session id -> running turn id
+	// ended are the turns Core ended without their result (S63): session id
+	// -> turn id -> when. Kept here, not in the actor, which may stop before
+	// the result comes.
+	ended map[string]map[string]time.Time
 }
 
 // NewService builds the service. Call SweepOnStart before serving.
@@ -170,6 +182,7 @@ func NewService(st *store.Store, live *agents.Live, c Conductor, prof ProfileSou
 		hub:           hub{subs: map[string]map[*liveSub]struct{}{}},
 		actors:        map[string]*actor{},
 		running:       map[string]string{},
+		ended:         map[string]map[string]time.Time{},
 	}
 }
 
@@ -399,6 +412,68 @@ func (s *Service) RunningTurn(sessionID string) (turnID string, ok bool) {
 	defer s.mu.Unlock()
 	turnID, ok = s.running[sessionID]
 	return turnID, ok
+}
+
+// EndedTurn reports whether turnID is a turn of the session that Core ended
+// without its turn_result, by an S48 backstop or a lost link, less than 30
+// minutes ago. The link lets that turn's late turn_result through, even on a
+// link the session is not open on, and only its cost is recorded (S63).
+func (s *Service) EndedTurn(sessionID, turnID string) bool {
+	now := s.clock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	at, ok := s.ended[sessionID][turnID]
+	return ok && now.Sub(at) < lateWindow
+}
+
+// noteEnded records a turn Core ended without its result (S63), dropping
+// every entry older than lateWindow and, past maxEndedTurns, the session's
+// oldest.
+func (s *Service) noteEnded(sessionID, turnID string) {
+	now := s.clock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for sid, turns := range s.ended {
+		for tid, at := range turns {
+			if now.Sub(at) >= lateWindow {
+				delete(turns, tid)
+			}
+		}
+		if len(turns) == 0 {
+			delete(s.ended, sid)
+		}
+	}
+	turns := s.ended[sessionID]
+	if turns == nil {
+		turns = map[string]time.Time{}
+		s.ended[sessionID] = turns
+	}
+	for len(turns) >= maxEndedTurns {
+		oldest := ""
+		for tid, at := range turns {
+			if oldest == "" || at.Before(turns[oldest]) {
+				oldest = tid
+			}
+		}
+		delete(turns, oldest)
+	}
+	turns[turnID] = now
+}
+
+// takeEnded is EndedTurn, removing the turn: its late result is ledgered once.
+func (s *Service) takeEnded(sessionID, turnID string) bool {
+	now := s.clock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	at, ok := s.ended[sessionID][turnID]
+	if !ok {
+		return false
+	}
+	delete(s.ended[sessionID], turnID)
+	if len(s.ended[sessionID]) == 0 {
+		delete(s.ended, sessionID)
+	}
+	return now.Sub(at) < lateWindow
 }
 
 func (s *Service) setRunning(sessionID, turnID string) {

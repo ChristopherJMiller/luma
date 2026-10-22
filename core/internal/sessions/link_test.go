@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -237,5 +238,62 @@ func TestRetryAfterHostCloseErrorWaitsForTheOldHost(t *testing.T) {
 	}
 	if errs := h.events(ses.ID, "error"); len(errs) != 1 {
 		t.Fatalf("error events = %d, want only the first turn's", len(errs))
+	}
+}
+
+// S63, over the real link: the cap gives up on a turn (S48), its result then
+// arrives while the old host is still closing, and its cost is ledgered;
+// the message stays as the backstop left it.
+func TestLateTurnResultOverTheLinkIsLedgered(t *testing.T) {
+	h := newHarness(t)
+	late := &lateService{}
+	srv := link.NewServer(link.Handlers{
+		Auth: internalauth.Middleware(tokenReviewer{}, "luma-internal",
+			map[string]internalauth.Principal{"system:serviceaccount:luma:luma-conductor": internalauth.PrincipalConductor},
+			internalauth.PrincipalConductor),
+		Sessions: late,
+		Metrics:  h.m,
+	})
+	svc := h.service(srv)
+	late.Service = svc
+	c := dialConductor(t, srv)
+
+	ses, err := svc.Create(bg, family, protocol.CreateSession{Agent: "luma"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Send(bg, family, ses.ID, userMsg("one", newClientID())); err != nil {
+		t.Fatal(err)
+	}
+	c.next() // host.open
+	ts := c.next().(protocol.TurnSend)
+	c.send(protocol.EventFrame{SessionID: ses.ID, TurnID: ts.TurnID, Event: protocol.LinkMessageStarted{Model: haiku}})
+	waitFor(t, "the message starts", func() bool { return len(h.messages(ses.ID, "assistant")) == 1 })
+
+	h.clk.Advance(15 * time.Minute) // the cap
+	if f := c.next(); f != (protocol.TurnInterrupt{SessionID: ses.ID}) {
+		t.Fatalf("frame = %#v, want turn.interrupt", f)
+	}
+	h.clk.Advance(interruptGrace) // no result: Core gives up
+	if f := c.next(); f != (protocol.HostClose{SessionID: ses.ID, Reason: "error"}) {
+		t.Fatalf("frame = %#v, want host.close{error}", f)
+	}
+	waitFor(t, "the turn fails", func() bool { _, running := svc.RunningTurn(ses.ID); return !running })
+	before := h.messages(ses.ID, "assistant")
+
+	// The CLI finished after all: its result comes on the closing host.
+	c.send(protocol.EventFrame{SessionID: ses.ID, TurnID: ts.TurnID, Event: result("sdk-late", "late", 0.04)})
+	waitFor(t, "the late result is ledgered", func() bool { return h.led.count() == 1 })
+	h.led.mu.Lock()
+	got := h.led.turns[0]
+	h.led.mu.Unlock()
+	if got.turnID != ts.TurnID || got.usage.CostUSD != 0.04 {
+		t.Fatalf("ledgered %+v, want the late result's $0.04 for %s", got, ts.TurnID)
+	}
+	if after := h.messages(ses.ID, "assistant"); !reflect.DeepEqual(after, before) || after[0].Status != "error" {
+		t.Fatalf("assistant message = %+v, want it as the backstop left it (%+v)", after, before)
+	}
+	if v := h.counter("luma_late_turn_results_total"); v != 1 {
+		t.Fatalf("luma_late_turn_results_total = %v, want 1", v)
 	}
 }
