@@ -4,7 +4,7 @@
 
 **Status:** approved for execution 2026-10-21 (Chris: /goal), pre-flight rulings applied; Task 0 done (6eca2d1).
 
-*History:* draft v2 2026-10-18, revised after the adversarial reviews (coherence, security, deploy, caching/harness); final review round 2026-10-19 (login takes Google and Microsoft, each pinned per address, Task 8); pre-flight rulings S1–S23 applied 2026-10-21; spike rulings S24–S35 (Tasks 2–4: the fake's ignore list, gateway TLS and paths, SDK consequences) applied 2026-10-21 (see "Rulings").
+*History:* draft v2 2026-10-18, revised after the adversarial reviews (coherence, security, deploy, caching/harness); final review round 2026-10-19 (login takes Google and Microsoft, each pinned per address, Task 8); pre-flight rulings S1–S23 applied 2026-10-21; spike rulings S24–S35 (Tasks 2–4: the fake's ignore list, gateway TLS and paths, SDK consequences) applied 2026-10-21; review rulings S36–S44 and the Tasks 2–8b review carries applied to the later tasks 2026-10-22 (see "Rulings").
 
 **Goal:** Chris chats with Luma from his Android phone and laptop. He gets streaming answers with web search, a memory profile he can edit, image/camera/PDF attachments, a history list and edit/regenerate branches. It is served by Luma Core (Go), the conductor (TypeScript, Claude Agent SDK) and a PWA (assistant-ui), and ships as one Helm chart with images pinned by digest.
 
@@ -32,7 +32,7 @@
 - The cluster side is the companion plan `luma-homeops/docs/superpowers/plans/2026-10-18-luma-phase1-deploy.md`. The seam is contracts C6, C8 and C10 below.
 
 Research behind the interfaces (checked 2026-10-18):
-- **Agent SDK.** The TS reference: `settings` takes an inline object, plus `mcpServerStatus()` and `applyFlagSettings()`. Also the hooks pages (`PostModelSwitch` since CLI 2.1.251; SessionStart sources `startup|resume|clear|compact|fork`), cost-tracking (totals are saved on normal exit and restored on resume **and** fork since 2.1.277), env-vars (`CLAUDE_CODE_AUTO_COMPACT_WINDOW` floor 100000; `CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS`) and settings (`switchModelsOnFlag`, `idleCompaction` default true on the 1h TTL). **`precomputeCompactionEnabled` is not documented**, so Spike S7 proves it exists or it is dropped.
+- **Agent SDK.** The TS reference: `settings` takes an inline object, plus `mcpServerStatus()` and `applyFlagSettings()`. Also the hooks pages (`PostModelSwitch` since CLI 2.1.251; SessionStart sources `startup|resume|clear|compact|fork`), cost-tracking (totals are saved on normal exit and restored on resume **and** fork since 2.1.277), env-vars (`CLAUDE_CODE_AUTO_COMPACT_WINDOW` floor 100000; `CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS`) and settings (`switchModelsOnFlag`, `idleCompaction` default true on the 1h TTL). **`precomputeCompactionEnabled` is not documented**; Spike S7 found the CLI reads it, defaulting to true (`PRECOMPUTE_SETTING_EXISTS = true`), so the inline settings keep it `false`.
 - **agentgateway v1.6.0** `schema/config.md` and source:
   - route-level `policies.apiKey`;
   - `ai.routes` falls back to **`completions`** for an unlisted path, so narrowing is done with route `matches`;
@@ -84,7 +84,7 @@ Every task's requirements include these. Values are copied from the spec. *(plan
 - **Web tools:**
   - The caps count **searches, not calls**: 3 per turn and 15 per session, counted from PostToolUse's `tool_response.searchCount` (Spike S17: `WEB_SEARCH_COUNT_SOURCE = 'postToolUse'`; the result's `webSearchRequests` delta agrees).
   - One WebSearch call can run `max_uses: 8` (S17: the nested request's `web_search_20250305` tool), so the worst case is 10 searches a turn ($0.10) and 22 a session ($0.22).
-  - **These bounds hold for `WEB_SEARCH_COUNT_SOURCE = 'postToolUse'` (S21), which Spike S17 found.** With `resultDelta`, the hook would count each call as 1 until `turn_result` set the true count, and the worst case would become 3 calls × `max_uses` a turn.
+  - **These bounds rest on `WEB_SEARCH_COUNT_SOURCE = 'postToolUse'` (S17, S21 amended):** PostToolUse records each call's true count before the next call's PreToolUse check. A CLI bump that moves the count elsewhere fails `sdk-spike` (a change detector) and reopens S21.
   - WebFetch must pass the URL guard (Task 18), then goes through smokescreen (`HTTPS_PROXY`). The CLI's own domain check goes to `api.anthropic.com:443` through it too, so smokescreen allows that host and the guard denies model-chosen fetches there (S33).
 - **CLI:** CLI ≥ 2.1.268, and the SDK and CLI are pinned exactly. Renovate groups their bumps **weekly** with a **3-day** minimum age, behind the eval gate. The CLI lives in its own final image layer.
 - **SDK issues to design around:** #348 (keep the input iterable open), #391 (one long-lived query; `pathToClaudeCodeExecutable` = the platform package's native `claude`, never `bin/claude.exe`, a stub under pnpm 10; S35), #268 (never `listSessions`), #370 (MCP proxies as a local **HTTP** server), #289 (large-session resume test), #432 (no `cache_control` in streamed user messages), #378 (a stream outlives its bearer; phase 1 uses static gateway bearers).
@@ -189,7 +189,7 @@ These are the five inputs the spec implies but no spec-derived test covers, most
 
 ## Rulings (2026-10-21)
 
-S1–S23 come from the pre-flight consistency scan (48 findings), S24–S35 from Tasks 2–4's spikes; all adopted. Each is written into the task text it touches; this list is the index.
+S1–S23 come from the pre-flight consistency scan (48 findings), S24–S35 from Tasks 2–4's spikes, S36–S44 from the reviews of Tasks 4–8b; all adopted. Each is written into the task text it touches; this list is the index.
 
 - **S1** (F1, F39, F47): Task 15 serves `GET /v1/me` and `/v1/agents[/{id}]`; `Me`/`AgentSummary` in Task 5; Core derives `source`; the Gate also guards Create (503/402). Touches C1, 5, 9a, 10, 15, 22.
 - **S2** (F2): Core persists `sdk_session_id` (from a re-sent `host.state`) and `last_totals`, and every reopen gets `HostSpec.resume`. Touches C2, 7, 9a, 19b, 19c.
@@ -211,7 +211,7 @@ S1–S23 come from the pre-flight consistency scan (48 findings), S24–S35 from
 - **S18** (F20, F21, F44, F45, F46): `MaxAttachmentBytes`; `NoThinking` and `SearchResult`; package names; the trailing-dot guard; buildx in the flake. Touches C3, 0, 2, 4, 5, 12, 18, 20, 23.
 - **S19** (F22, F23, F28, F29, F42): lockfiles staged with their dependencies; one CLI source; `check-versions` compares the CLI lock, the gateway digest and `SubagentTool`; assistant-ui pinned before shadcn; e2e images by digest. Touches Global Constraints, 4, 6, 20, 25, 26a, 28a, 28b and the commit steps.
 - **S20** (F27, F41): the change-detector carve-out; `satisfies` plus a typecheck in `make lint`; exact-string tests; id tests assert monotonic, not contiguous. Touches Global Constraints, CLAUDE.md, 3, 4, 5, 9a, 9b, 18, 24.
-- **S21** (F30): the search-cap bound is restated under `resultDelta`, and Task 18's 8-search test becomes conditional. Touches Global Constraints, 4, 18, 19b.
+- **S21** (F30), amended after Task 4's review: Spike S17 found `postToolUse`, so the search-cap bound is 10 a turn and 22 a session, and Task 18's 8-search test runs unconditionally (no `resultDelta` path). Touches Global Constraints, 4, 18, 19b.
 - **S22** (F37): the retention copy drops "encrypted". Touches 24.
 - **S23** (F38): six more spec deviations in CLAUDE.md. Touches 0 (done in the Task 0 follow-up commit).
 
@@ -228,6 +228,17 @@ S1–S23 come from the pre-flight consistency scan (48 findings), S24–S35 from
 - **S33** (Task 4): smokescreen `web` allows `api.anthropic.com:443` for the CLI's WebFetch domain check (a chart default no site value may deny); the URL guard still denies model-chosen fetches there. Touches Global Constraints (web tools), C8, 18, 26b, 27, 28b, deploy Global Constraints/Task 7.
 - **S34** (Task 4): a store resume runs the CLI in the SDK's `${TMPDIR}/claude-resume-<uuid>`; `TMPDIR` is the conductor's own, inside the sized emptyDir, and the cleanup covers it. Touches Global Constraints, P18, C6, C8, 16, 19b, 19c, 26a.
 - **S35** (Task 4): the conductor launches the platform package's native `claude` (`bin/claude.exe` is a stub); Task 25's image ships it in its own final layer. Touches Global Constraints, C6, 16, 19b, 25, 26a.
+
+**Review rulings,** from the reviews of Tasks 4–8b:
+- **S36** (Task 4): weekly `compaction.forced` expects exactly one binding 400 per compaction (the first post-compaction body) and replays the stripped retry plus the next turn's first thinking-carrying request with `prefix_mismatch_behavior: "error"`. Touches 27.
+- **S37** (Task 5): runtime decoders reject missing required keys and wrong type tags but ignore unknown keys; tests stay strict; additive = compatible, removals and renames lockstep. Touches C1, 5 (done, 6e789d1), 19a.
+- **S38** (Task 7): `AppendEvent` serialises per session with `pg_advisory_xact_lock` until commit, so ids commit in id order and `since=N` replay never skips. Touches 7 (done, d130b06), 9b.
+- **S39** (Task 7): a tree delete sends `tree.purge` and waits for the conductor's new `tree.purged` ack (or link-down, ≤ 30 s) before `store.DeleteTree`; the janitor deletes transcript rows whose `project_key` has no session row. Touches C2, 9b, 10, 15, 19b, 19c.
+- **S40** (Task 7): the janitor prunes `message.text_delta` events (the `Relaxed` kinds) of completed messages older than 7 days; durable events stay, and an old tree's replay comes from its completed messages (P23). Touches 15.
+- **S41** (Task 8): the auth layer's 401/403/415 are status-only plain text, not `ErrorInfo`; the PWA acts on status. Touches C1 (done, 0c47977); Task 20's `api maps 401 to unauthenticated` already keys on the status.
+- **S42** (Task 8): an unsafe request with an empty body needs no `Content-Type` (Origin is the CSRF control). Touches C1 (done, 0c47977).
+- **S43** (Task 8b): internal 401/403/503 are status-only; 503 (with `Retry-After`) means the TokenReview could not complete and is retryable with backoff. Touches C10 (done, e3fa97c), 14b, 19c, 27.
+- **S44** (Task 8b): Task 26a's chart adds a NetworkPolicy admitting only the conductor, evals and reconcile pods to Core :8081 and only Traefik to :8080; inert on flannel until kube-network-policies (phase 4), defence in depth, never relied on. Touches C8, 26a, 26b, 28a.
 
 **Deploy-seam rulings (2026-10-21),** from the deploy plan's pre-flight scan (luma-homeops `docs/superpowers/plans/2026-10-18-luma-phase1-deploy.md`, its D-numbers):
 - **D7:** the deploy plan's Task 3 starts from tag `stage-1a`. Touches cross-plan ordering, the Stage 1A gate.
@@ -337,7 +348,7 @@ Frames are JSON `{type, ...}`. Hand-written fixtures for every type live in `pro
 - `turn.send{session_id, turn_id, content: ContentBlock[], untrusted: bool}`. Attachments are inlined as base64 image/document blocks or fenced text, and the `<luma-now>` block is already appended. `untrusted` = the session is tainted.
 - `turn.interrupt{session_id}`
 - `host.close{session_id, reason:"deleted"|"shutdown"|"maintenance"}`
-- `tree.purge{root_id, person_ref}`: remove the tree's project dirs (`conv/<root_id>` and `config/<person_ref>/projects/<root_id>`) after its hosts close, even when none is open (S14)
+- `tree.purge{root_id, person_ref}`: remove the tree's project dirs (`conv/<root_id>` and `config/<person_ref>/projects/<root_id>`) after its hosts close, even when none is open (S14). Core deletes the tree's rows only after the `tree.purged` ack, link-down or 30 s, whichever comes first (S39)
 - `rpc.result{rpc_id, ok, result?: MemoryResult, error?: ErrorInfo}`, where `MemoryResult = {status:"applied"|"pending"|"disabled"|"full"|"rejected", write_id?: string, removed?: number, code?: ErrorCode}`
 - `shutdown{reason}`
 
@@ -346,6 +357,7 @@ Frames are JSON `{type, ...}`. Hand-written fixtures for every type live in `pro
 - `host.state{session_id, state:"ready"|"closed", sdk_session_id?, reason?: "idle"|"evicted"|"capacity"|"error"|"shutdown"|"deleted"|"maintenance"}`. The host sends `ready` when it opens, and **`ready` again with `sdk_session_id` as soon as the SDK reports the session id** (a fresh session learns it from its first `system/init`); Core persists any `sdk_session_id` it receives (S2).
 - `event{session_id, turn_id, event: LinkEvent}`
 - `rpc{rpc_id, session_id, turn_id, method:"memory.remember"|"memory.forget", params:{text, untrusted}}`
+- `tree.purged{root_id}`: the ack of `tree.purge`, sent once `pool.purgeTree` has closed the tree's hosts, let their `SessionStore` appends settle and removed the dirs (also after a purge that failed, which is logged). Added by Task 10 to the Go and TS protocol packages with fixture `protocol/fixtures/link/tree-purged.json`; additive, so compatible (S37, S39)
 
 Core accepts `event` and `rpc` only for a session opened **on this link**, and only with the session's **running** `turn_id`. Anything else is dropped and counted in `luma_link_rejected_total{reason}`.
 
@@ -560,6 +572,7 @@ The registries are created **before their first users** (S3): every Core descrip
 | `usageReconcile.adminKeySecretName` | `luma-anthropic-admin` | key `ANTHROPIC_ADMIN_KEY` → file `/run/secrets/anthropic-admin/key`, **mounted by this CronJob only** |
 | `priorityClass` | `{create: true, name: luma-batch, value: -5}` | evals and reconcile pods only (P25) |
 | `serviceMonitor` | `{enabled: false, labels: {}}` | — |
+| `networkPolicy.{enabled,publicFrom,metricsFrom}` | `true`; `[{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: traefik}}, podSelector: {matchLabels: {app.kubernetes.io/name: traefik}}}]`; `[{namespaceSelector: {}}]` | NetworkPolicy `luma-core` on the Core pods (S44): `:8081` only from this release's conductor, evals and reconcile pods; `:8080` only from `publicFrom` (Traefik); `:9090` from `metricsFrom`. Inert on flannel today, enforced once kube-network-policies lands (phase 4); defence in depth, never relied on |
 
 **Default `egress.web.denyRanges`.** smokescreen already denies RFC1918, CGNAT, link-local, loopback, ULA, NAT64, 6to4, Teredo and IPv4-mapped; they are listed anyway to state intent:
 
@@ -899,7 +912,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
     - The host's baseline rule (P11) is asserted here: delta = result total − baseline, and is never negative across all three cases.
   - **S7 `settings path`:**
     - `settings: {idleCompaction: false, switchModelsOnFlag: true}` passed inline is observed. Record how.
-    - With and without `precomputeCompactionEnabled: false`, record whether a precompute request appears, and set `PRECOMPUTE_SETTING_EXISTS`. If it has no effect, Task 16 drops the key and CLAUDE.md records it.
+    - With and without `precomputeCompactionEnabled: false`, record whether a precompute request appears, and set `PRECOMPUTE_SETTING_EXISTS`. **Result:** `true` (the CLI reads the key, default true, behind a server flag that is off offline), so Task 16 keeps `precomputeCompactionEnabled: false`.
   - **S8 `fork at a message`:**
     - From U1, A1 (thinking + `WebSearch` tool use + tool result + text), U2, A2: fork **from a second ConversationHost with an empty local dir**, reading the store only.
     - Use `resume + forkSession + resumeSessionAt` = the uuid of the **last main-loop entry of turn 1**, and send U2'.
@@ -930,7 +943,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
     - The fake returns them on a reply, with `ANTHROPIC_BETAS=thinking-binding-controls-2026-08-01` in the CLI env. Record whether any SDK message exposes them (`INPUT_TRANSFORMATIONS_VISIBLE`).
     - If they are exposed, Task 16 adds that `ANTHROPIC_BETAS` key to `buildEnv`, and Task 19a counts `luma_conductor_thinking_dropped_total`.
     - If not, the key stays out, and detection rests on the gateway 400 alert and the nightly replays.
-  - **S17 `web search count`:** one WebSearch call whose nested request reports `web_search_requests: 3`. Record where 3 appears (`WEB_SEARCH_COUNT_SOURCE`). If it is `resultDelta`, Step 5 restates the Global Constraints search worst case (S21).
+  - **S17 `web search count`:** one WebSearch call whose nested request reports `web_search_requests: 3`. Record where 3 appears (`WEB_SEARCH_COUNT_SOURCE`). **Result:** `'postToolUse'` (PostToolUse's `tool_response.searchCount`; the result's `webSearchRequests` delta agrees), so the worst case stays 10 searches a turn and 22 a session (S21 amended).
 - [ ] **Step 2: Run** `nix develop -c make sdk-spike`. Expected: each case PASS, or a recorded FAIL with its branch applied.
 - [ ] **Step 3: Write `conductor/src/spike-results.ts`.** Record every taken branch in CLAUDE.md "Deviations".
 - [ ] **Step 4: CI.** Add job `sdk-spike` (`nix develop -c make sdk-spike`, no key, offline) to `ci-ok`.
@@ -940,7 +953,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
   - `MODEL_SWITCH_SIGNAL` changes nothing in C2;
   - `CONTEXT_DELIVERY` changes nothing in Core (the `first-user-turn` fallback is the conductor's, Task 19b);
   - S1 failed → C7 gains `luma_conductor_resume_prefix_changed_total`, and C6/C8's idle default becomes 55;
-  - `WEB_SEARCH_COUNT_SOURCE === 'resultDelta'` → restate the Global Constraints search worst case from S17's numbers (S21).
+  - `WEB_SEARCH_COUNT_SOURCE` is `'postToolUse'`, so the Global Constraints search worst case stands (S21 amended).
 
   **Gateway config (S8):** if `CLI_PATHS` holds a path beyond the two documented ones, add it to both routes' `matches` (and `ai.routes`, with its route type). Replace the provisional `request_class` regex with the exact `REQUEST_CLASSES` set. Then re-run `nix develop -c make gateway-spike` until it is green.
 
@@ -1058,7 +1071,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
 - Produces:
   - `func Open(ctx, cfg PGConfig) (*Store, error)` (pgx; `PGSSLMODE` honoured as libpq does) and `func (s *Store) Migrate(ctx) error` (goose v3, embedded FS).
   - `func (s *Store) GrantConductor(ctx, role string) error` (C4 grants, idempotent).
-  - `type Durability int; const (Durable Durability = iota; Relaxed)`, and `func (s *Store) AppendEvent(ctx, sessionID, typ string, payload any, d Durability) (int64, error)`. `Relaxed` runs `SET LOCAL synchronous_commit = off` in its transaction (P24).
+  - `type Durability int; const (Durable Durability = iota; Relaxed)`, and `func (s *Store) AppendEvent(ctx, sessionID, typ string, payload any, d Durability) (int64, error)`. `Relaxed` runs `SET LOCAL synchronous_commit = off` in its transaction (P24). Appends serialise per session with `pg_advisory_xact_lock` until commit, so a session's ids commit in id order and `since=N` replay never skips one (S38; done, pinned by a test that fails without the lock).
   - `func (s *Store) EventsSince(ctx, sessionID string, since int64, limit int) ([]protocol.Event, error)`.
   - `func (s *Store) DeleteTree(ctx, personID, rootID string) error`, in one transaction:
     - the tree's sessions, messages, events and attachments;
@@ -1188,6 +1201,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
 
 **Files:**
 - Create: `core/internal/sessions/{service.go,actor.go,title.go,nowctx.go,service_test.go,actor_test.go,nowctx_test.go}`
+- Modify: `core/internal/agents/{agentfile.go,agents_test.go}` (`AgentFile.Admits`)
 
 **Interfaces:**
 - Consumes:
@@ -1197,7 +1211,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
   - `Ledger`, which Task 14 implements; `NopLedger` stands in until then (S3).
 - Produces:
   ```go
-  type Conductor interface { Open(ctx, protocol.HostSpec) error; SendTurn(ctx, protocol.TurnSend) error; Interrupt(ctx, sessionID string) error; Close(ctx, sessionID, reason string) error; PurgeTree(ctx, rootID, personRef string) error; Connected() bool }
+  type Conductor interface { Open(ctx, protocol.HostSpec) error; SendTurn(ctx, protocol.TurnSend) error; Interrupt(ctx, sessionID string) error; Close(ctx, sessionID, reason string) error; PurgeTree(ctx, rootID, personRef string) error; Connected() bool }   // PurgeTree returns after the conductor's tree.purged ack, link-down or 30 s (S39, Task 10)
   type Gate interface { CheckNewTurn(ctx) *protocol.ErrorInfo }   // maintenance (Task 10) + budget (Task 14); checked on Create AND Send (S1)
   type AttachmentResolver interface { Bind(ctx, p auth.Person, rootID string, ids []string, tier string) ([]protocol.ContentBlock, error) }  // owner check, binds to root, caps (Task 12)
   type EventSink interface { Emit(ctx context.Context, sessionID, typ string, payload any) (int64, error) }   // goes through the session's actor
@@ -1206,7 +1220,8 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
     RecordMainRequest(sess store.Session, u protocol.MainRequestUsage)
   }
   type NopLedger struct{}   // stand-in until Task 14
-  type Config struct { Location *time.Location; WebFetchDenyDomains []string }   // no HelperModel: it comes from Live.Models() at Create (S11)
+  type Config struct { Location *time.Location; WebFetchDenyDomains []string }   // no HelperModel: it comes from Create's catalog snapshot (S11)
+  func (a agents.AgentFile) Admits(personTier string) bool   // added to core/internal/agents by this task: audience tier "" admits everyone, "family" admits family and admin, "admin" admits admin only; Task 15 uses the same method
   func NewService(st *store.Store, live *agents.Live, c Conductor, prof ProfileSource, att AttachmentResolver, gate Gate, led Ledger, m *metrics.Core, clock func() time.Time, cfg Config) *Service
   func (s *Service) Create(ctx, p auth.Person, req protocol.CreateSession) (protocol.Session, error)
   func (s *Service) Send(ctx, p auth.Person, sessionID string, ev protocol.ClientEvent) (*protocol.Message, error)
@@ -1226,10 +1241,12 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
   - **`client_id` idempotency:** a repeated id returns the existing message and starts no turn.
   - **Create:**
     - **`Gate.CheckNewTurn` runs first** (S1): maintenance → 503 `maintenance`, budget → 402 `budget_exhausted`, and no row is written;
-    - checks the agent's audience; tier ∈ the agent's tiers (default first);
+    - **one catalog snapshot** (Task 6 review): `cat := s.live.Load()` once, and everything below comes from `cat`: the agent (`cat.Agent`), the spec (`cat.Compile(id, tier)`, or `Live.Compile`, which also uses one snapshot), `helper_model` (`cat.Models().HelperModel`) and `bound_models`. Never `live.Agent` then `live.Models()`: a reload between the calls would mix two catalogs;
+    - **the agent must be `kind: agent` and `Admits(p.Tier)`**, otherwise 404, as `/v1/agents/{id}` answers (a subagent such as `deep-think` never gets a session); tier ∈ the agent's tiers (default first);
     - **`deep` needs tier admin**; `workspace` must be `none`; effort ∈ `{low, medium, high}`, defaulting to the binding's;
     - **`source` is derived, not read** (S1): a cookie-authenticated Create is `web`, and any client-sent `source` is ignored. `api_workspace` is `interactive` for `web` (S5);
-    - stores the compiled `AgentSpec`, `helper_model` from `live.Models().HelperModel` (S11), `profile_snapshot` = `ProfileSource.Snapshot` **verbatim** (already fenced; empty if incognito or memory `none`; S13) and `bound_models` (model, helper, subagent models).
+    - stores the compiled `AgentSpec`, `helper_model` (S11), `profile_snapshot` = `ProfileSource.Snapshot` **verbatim** (already fenced; empty if incognito or memory `none`; S13) and `bound_models` (the spec's model, the helper, the subagent models), all from the one snapshot;
+    - **no compiled-spec cache.** The session stores its snapshot. Any cache added later keys on the `TierBinding` (or the `*Catalog`) as well as `AgentFile.Version`, because `Version` hashes only AGENT.md and ignores `models.yaml` (Task 6 review).
   - **HostSpec:** `person.ref` comes from `store.PersonRef`. `workspace` = the session's `api_workspace`, `helper_model` = its stored `helper_model`, `profile_context` = its `profile_snapshot`. `timezone` and `webfetch_deny_domains` come from `Config`.
   - **Open and resume (S2):**
     - Core sends `host.open` lazily, on the first Send after the session has no host on the current link;
@@ -1272,6 +1289,8 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
   - `TestSweepOnStartFailsStuckTurns`.
   - `TestCapacityClosedFailsTurn`.
   - `TestDeepTierAdminOnly`, `TestWorkspaceOtherThanNoneRejected`.
+  - `TestCreateRefusesSubagentAndAudience`: Create on `deep-think` (`kind: subagent`) → 404; an agent with `audience: {tier: admin}` → 404 for a family person, created for an admin; no session row for the refusals.
+  - `TestAdmits` (`core/internal/agents`): the three audience values against `admin` and `family`, typed in the test.
   - `TestNowContextUsesConfiguredTimezone`: clock `2026-10-19T02:30:00Z` with `America/Los_Angeles` → contains `2026-10-18`.
   - `TestTitleFromFirstMessage` (60 runes, whitespace collapsed).
   - `TestOtherPersonsSession404`.
@@ -1280,10 +1299,10 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
   - `TestTurnSendCarriesUntrusted`.
   - `TestHostSpecCarriesRefNotName`: the spec has `person.ref` and no `display_name` or registry id.
   - `TestSinkEventsSerialisedWithTurnEvents`: 100 sink emits interleaved with deltas. The session's events, in id order, have strictly increasing ids with no duplicates, and the set of ids equals the set the emits returned. Not contiguity: `events.id` is a global identity (S20).
-- [ ] **Step 2: Run** `go test ./core/internal/sessions/ -run 'Service|Actor|Now|Title|Create|Source|Helper|HostState|TurnResult|Reopen|Fresh|MainRequest|Thinking|UserMessage|ProfileSnapshot'`. Expected: FAIL.
+- [ ] **Step 2: Run** `go test ./core/internal/sessions/ -run 'Service|Actor|Now|Title|Create|Source|Helper|HostState|TurnResult|Reopen|Fresh|MainRequest|Thinking|UserMessage|ProfileSnapshot' && go test ./core/internal/agents/ -run Admits`. Expected: FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** the tests again. Expected: PASS.
-- [ ] **Step 5: Commit.** `git add core/internal/sessions go.mod go.sum && git commit -m "sessions: actors, one message per turn, taint, resume on reopen, startup sweep"`
+- [ ] **Step 5: Commit.** `git add core/internal/sessions core/internal/agents go.mod go.sum && git commit -m "sessions: actors, one message per turn, taint, resume on reopen, startup sweep"`
 
 ### Task 9b: The session HTTP API and the WebSocket stream
 
@@ -1295,12 +1314,17 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
 - Produces: `func (s *Service) Routes(mux *http.ServeMux, requirePerson func(http.Handler) http.Handler)`, and `func (s *Service) Subscribe(ctx, p auth.Person, sessionID string, since int64) (<-chan protocol.Event, error)`.
   - `Routes` registers C1's session routes except `/fork` and `/tree`, which Task 11 adds to `api.go` (S12). It does **not** apply `UnsafeRequestGuard`: Task 15 wraps the whole public mux in it, outside every `RequirePerson` (S17).
   - `POST /v1/sessions` maps `Gate` refusals to 503 `maintenance` / 402 `budget_exhausted` (S1).
+  - `func (s *Service) DeleteTree(ctx, personID, rootID string) error`: the one tree-delete path, used by `DELETE` and by the Task 15 janitor (S39), in this order:
+    1. mark the root deleting: from here, Send and Fork on any session of the tree answer 404, so no host reopens mid-delete;
+    2. `Conductor.PurgeTree(root, <the owner's person ref>)`, which returns once the conductor acks with `tree.purged`, the link drops, or 30 s pass (Task 10); a timeout is logged and the delete goes on (the janitor's orphan sweep catches a late mirror write);
+    3. `store.DeleteTree`.
 - **WS rules:**
-  - subscribe to live **before** reading `EventsSince`, then dedupe by id;
+  - subscribe to live **before** reading `EventsSince`, then dedupe by id. Ids of one session commit in id order (S38, Task 7), so a `since` read never skips one;
   - check the Origin and cookie;
   - ping every 25 s;
   - drop subscribers more than 1000 events behind (the client reconnects with `since`);
-  - **close with 4401 when `OnSessionEnded` fires** for that web session or person.
+  - **close with 4401 when `OnSessionEnded` fires** for that web session or person;
+  - **no missed session end (Task 8 review):** before `websocket.Accept`, take the web session's hash with `auth.WebSessionIDHashFrom(r.Context())` and register the socket under that hash and the person in the session-end index; then re-check the row with `store.WebSession(ctx, hash, now)`. A session that ended in between gets 401 and no upgrade. So neither a `SetRegistry` nor a janitor `Sweep` running between `RequirePerson` and the upgrade can leave a socket open.
 
 - [ ] **Step 1: Write failing tests:**
   - `TestReplaySinceNoGapsNoDupes`: 500 events emitted concurrently with a subscribe at `since=N`. The subscriber receives exactly the 500 ids the emits returned, each once, in strictly increasing order (S20: monotonic, not contiguous; `events.id` is a global identity).
@@ -1308,6 +1332,8 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
   - `TestWSClosedOnLogout`, `TestWSClosedOnRegistryRemoval`.
   - `TestSlowSubscriberDropped`.
   - `TestDeleteDeletesTree`: `DELETE` on a fork id removes the root and its siblings, and calls `Conductor.PurgeTree(root, <the owner's person ref>)`.
+  - `TestDeletePurgesBeforeRows` (S39): the fake `Conductor.PurgeTree` blocks; while it blocks the tree's rows still exist and a Send on a sibling → 404; once it returns the rows are gone. A `PurgeTree` that returns a timeout error still deletes the rows.
+  - `TestWSSessionEndedDuringUpgrade`: a test hook ends the web session between `RequirePerson` and `Accept` → 401 and no upgrade; a session ended right after `Accept` → the socket closes with 4401.
   - `TestCreateMapsGateRefusals` (S1): 503 `maintenance`, 402 `budget_exhausted`.
 - [ ] **Step 2: Run** `go test ./core/internal/sessions/ -run 'Replay|WS|Slow|Delete|CreateMaps'`. Expected: FAIL.
 - [ ] **Step 3: Implement** with `coder/websocket`.
@@ -1319,6 +1345,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
 **Files:**
 - Create: `core/internal/link/{server.go,server_test.go}`, `core/internal/maintenance/{maintenance.go,admin.go,maintenance_test.go}`
 - Create (S12): `core/cmd/luma-core/main.go`, a subcommand dispatcher: `serve` (a stub that prints "serve: not wired yet (Task 15)" and exits 1), `maintenance on|off|status [--reason] [--drain-timeout=120s]`, and an unknown subcommand → usage on stderr, exit 2. Tasks 14b and 15 modify it.
+- Modify (S39): `core/internal/protocol/{link.go,marshal.go,fixtures_test.go,marshal_test.go}`, `packages/protocol/src/{link.ts,schema.ts}` and `packages/protocol/test/fixtures.test.ts`, and create `protocol/fixtures/link/tree-purged.json`: the conductor → Core frame `TreePurged` / `tree.purged{root_id}`. C2 already lists it (the S39 plan amendment), which is the Stage 1B gate's mirror for this hunk.
 
 **Interfaces:**
 - Consumes: `sessions.Service`, `internalauth.Middleware(…, "conductor")`, and the memory handlers (Task 13) behind `type RPCHandler func(ctx, sessionID, turnID, method string, params json.RawMessage) (protocol.MemoryResult, error)`.
@@ -1332,6 +1359,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
   - **Liveness:** ping every 10 s; no pong for 30 s → lost.
   - **Session binding:** `event`/`rpc` are accepted only for sessions opened on this link and the running `turn_id`. Anything else is counted in `luma_link_rejected_total{reason=unopened|stale_turn}`.
   - **RPC ownership:** the person is derived **from the session row**, never from params. Incognito, memory `none` and unknown sessions → `MemoryResult{status:"disabled"}`.
+  - **Purge waits for its ack (S39):** `PurgeTree(ctx, root, ref)` sends `tree.purge` and blocks until `tree.purged{root_id: root}` arrives on the same link, that link is lost or superseded, or 30 s pass (then it returns a timeout error the caller logs). With no link connected it returns at once: the conductor's hosts closed on link loss. Concurrent purges of one root share one ack; a `tree.purged` with no waiting purge is ignored.
 - **Maintenance rules:**
   - **On:**
     1. refuse `Create`/`Send` with `maintenance`;
@@ -1350,11 +1378,13 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
   - `TestAdminListenerIsLoopbackOnly`: `maintenance.ListenAdmin` refuses `0.0.0.0:8082`, `:8082` and `[::]:8082`, and accepts `127.0.0.1:0` and `[::1]:0`. (Task 15's `config.Load` repeats the check on `LUMA_ADMIN_LISTEN`.)
   - `TestMaintenanceRefusesCreate` (S1): with maintenance on, `CheckNewTurn` returns `maintenance`.
   - `TestTreePurgeCarriesPersonRef` (S14): `PurgeTree(root, ref)` sends `tree.purge{root_id: root, person_ref: ref}`.
+  - `TestPurgeTreeWaitsForAck` (S39): `PurgeTree` has not returned before the test conductor sends `tree.purged`, and returns within 100 ms after; it returns on link loss without an ack; with the clock faked, it returns a timeout error at 30 s; with no link it returns at once.
+  - `TestTreePurgedFixtureRoundTrips`: Go and TS decode and re-encode `tree-purged.json` (the protocol fixture tests' frame lists gain `tree.purged`).
   - `TestShutdownReasonMaintenance`: a `host.state{closed, reason:"maintenance"}` decodes and is accepted.
-- [ ] **Step 2: Run** `go test ./core/internal/link/ ./core/internal/maintenance/ && go build ./core/cmd/luma-core`. Expected: FAIL.
+- [ ] **Step 2: Run** `go test ./core/internal/link/ ./core/internal/maintenance/ ./core/internal/protocol/ && pnpm --filter @luma/protocol test && go build ./core/cmd/luma-core`. Expected: FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** the tests again. Expected: PASS.
-- [ ] **Step 5: Commit.** `git add core/internal/link core/internal/maintenance core/cmd/luma-core go.mod go.sum && git commit -m "link: authenticated conductor WS, newest wins, turn-bound events; maintenance via loopback admin"`
+- [ ] **Step 5: Commit.** `git add core/internal/link core/internal/maintenance core/cmd/luma-core core/internal/protocol packages/protocol protocol go.mod go.sum && git commit -m "link: authenticated conductor WS, newest wins, turn-bound events, acked tree purge; maintenance via loopback admin"`
 
 ### Task 11: Fork and the conversation tree (P3, P4)
 
@@ -1560,6 +1590,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
   ```
 - `drift_usd = ledger_usd − api_usd` and `drift_ratio = drift_usd / max(api_usd, 0.01)`, both exported per workspace. The alert threshold (ratio *and* dollars, so near-zero days stay quiet) lives in the deploy plan.
 - **The key never leaves the reconcile process:** it is not logged, not posted to Core, and not in errors.
+- **Core's 503 is retried (S43):** `Run` retries its C10 POST on 503 with backoff (1 s, 2 s, 4 s, 8 s, 16 s, or `Retry-After` when longer; 5 retries), re-reading `tokenFile` each attempt. Any other non-2xx, or a sixth 503, fails the run (non-zero exit).
 
 - [ ] **Step 1: Write failing tests:**
   - **Admin client** (`httptest` fake Admin API):
@@ -1573,6 +1604,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
     - `TestWorkspaceNameMapping` (S5): ledger rows with `api_workspace` `ci` give `luma-ci` its `ledger_usd`, and `luma-interactive` sums only `interactive` rows. An unknown name `luma-other` → 422.
     - `TestUpsertIdempotent`.
     - `TestReconcileGaugesInitialisedFromDB` (S7): `InitGauges` sets `luma_usage_reconcile_last_success_timestamp_seconds` and each workspace's drift gauges from the newest rows.
+  - **Run:** `TestRunRetriesCore503` (S43; fake clock): two 503s with `Retry-After: 1`, then 200 → success after three POSTs; six 503s → error; a 403 → error at once, no retry.
 - [ ] **Step 2: Run** `go test ./core/internal/reconcile/`. Expected: FAIL.
 - [ ] **Step 3: Implement.** Check the endpoints, parameters and amount units against the Anthropic Admin API docs at implementation time, and update the testdata if they differ. Record the endpoints, parameters and units in `docs/spikes/phase-1.md` **§R** (S12); Task 29 copies them into `docs/operations.md`.
 - [ ] **Step 4: Run** the tests again. Expected: PASS.
@@ -1582,7 +1614,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
 
 **Files:**
 - Create: `core/internal/config/{config.go,config_test.go}`, `core/internal/web/{static.go,headers.go,v1.go,*_test.go}`, `core/internal/janitor/{janitor.go,janitor_test.go}`, `core/cmd/luma-core/serve_test.go`
-- Modify: `core/cmd/luma-core/main.go` (Task 10 created it; `serve` replaces its stub)
+- Modify: `core/cmd/luma-core/main.go` (Task 10 created it; `serve` replaces its stub); `core/internal/store/` (new `janitor.go` + `janitor_test.go`: `DeleteOrphanTranscripts(ctx) (int64, error)` and `PruneDeltaEvents(ctx, before time.Time, batch int) (int64, error)`; S39, S40)
 
 **Interfaces:**
 - Consumes: everything in stage 1B.
@@ -1597,14 +1629,14 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
     On start it runs `Migrate`, `GrantConductor`, `SweepOnStart`, `ledger.InitGauges` and `reconcile.InitGauges` (S7). It builds one `agents.Live` (with `Live.Watch` on `LUMA_CONFIG_DIR`) and runs `auth.WatchRegistry(ctx, path, bff.SetRegistry)` (S11), and passes the real `*ledger.Ledger` to `NewService` (S3). Also `luma-core config-check` (loads and validates config, exits 0).
   - `config.Load(env func(string) string) (Config, error)` for C6. **Empty or missing secrets are errors**; so are a signing key under 32 bytes (decoded with standard base64, measured after decoding), a non-loopback admin listener and an unknown time zone.
   - `main.go` has `import _ "time/tzdata"`.
-  - `GET /internal/v1/agents/{id}/spec?tier=` returns `EvalSpec` (C10), from `agents.Live`.
+  - `GET /internal/v1/agents/{id}/spec?tier=` returns `EvalSpec` (C10), from **one** snapshot `cat := live.Load()`: `cat.Compile(id, tier)` and `cat.Models().HelperModel` (Task 6 review).
   - **`/v1/me` and `/v1/agents` (S1),** in `core/internal/web/v1.go`, behind `RequirePerson`:
     ```go
     type V1Deps struct { Budget interface{ Status(ctx context.Context, now time.Time) protocol.BudgetStatus }; Maintenance interface{ Enabled() bool }; Agents *agents.Live; Clock func() time.Time }
     func V1Routes(mux *http.ServeMux, requirePerson func(http.Handler) http.Handler, d V1Deps)
     ```
     - `GET /v1/me` → `protocol.Me{person:{id, display_name, tier}, budget, maintenance}`;
-    - `GET /v1/agents` → `{agents: AgentSummary[]}` and `GET /v1/agents/{id}` → `AgentSummary`, per C1's filter (`kind: agent`, audience, `deep` for admins only); otherwise 404.
+    - `GET /v1/agents` → `{agents: AgentSummary[]}` and `GET /v1/agents/{id}` → `AgentSummary`, per C1's filter, otherwise 404. **`Live.List()` returns subagents too** (Task 6 review), so keep only `Kind == "agent"`, then `AgentFile.Admits(person.Tier)` (Task 9a, the same audience rule Create applies), and list `deep` only for admins.
 - **Security headers** on every public response:
   - `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' wss://<public host>; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; manifest-src 'self'; worker-src 'self'`
   - `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Permissions-Policy: camera=(), microphone=(), geolocation=()`
@@ -1613,11 +1645,27 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
 - **Static:**
   - `/assets/*` → `public, max-age=31536000, immutable`; `/sw.js` and `/index.html` → `no-cache`.
   - Unknown GETs fall back to `index.html`, **except under `/v1/`, `/auth/` and `/internal/`**.
-- **Janitor** (every 10 min): incognito sessions idle > 24 h (tree delete plus `PurgeTree(root, ref)`), unbound attachments > 24 h, expired web sessions.
+- **Internal auth wiring (Task 8b review):**
+  - `apiServer, err := internalauth.APIServerFromEnv(KUBERNETES_SERVICE_HOST, KUBERNETES_SERVICE_PORT)`; an error is a startup error;
+  - `principals, err := internalauth.ParsePrincipals(LUMA_INTERNAL_PRINCIPALS)` inside `config.Load`; an error is a config error;
+  - `rev := internalauth.NewKubeReviewer(apiServer, LUMA_KUBE_CA_FILE, LUMA_KUBE_TOKEN_FILE, LUMA_INTERNAL_AUDIENCE)`. **`rev.Err() != nil` is a startup error** (an unusable CA, a non-https API server): `serve` exits non-zero before listening;
+  - every C10 route is `internalauth.Middleware(rev, LUMA_INTERNAL_AUDIENCE, principals, <its principal>)`, with the **same** audience value passed to `NewKubeReviewer`.
+- **One origin list (Task 8 review):** `config.Load` parses and validates `LUMA_ALLOWED_ORIGINS` once (each `scheme://host[:port]`, no path; default the public URL's origin; an invalid entry is a config error), and that same slice goes to `auth.UnsafeRequestGuard` and `BFFConfig.AllowedOrigins`.
+- **Agents reload metric (Task 6 review):** `live.OnReload(func(err error) { … })`, registered **before** `Live.Watch`, increments `luma_agents_reload_total{result="ok"}` or `{result="error"}`.
+- **Janitor** (every 10 min):
+  - incognito sessions idle > 24 h, through `Service.DeleteTree` (purge, ack, then rows; S39);
+  - unbound attachments > 24 h;
+  - **web sessions: `bff.Sweep(ctx)`, never `store.DeleteExpiredWebSessions`**, so an expired or idle session fires `OnSessionEnded` and its WebSockets close (Task 8 review);
+  - **orphan transcripts (S39):** `store.DeleteOrphanTranscripts(ctx)` deletes `sdk_transcript_entries` rows whose `project_key` matches no `sessions.id` (a mirror write that landed after its tree's delete). The root row is created before any host opens, so a live tree never matches;
+  - **old deltas (S40):** `store.PruneDeltaEvents(ctx, now − 7 days, 10000)` deletes `message.text_delta` events (the only `Relaxed` kind, Task 9a; a new `Relaxed` kind joins this list in its own commit) older than 7 days whose `message_id` is a message with status `complete`, in transactions of ≤ 10 000 rows. Every durable event stays, so `message.started`/`message.completed` still replay and an old tree's text comes from its completed messages (P23).
 
 - [ ] **Step 1: Write failing tests:**
   - **Headers and static:** `TestCSPExact`; `TestHSTSFollowsPublicURL` (D19: an https `LUMA_PUBLIC_URL` with a plain-http request → the header is present; an http `LUMA_PUBLIC_URL` → absent); `TestSPAFallbackNotForAPI` (`/v1/nope` → 404 JSON); `TestAssetsImmutableSWNoCache`.
-  - **Janitor:** `TestJanitorDeletesIdleIncognitoOnly`.
+  - **Janitor:**
+    - `TestJanitorDeletesIdleIncognitoOnly` (through `Service.DeleteTree`: the fake conductor sees `tree.purge` before the rows go).
+    - `TestJanitorSweepsWebSessionsThroughBFF`: an expired web session's row is gone and `OnSessionEnded` fired for it.
+    - `TestJanitorDeletesOrphanTranscripts` (S39; store test against real PG): rows under a `project_key` with no session go; a live tree's rows stay.
+    - `TestJanitorPrunesOldDeltas` (S40; store test): deltas of a `complete` message 8 days old go; deltas 6 days old, deltas of a `running` or `error` message, and every non-delta event stay; 25 000 old deltas go in three transactions.
   - **Config:**
     - `TestConfigRequiresSecrets`: an empty `LUMA_OIDC_CLIENT_SECRET` → error naming it.
     - `TestConfigRejectsShortSigningKey` (31 decoded bytes rejected, 32 accepted), `TestConfigRejectsUnknownTimezone`, `TestConfigRejectsNonLoopbackAdmin`.
@@ -1631,6 +1679,11 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
     - `TestReadyzFailsWithoutCatalog`.
     - `TestInternalRoutesNotOnPublicPort`.
     - `TestSpecEndpointRequiresEvalsPrincipal`.
+    - `TestServeRefusesReviewerConfigError`: an unreadable `LUMA_KUBE_CA_FILE` → `serve` exits non-zero before any listener opens.
+    - `TestInternalAudienceShared`: the fake API server sees `spec.audiences == [LUMA_INTERNAL_AUDIENCE]`, and a review answering another audience → 401.
+    - `TestConfigRejectsBadPrincipals` and `TestConfigRejectsBadOrigin`.
+    - `TestOneOriginListForGuardAndBFF`: with `LUMA_ALLOWED_ORIGINS=https://a.example`, a POST and a WS handshake from `https://a.example` pass the Origin checks; from `https://b.example` both get 403.
+    - `TestAgentsReloadCounted`: a good reload adds 1 to `luma_agents_reload_total{result="ok"}`, a broken `models.yaml` 1 to `{result="error"}`.
 - [ ] **Step 2: Run** `go test ./core/...`. Expected: FAIL in the new packages.
 - [ ] **Step 3: Implement the wiring.**
 - [ ] **Step 4: Run** `nix develop -c make test-go`. Expected: PASS.
@@ -1650,7 +1703,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
 
 **Files:**
 - Create: `conductor/{tsconfig.json,eslint.config.js}`, `conductor/src/{options.ts,env.ts,pgconfig.ts,site.ts,metrics.ts}`, `conductor/test/{options.test.ts,env.test.ts,pgconfig.test.ts,metrics.test.ts}`. There is no `tools.ts`, and `context.ts` belongs to Task 19b (S13).
-- Modify: `conductor/package.json` (dependencies, and scripts `test` and `typecheck`: `tsc --noEmit`)
+- Modify: `conductor/package.json` (dependencies, and scripts `test` and `typecheck`: `tsc --noEmit`); `conductor/spike/sdk.spike.test.ts` (one S11 assertion: the deep-think request has no tools)
 
 **Interfaces:**
 - Consumes: `@luma/protocol` `HostSpec`/`AgentSpec`, and `spike-results.ts`.
@@ -1696,7 +1749,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
     - `cliPath` is the **platform package's native `claude`** (`@anthropic-ai/claude-code-<platform>-<arch>/claude`; in the image `/opt/claude-cli/claude`), never `@anthropic-ai/claude-code/bin/claude.exe`, a stub because pnpm 10 skips its postinstall (S35). Tests resolve it as `conductor/spike/harness.ts`'s `cliPath()` does.
   - **Streaming and sessions:** `includePartialMessages: true`, `sessionStore`.
   - **Resume and fork:** `resume`, `forkSession`/`resumeSessionAt` from `spec.resume`, per `FORK_STRATEGY`.
-  - **Subagents:** `agents: { "deep-think": { description, prompt, tools: [], model, effort } }`.
+  - **Subagents:** `agents: { "deep-think": { description, prompt, tools: [], model, effort } }`. **`tools: []` must mean no tools at all** (deep-think runs tool-less; Task 6 review). The SDK documents an omitted `tools` as "inherit the parent's", so this task proves `[]` against the real CLI: Spike S11's foreground run in `conductor/spike/sdk.spike.test.ts` (its `DEEP_THINK` already passes `tools: []`) gains the assertion that the `subagent`-class request carries no tools (`tools` absent or `[]`). If it fails (the CLI reads `[]` as inherit), deep-think's definition also sets `disallowedTools` to every name in the parent's `tools`, this task's options test pins that, and CLAUDE.md "Deviations" records it.
   - **Plumbing:** `hooks`, `abortController`.
 - **It never sets** `persistSession`, `continue`, `enableFileCheckpointing` or `extraArgs`.
 
@@ -1712,6 +1765,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
   - `settings are passed inline, not as extraArgs`, and equal `{switchModelsOnFlag: true, idleCompaction: false, precomputeCompactionEnabled: false}` exactly.
   - `pathToClaudeCodeExecutable is the site cliPath`, and `loadSite` refuses an empty `LUMA_CLI_PATH` (S35).
   - `tools and allowedTools are AgentSpec.tools verbatim`.
+  - `deep-think gets tools []`: `options.agents["deep-think"].tools` is `[]` (and its `disallowedTools`, if the spike assertion forced the fallback, is the parent's `tools`).
   - `no mcpServers when the agent has no mcp`.
   - `cache ttl follows the tier binding`.
   - `stderr is counted, not forwarded`.
@@ -1720,8 +1774,8 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
   - `every C7 conductor metric is registered`: the registry's metric names and label names equal a table typed from C7 in the test, `luma_conductor_thinking_dropped_total` included (S16 found `INPUT_TRANSFORMATIONS_VISIBLE`).
 - [ ] **Step 2: Run** `pnpm --filter conductor test -- options env pgconfig metrics`. Expected: FAIL.
 - [ ] **Step 3: Implement.** Pin dependencies exactly: `@anthropic-ai/claude-agent-sdk` 0.3.303 and `@anthropic-ai/claude-code` 2.1.303 (both already pinned by Task 4), `@modelcontextprotocol/sdk`, `pg`, `ws`, `prom-client`, `pino`.
-- [ ] **Step 4: Run** the tests again, then `nix develop -c make lint check-versions`. Expected: PASS.
-- [ ] **Step 5: Commit.** `git add conductor pnpm-lock.yaml && git commit -m "conductor: pinned SDK options, inline settings, explicit env, pg ssl config, C7 metrics"`
+- [ ] **Step 4: Run** the tests again, then `nix develop -c make lint check-versions sdk-spike`. Expected: PASS (`sdk-spike` carries the deep-think no-tools assertion).
+- [ ] **Step 5: Commit.** `git add conductor pnpm-lock.yaml CLAUDE.md && git commit -m "conductor: pinned SDK options, inline settings, explicit env, pg ssl config, C7 metrics"`
 
 ### Task 17: The Postgres `SessionStore` adapter (P5, P6, P18)
 
@@ -1807,10 +1861,10 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
   - **PreToolUse:**
     - `WebFetch`: `checkFetchUrl(tool_input.url, spec.webfetch_deny_domains)`. A denial returns "Luma can't open that address." and counts `luma_conductor_webfetch_denied_total{reason}`.
     - `WebSearch`: deny with "Web search limit reached for this turn (3) or conversation (15). Answer with what you have." when `searches.turn ≥ limits.web_search_per_turn` or `searches.session ≥ limits.web_search_per_session`.
-    - **Subagent lock**, for `SUBAGENT_TOOL`: deny unless `tool_input.subagent_type === "deep-think"` **and** `tool_input` has no `model` key ("Only the deep-think helper is available."). Counted.
+    - **Subagent lock**, for `SUBAGENT_TOOL`: deny unless `tool_input.subagent_type === "deep-think"` **and** `tool_input` has no `model` key ("Only the deep-think helper is available."). Counted. deep-think itself has **no tools** (Task 16's `tools: []`, proven against the real CLI by its S11 assertion), so the caps here never see a call from inside it; this hook adds no rule of its own for that.
     - All tools: deny when `toolCallsThisTurn ≥ max_tool_calls` (P13).
   - **PostToolUse:**
-    - `WebSearch` → `addSearches(n)`, with n per `WEB_SEARCH_COUNT_SOURCE`. With `resultDelta`, `n = 1` here, and Task 19b corrects it at `turn_result`.
+    - `WebSearch` → `addSearches(n)`, with `n = tool_response.searchCount` (Spike S17: `WEB_SEARCH_COUNT_SOURCE = 'postToolUse'`; S21 amended). There is no `resultDelta` path.
     - Tools in `untrusted_inputs` → `markUntrusted()`.
   - **SessionStart**, matcher `startup|compact` only: `additionalContext: profileContext`, when `CONTEXT_DELIVERY === 'session-start'` and the context is non-empty.
   - **PostModelSwitch** (when `MODEL_SWITCH_SIGNAL === 'postModelSwitchHook'`) → emit `model_switched`.
@@ -1844,7 +1898,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
   - **Hooks** (`hooks.test.ts`):
     - `WebFetch to a private address is denied before any fetch`.
     - `fourth search in a turn is denied`, `sixteenth search in a session is denied`, `counters reset per turn`.
-    - `one call reporting 8 searches counts 8`: runs **only** when `WEB_SEARCH_COUNT_SOURCE === 'postToolUse'` (`it.runIf`); the `resultDelta` case is Task 19b's (S21).
+    - `one call reporting 8 searches counts 8` (unconditional: S17 found `postToolUse`).
     - `subagent call without subagent_type is denied`, `subagent call with a model argument is denied`, `deep-think call is allowed`.
     - `tool calls past max_tool_calls are denied`.
     - `WebFetch result marks the turn untrusted`.
@@ -1942,14 +1996,13 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
     - pushes the content, after `ContextInjector.apply`, with `parent_tool_use_id: null` and **no `cache_control`** (#432);
     - calls `TurnState.beginTurn(turnId, untrusted)`;
     - sets `pendingExclusion` to `first` for a fresh session's first turn, or to `cold_resume` for the first turn after a resume whose idle gap exceeded `cache_ttl` (or `SLO_SIGNALS.coldResume`).
-  - **At `turn_result`:** with `WEB_SEARCH_COUNT_SOURCE === 'resultDelta'`, set the session's search counter from the delta's `web_search_requests`.
   - **`close`** removes only `${dataDir}/config/${ref}/projects/${root_id}/${sdkSessionId}.jsonl` and `…/${sdkSessionId}/` (P18). That covers a **fresh** session only.
   - **A store-resumed host (S34)** never writes there: the SDK copies the store into `${site.tmpDir}/claude-resume-<uuid>` and runs the CLI with `CLAUDE_CONFIG_DIR` pointing at it (Spike S1). `close` ends the input, waits for the stream to end, then calls `query.close()` (Spike S "Environment": that order also lets the CLI write its `cost-state`); the SDK then deletes the dir. `TMPDIR` must hold one transcript copy per resumed host (C8 sizes the emptyDir).
 - **Pool:**
   - `max` is 4, and the LRU **idle** host is evicted when full.
   - With 4 running hosts, `ensure` throws `CapacityError`, which the link answers with `host.state{closed, reason:"capacity"}`.
   - **The idle timer is `idleMs`**, which `main.ts` sets to `LUMA_IDLE_MINUTES × 60 000` (S4). `IDLE_EVICT_MS` only sets the chart default; no conductor code reads it.
-  - `purgeTree(rootId, personRef)` closes the tree's hosts, then removes `conv/<rootId>` and `config/<personRef>/projects/<rootId>`, even when no host of the tree is open (S14).
+  - `purgeTree(rootId, personRef)` closes the tree's hosts, then removes `conv/<rootId>` and `config/<personRef>/projects/<rootId>`, even when no host of the tree is open (S14). It resolves only after each closed host's stream has ended and its pending `SessionStore.append`s have settled, because Core deletes the tree's rows on the ack that follows (S39, Task 19c).
 
 - [ ] **Step 1: Write integration tests** (the real CLI against fakeanthropic and pgtest; the fake's binding check is on). The site's `cliPath` is the platform package's native `claude`, resolved as `conductor/spike/harness.ts`'s `cliPath()` does, never `bin/claude.exe` (S35); `tmpDir` is a `tmp/` under the test's data dir, and the test process's `TMPDIR` is set to it (S34):
   - **Turns:** `turn streams and completes`; `interrupt ends the turn`.
@@ -1959,11 +2012,10 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
     - `resume-previous-cli`: resume `test/fixtures/transcripts/cli-<previous>.jsonl` from the store; one turn succeeds.
   - **Fork:** `fork after a tool-using turn resumes at the turn's sdk_uuid from a fresh host`.
   - **Pool:** `fifth host evicts the LRU idle host`; `five running hosts reject with capacity`.
-  - **Cleanup:** `close removes only its own jsonl`, with a sibling host of the same tree still open; `purgeTree removes the project dir and rows`, including with **no** host of the tree open; `a resumed host runs under TMPDIR and leaves no claude-resume dir` (S34: while open, exactly one `claude-resume-*` exists under `site.tmpDir`; after `close`, and after `purgeTree` of its tree, none does).
+  - **Cleanup:** `close removes only its own jsonl`, with a sibling host of the same tree still open; `purgeTree removes the project dir and rows`, including with **no** host of the tree open; `purgeTree resolves after the last mirror append` (S39: a host mid-turn, with a store whose `append` is delayed 200 ms, has its rows written before `purgeTree` resolves, and none after); `a resumed host runs under TMPDIR and leaves no claude-resume dir` (S34: while open, exactly one `claude-resume-*` exists under `site.tmpDir`; after `close`, and after `purgeTree` of its tree, none does).
   - **Baseline (S31):** `a resume after SIGKILL takes the pre-kill cost-state as baseline` (the first delta equals that turn's own usage, never negative), and `a resume with no cost-state uses zero`.
   - **State (S2):** `fresh host reports ready, then ready with sdk_session_id` (the second `onState` carries the id the fake's transcript shows).
   - **Idle (S4):** `idle timer follows idleMs` (a pool with `idleMs: 200` closes an idle host with `idle` within 1 s).
-  - **Search count (S21):** `resultDelta: turn_result sets the session search count`. It runs only when `WEB_SEARCH_COUNT_SOURCE === 'resultDelta'`: one call whose nested request reports 8 → the session counter is 8 after `turn_result`.
   - **Refused tools** (`tools-refused.int.test.ts`): scripted `tool_use` for `Read`, `Bash`, `Glob` and `NotebookRead` each returns a tool error. The fake's next request shows `is_error: true` and no file content. A WebFetch of `file:///proc/self/environ` is denied by the guard.
   - **Hygiene:** `no MCP server late connection` (the first request lists the memory tools); `stderr is not in the logs`.
   - **Context (`context.test.ts`, unit, S13):** `first-user-turn: a fresh session's first turn starts with the profile block`; `a resumed session's first turn gets none`; `the first turn after compact_boundary gets it again`; `session-start mode never prepends`; `an empty profile adds nothing`.
@@ -1986,11 +2038,12 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
   ```
 - **Link:**
   - **Connection:** reads the token file **at every connect**. Backoff runs from 1 s to 30 s. It answers pings, and treats 30 s without a ping as lost.
+  - **A 503 handshake is retried (S43):** Core's TokenReview could not complete. The link retries in the same backoff, waiting at least the response's `Retry-After`, and logs `{"msg":"core link refused","status":503}` (status only). A 401 or 403 is logged the same way and stays on the normal backoff.
   - **On close:** `pool.closeAll('link_lost')` immediately (P2).
   - **On connect:** sends `hello` and logs `{"msg":"core link up"}`. The deploy plan greps for that exact message.
   - **Frames: every C2 frame, both ways (S14).**
-    - Core → conductor: `host.open` → `pool.ensure` (a `CapacityError` → `host.state{closed, reason:"capacity"}`); `turn.send` → `host.send`; `turn.interrupt` → `host.interrupt`; `host.close{reason}` → `host.close(reason)`; `tree.purge{root_id, person_ref}` → `pool.purgeTree(root_id, person_ref)`; `rpc.result` → resolves the pending `CoreRpc.memory` call with that `rpc_id`; `shutdown{reason}` → `closeAll(reason)`.
-    - Conductor → Core: `hello`; `host.state` from `HostDeps.onState`; `event` from `HostDeps.emit`; `rpc` from `CoreRpc.memory`.
+    - Core → conductor: `host.open` → `pool.ensure` (a `CapacityError` → `host.state{closed, reason:"capacity"}`); `turn.send` → `host.send`; `turn.interrupt` → `host.interrupt`; `host.close{reason}` → `host.close(reason)`; `tree.purge{root_id, person_ref}` → `pool.purgeTree(root_id, person_ref)`, then `tree.purged{root_id}`, also when the purge threw (logged; S39); `rpc.result` → resolves the pending `CoreRpc.memory` call with that `rpc_id`; `shutdown{reason}` → `closeAll(reason)`.
+    - Conductor → Core: `hello`; `host.state` from `HostDeps.onState`; `event` from `HostDeps.emit`; `rpc` from `CoreRpc.memory`; `tree.purged` after each `tree.purge`.
 - **`main.ts`:**
   - builds `HostPool` with `idleMs = LUMA_IDLE_MINUTES × 60 000` and `max = LUMA_MAX_HOSTS` (S4);
   - at start, before the link connects, creates `TMPDIR` (mode 0700) and removes every `${TMPDIR}/claude-resume-*` in it: a container restart keeps the emptyDir, so a killed process's store-resume copies would otherwise stay (S34);
@@ -2001,6 +2054,8 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
 - [ ] **Step 1: Write failing tests:**
   - `every link fixture is handled` (S14): for each `protocol/fixtures/link/*.json`, a Core → conductor frame dispatches to its handler (spies on pool, hosts and the pending RPC), and a conductor → Core frame is exactly what the link sends for the matching call (JSON-equal to the fixture).
   - `link re-reads the token file on reconnect`.
+  - `a 503 handshake is retried after Retry-After` (S43; fake clock): a test Core answers 503 with `Retry-After: 5` twice, then upgrades; the link is up after the third attempt, no attempt came sooner than 5 s after a 503, and the log line carries only the status.
+  - `tree.purge is acked after purgeTree resolves` (S39): `tree.purged{root_id}` is sent only once the spied `purgeTree` promise resolves, and also after it rejects.
   - `link loss kills every CLI within 5 s`.
   - `capacity is reported as host.state closed capacity`.
   - `no message text or tool input is logged` (a unique marker sent through a turn is absent from captured logs).
@@ -2033,6 +2088,11 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
   - It is a local HTTP proxy used as each eval CLI's `ANTHROPIC_BASE_URL`. It forwards to the gateway unchanged and records headers and bodies.
   - A request with a `web_search_*` server tool gets a canned SSE reply from the task's `stub_web_search`, and never leaves the pod (P19).
   - In the `guard` suite it answers main requests itself, with scripted WebFetch tool uses.
+- **Golden checks (C9; Task 6 review):**
+  - `tools_called` is compared with the **emitted** tool names, the `tool_started.name`s the host's translation produces (Task 19a): `deep-think` for the subagent (never `SUBAGENT_TOOL`), `WebSearch`, `mcp__luma__remember`, `mcp__luma__forget`. Never the raw SDK `tool_use` names.
+  - The set of distinct emitted names must equal `tools_called` (order and repeats ignored), so **`tools_called: []` means no tool was called**.
+  - Golden-task wording and thresholds (`text_matches`, `max_cost_usd`) are tuned at the first live eval gate (the deploy plan's Task 10), not offline: the offline tests check the runner, and a task edit lands in `agents/` and `charts/luma/files/evals/` together (`check-chart-sync`).
+- **Core's 503 is retried (S43):** the spec fetch and the `eval-runs` POST retry a 503 with backoff (1 s doubling, at least `Retry-After`, 5 retries), re-reading `LUMA_CORE_TOKEN_FILE` each attempt. Any other non-2xx, or a sixth 503, fails the run.
 - **Suites:**
   - **`nightly`:**
     - `cache.identical`: two identical Haiku requests; the second has `cache_read_input_tokens > 0`.
@@ -2044,13 +2104,19 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
     - each must contain **≥ 1 signed thinking block**, or the case fails;
     - each body first goes to `count_tokens` (free) with `anthropic-beta: thinking-binding-controls-2026-08-01` and `thinking.block_binding.prefix_mismatch_behavior: "error"`, and any 400 fails;
     - then the last body of each conversation is replayed to `/v1/messages` with `tool_choice: {type: "none"}` and `max_tokens: 16`. It must return 200 with `input_transformations` empty.
-  - **`weekly`:** the `smart` golden tasks, plus `compaction.forced` (a fast-tier conversation driven past `COMPACTION_TRIGGER_TOKENS` with synthetic pasted text, then a replay of the first post-compaction body).
+  - **`weekly`:** the `smart` golden tasks, plus **`compaction.forced` (S36)**:
+    - a fast-tier conversation of ≥ 4 turns (Spike S4: fewer fails `too_few_groups`) driven past `COMPACTION_TRIGGER_TOKENS` with synthetic pasted text (the turn that crosses it compacts), then one more turn;
+    - the recorder must show **exactly one main-class binding 400 per compaction**: the first post-compaction body, whose thinking was bound to the pre-compaction prefix (Spike S4, S32). Zero or two fail the case;
+    - replayed, through the replay-hygiene passes with `prefix_mismatch_behavior: "error"`: the **first successful post-compaction request** (the CLI's stripped retry, exempt from the ≥ 1 signed-thinking rule because the CLI stripped it) and **the next turn's first main request carrying ≥ 1 signed thinking block** (the rule applies to it);
+    - the first post-compaction body is never replayed: its 400 is the expected one.
   - **`guard`:** scripted WebFetch tool uses at `https://10.96.0.1/`, `https://192.168.0.1/`, `https://luma-core-internal:8081/`, `https://localhost:9091/`, `file:///proc/self/environ`, `https://api.anthropic.com/v1/messages` (smokescreen allows that host for the CLI's domain check, so only the guard stops it; S33), every `webfetch_deny_domains` apex, and the optional `--redirect-probe <url>`. Each must produce a denied tool result, and no extraction request may reach the recorder. It costs nothing at Anthropic.
   - **`gate`:** `nightly` + every `fast` golden task (10–20, sequential, so later trials read the cache) + `guard`.
 - **Report:** `POST /internal/v1/eval-runs` (C10). Exit code is non-zero on any failure. Only ids and numbers are logged.
 
 - [ ] **Step 1: Write failing tests** (offline: fakeanthropic stands in for the gateway, and an `httptest`-style stub for Core's C10):
-  - **Recorder and golden:** `recorder stubs web search and records the rest`; `golden task checks text, tools and remembered facts through the in-process stub`.
+  - **Recorder and golden:** `recorder stubs web search and records the rest`; `golden task checks text, tools and remembered facts through the in-process stub`; `tools_called compares emitted names` (a scripted `Agent` call with `subagent_type: "deep-think"` passes `["deep-think"]` and fails `["Agent"]`); `tools_called [] fails when any tool ran`.
+  - **Compaction (S36):** `compaction.forced expects one binding 400 and replays the retry and the next thinking request` (against fakeanthropic, whose binding check 400s the first post-compaction body: the case passes; the count check fed a recorded log holding 0 or 2 binding 400s fails; the replayed bodies are the stripped retry and the next turn's first thinking-carrying request, never the 400 body).
+  - **Retry (S43):** `spec fetch and report retry a 503` (two 503s with `Retry-After: 1`, then success; six 503s → non-zero exit).
   - **Replay:**
     - `replay fails a capture without a signed thinking block`.
     - `replay runs the count_tokens pre-pass first`.
@@ -2311,7 +2377,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
 **Files:**
 - Create:
   - `charts/luma/{Chart.yaml,values.yaml,values.schema.json,ci/{minimal,all-features,disabled,shed}-values.yaml}`. There is **no** `ci/e2e-values.yaml`: e2e uses only `test/e2e/values.yaml` (Task 28a, S12);
-  - `charts/luma/templates/{_helpers.tpl,core.yaml,conductor.yaml,serviceaccounts.yaml,rbac.yaml,priorityclass.yaml,config.yaml,NOTES.txt}`;
+  - `charts/luma/templates/{_helpers.tpl,core.yaml,conductor.yaml,serviceaccounts.yaml,rbac.yaml,priorityclass.yaml,config.yaml,networkpolicy.yaml,NOTES.txt}`;
   - `charts/luma/files/{models.yaml,agents/luma.agent.md,agents/deep-think.agent.md,evals/*.yaml}`;
   - `hack/check-chart-sync.sh`, `test/chart/chart_test.go`.
 - Modify: `Makefile` (the real `check-chart-sync` and `chart-test` recipes replace Task 0's placeholders), `hack/check-versions.sh` (S19).
@@ -2327,6 +2393,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
   | conductor | Deployment (1 replica, **`Recreate`**), Service `luma-conductor` (9091 metrics only) | `emptyDir: {medium: Memory, sizeLimit: 512Mi}` at `/var/lib/luma`; container env `TMPDIR=/var/lib/luma/tmp` (the process's own, so the SDK's `claude-resume-*` dirs land in the emptyDir; S34) and `LUMA_CLI_PATH=/opt/claude-cli/claude` (the native binary of Task 25's last layer; S35); a projected token (audience `luma-core-internal`, 600 s) at `/var/run/secrets/luma/core/token`; `terminationGracePeriodSeconds: 30` |
   | identity | the six ServiceAccounts (C8), ClusterRoleBinding `luma-core-tokenreview` → `system:auth-delegator` | every pod `automountServiceAccountToken: false` |
   | shared | PriorityClass `luma-batch` (−5, `preemptionPolicy: Never`, when `create`) | serving pods get no `priorityClassName` (P25) |
+  | network (S44) | NetworkPolicy `luma-core` (when `networkPolicy.enabled`) selecting the Core pods, `policyTypes: [Ingress]` | `:8081` only from pods of this release labelled `app.kubernetes.io/component` ∈ `{conductor, evals, usage-reconcile}` (a `podSelector` with `matchExpressions`; Task 26b's evals CronJobs, gate Job and reconcile CronJob carry those labels); `:8080` only from `networkPolicy.publicFrom` (default: the `traefik` namespace's Traefik pods); `:9090` from `networkPolicy.metricsFrom` (default any namespace). Inert on flannel today, enforced once kube-network-policies lands (phase 4). **Defence in depth, never relied on:** TokenReview (P20) and the Origin guard stay the controls, and no test passes because of the policy. |
 
   - `hack/check-chart-sync.sh` fails unless `charts/luma/files/agents/*.agent.md`, `files/models.yaml` and `files/evals/` equal `agents/` byte for byte. It runs in `make lint`.
   - **The chart creates no Secrets.**
@@ -2337,7 +2404,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
   - **Values:** `TestValuesCoverC8` (every C8 key, gateway/egress/evals/usageReconcile included, exists in `values.yaml` and `values.schema.json`); `TestIdleMinutesDefault` (`conductor.idleMinutes` = `IDLE_EVICT_MS / 60000`, typed).
   - **Identity:** `TestAutomountDisabledEverywhere`; `TestProjectedTokenAudienceAndTTL`; `TestCoreTokenReviewBinding`.
   - **Priority:** `TestServingPodsHaveNoPriorityClass`.
-  - **Security:** `TestPodsRestrictedCompliant`; `TestInternalPortNotInPublicService`.
+  - **Security:** `TestPodsRestrictedCompliant`; `TestInternalPortNotInPublicService`; `TestCoreNetworkPolicy` (S44): the default render has exactly one NetworkPolicy, `luma-core`, whose ingress rules are, typed in the test, 8081 ← the three component labels within the release, 8080 ← the default Traefik selector, 9090 ← `namespaceSelector: {}`; no rule names port 15000 or 8082; a `publicFrom` value replaces the 8080 peers; `networkPolicy.enabled: false` renders none.
   - **Resources:** `TestConductorRequestIncludesEmptyDir` (request ≥ 2Gi with `sizeLimit` 512Mi).
   - **Conductor paths (S34, S35):** `TestConductorTmpdirInEmptyDir` (`TMPDIR` is `/var/lib/luma/tmp`, under the emptyDir's mount, on the conductor container; Task 26b extends both tests to the evals containers); `TestConductorCLIPath` (`LUMA_CLI_PATH` is `/opt/claude-cli/claude`, never a `claude.exe` path).
   - **Switches:** `TestDisabledRendersNothing` (`enabled: false` → zero documents); `TestShedScalesToZero` (every Deployment `replicas: 0`, every CronJob `suspend: true`).
@@ -2415,6 +2482,7 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
     - `TestReconcileCommandArgsSplit` (D10): the reconcile container has `command: ["/luma-core"]` and `args: ["usage-reconcile"]`.
     - `TestEvalsMountGoldenTasksAndImage` (S6): every evals pod mounts the golden tasks at `/etc/luma/evals` and sets `LUMA_IMAGE` to the conductor's `repository:tag@digest`.
     - `TestEnvCoversC6` is extended to the evals and reconcile containers, and Task 26a's `TestConductorTmpdirInEmptyDir` and `TestConductorCLIPath` to the evals containers (S34, S35).
+    - `TestBatchPodsAdmittedByCoreNetworkPolicy` (S44): the pod templates of `luma-evals-nightly`, `luma-evals-weekly`, `luma-evals-gate` and `luma-usage-reconcile` carry `app.kubernetes.io/component` `evals` (the three evals pods) or `usage-reconcile`, plus the release's instance label, so Task 26a's NetworkPolicy `luma-core` admits them to `:8081`.
   - **Monitors:** `TestServiceMonitorLabels`.
 - [ ] **Step 2: Run** `nix develop -c make chart-test` and `go test ./core/cmd/luma-core/`. Expected: FAIL.
 - [ ] **Step 3: Write the templates** and `gateway-token-check`.
@@ -2444,7 +2512,8 @@ The task order is **layered** *(Chris)*. Tasks are grouped into five stages, and
     - gateway `upstream` → fakeanthropic, with the binding check on;
     - the registry lists the mock user under `mock`;
     - `usageReconcile.enabled: false`;
-    - `evals.enabled: false`, because e2e runs the evals entrypoint as a one-off Job when it needs it (Task 28b renders it from the evals template).
+    - `evals.enabled: false`, because e2e runs the evals entrypoint as a one-off Job when it needs it (Task 28b renders it from the evals template);
+    - `networkPolicy.enabled: false` (S44): the policy is defence in depth, never relied on, so e2e proves TokenReview and the Origin guard alone; and its 401/403 probes come from test pods (and NodePort traffic) that an enforcing kind CNI would drop before Core answers.
   - Test values are obviously fake (`e2e-not-a-secret-…`).
 
 - [ ] **Step 1: Write the failing tests:**
