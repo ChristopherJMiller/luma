@@ -36,6 +36,7 @@ var c7Core = []struct {
 	{"luma_cost_basis_unexpected_total", nil, "CostBasisUnexpectedTotal"},
 	{"luma_turns_total", []string{"agent", "tier", "source", "outcome"}, "TurnsTotal"},
 	{"luma_turn_duration_seconds", []string{"agent", "tier"}, "TurnDurationSeconds"},
+	{"luma_late_turn_results_total", nil, "LateTurnResultsTotal"},
 	{"luma_conductor_connected", nil, "ConductorConnected"},
 	{"luma_open_hosts", nil, "OpenHosts"},
 	{"luma_link_rejected_total", []string{"reason"}, "LinkRejectedTotal"},
@@ -72,7 +73,7 @@ func TestEveryC7CoreMetricRegistered(t *testing.T) {
 			c.WithLabelValues(vals...).Set(0)
 		case *prometheus.HistogramVec:
 			c.WithLabelValues(vals...).Observe(0)
-		case prometheus.Gauge, prometheus.Counter:
+		case prometheus.Gauge, prometheus.Counter, *metrics.FuncGauge:
 			if len(m.labels) != 0 {
 				t.Errorf("%s has labels in C7 but Core.%s is a plain metric", m.name, m.field)
 			}
@@ -154,6 +155,37 @@ func TestLabelMapsUnknownToOther(t *testing.T) {
 	}
 	if got := metrics.Label("x"); got != "other" {
 		t.Errorf("Label with no allowed values = %q", got)
+	}
+}
+
+func TestFuncGaugeReadsItsFunctionAtScrape(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	core := metrics.NewCore(reg)
+	read := func() float64 {
+		t.Helper()
+		mfs, err := reg.Gather()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, mf := range mfs {
+			if mf.GetName() == "luma_budget_spent_usd" {
+				return mf.GetMetric()[0].GetGauge().GetValue()
+			}
+		}
+		t.Fatal("luma_budget_spent_usd not gathered")
+		return 0
+	}
+	if v := read(); v != 0 {
+		t.Errorf("before SetFunc: %v, want 0", v)
+	}
+	v := 12.5
+	core.BudgetSpentUSD.SetFunc(func() float64 { return v })
+	if got := read(); got != 12.5 {
+		t.Errorf("after SetFunc: %v, want 12.5", got)
+	}
+	v = 13
+	if got := read(); got != 13 {
+		t.Errorf("a later scrape: %v, want 13 (read at each scrape)", got)
 	}
 }
 

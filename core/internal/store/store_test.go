@@ -671,7 +671,8 @@ func TestLedgerReconcileEvalsSettingsMemory(t *testing.T) {
 		{APIWorkspace: "ci", CostUSD: 0.5, CreatedAt: day.Add(2 * time.Hour)},
 		{APIWorkspace: "interactive", CostUSD: 9, CreatedAt: day.Add(25 * time.Hour)},
 	} {
-		r.PersonID, r.AgentID, r.Tier, r.Source, r.Model, r.TurnID = "chris", "luma", "fast", "web", "m", "t"
+		// (turn_id, model) is unique (migration 0003): one turn id per row.
+		r.PersonID, r.AgentID, r.Tier, r.Source, r.Model, r.TurnID = "chris", "luma", "fast", "web", "m", "t"+r.CreatedAt.Format("02T15")
 		if _, err := s.RecordLedger(ctx, r); err != nil {
 			t.Fatal(err)
 		}
@@ -1033,5 +1034,72 @@ func TestHistoryMessageFollowsParents(t *testing.T) {
 	msg("c2", "ses_a", p("c1"))
 	if _, err := s.HistoryMessage(ctx, "c1", "m1"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("HistoryMessage over a cycle = %v, want ErrNotFound", err)
+	}
+}
+
+// Task 14 review: a turn's rows are written all or none, once per
+// (turn_id, model); an eval run and its cost row likewise.
+func TestLedgerRowsAtomicAndOnce(t *testing.T) {
+	s := storetest.New(t)
+	row := func(turn, model, ws string, usd float64) store.LedgerRow {
+		return store.LedgerRow{PersonID: "chris", AgentID: "luma", Tier: "fast", Source: "web",
+			APIWorkspace: ws, Model: model, TurnID: turn, CostUSD: usd}
+	}
+	count := func() (n int, usd float64) {
+		t.Helper()
+		if err := s.Pool().QueryRow(ctx, `select count(*), coalesce(sum(cost_usd), 0)::float8 from cost_ledger`).Scan(&n, &usd); err != nil {
+			t.Fatal(err)
+		}
+		return n, usd
+	}
+
+	// The second row breaks a check constraint: the first is rolled back.
+	if _, err := s.RecordLedgerRows(ctx, []store.LedgerRow{row("t1", "a", "interactive", 1), row("t1", "b", "bogus", 2)}); err == nil {
+		t.Fatal("a row breaking a constraint was accepted")
+	}
+	if n, _ := count(); n != 0 {
+		t.Fatalf("%d rows after a failed batch, want 0", n)
+	}
+
+	got, err := s.RecordLedgerRows(ctx, []store.LedgerRow{row("t1", "a", "interactive", 1), row("t1", "b", "interactive", 2)})
+	if err != nil || !reflect.DeepEqual(got, []bool{true, true}) {
+		t.Fatalf("first delivery = %v, %v; want both inserted", got, err)
+	}
+	// Delivered again, with one model more: only the new row is written.
+	got, err = s.RecordLedgerRows(ctx, []store.LedgerRow{row("t1", "a", "interactive", 1), row("t1", "b", "interactive", 2),
+		row("t1", "c", "interactive", 4)})
+	if err != nil || !reflect.DeepEqual(got, []bool{false, false, true}) {
+		t.Fatalf("second delivery = %v, %v; want only c inserted", got, err)
+	}
+	if n, usd := count(); n != 3 || usd != 7 {
+		t.Fatalf("ledger = %d rows, $%v; want 3 rows, $7", n, usd)
+	}
+
+	day := time.Date(2026, 10, 20, 3, 0, 0, 0, time.UTC)
+	run := protocol.EvalRun{Suite: "nightly", SDKVersion: "1", CLIVersion: "2", Image: "img@sha256:x",
+		StartedAt: day, FinishedAt: day.Add(time.Minute), Passed: 3, Failed: 0, CostUSD: 1.5,
+		Results: []protocol.EvalResult{}}
+	cost := row("eval_nightly_20261020T030100Z", "eval-run", "ci", 1.5)
+	for i, want := range []bool{true, false} {
+		recorded, err := s.InsertEvalRunWithCost(ctx, run, cost)
+		if err != nil || recorded != want {
+			t.Fatalf("post %d: recorded = %v, %v; want %v", i+1, recorded, err, want)
+		}
+	}
+	var runs int
+	if err := s.Pool().QueryRow(ctx, `select count(*) from eval_runs`).Scan(&runs); err != nil {
+		t.Fatal(err)
+	}
+	if n, usd := count(); runs != 1 || n != 4 || usd != 8.5 {
+		t.Fatalf("after posting a run twice: %d runs, %d rows, $%v; want 1 run, 4 rows, $8.5", runs, n, usd)
+	}
+	// A run whose cost row cannot be written is not stored either.
+	bad := run
+	bad.FinishedAt = day.Add(2 * time.Minute)
+	if _, err := s.InsertEvalRunWithCost(ctx, bad, row("eval_nightly_x", "eval-run", "bogus", 1)); err == nil {
+		t.Fatal("a bad cost row was accepted")
+	}
+	if err := s.Pool().QueryRow(ctx, `select count(*) from eval_runs`).Scan(&runs); err != nil || runs != 1 {
+		t.Fatalf("eval runs after a failed post = %d, %v; want 1", runs, err)
 	}
 }

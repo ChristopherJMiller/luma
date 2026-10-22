@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"slices"
 	"sync"
 	"time"
@@ -80,11 +81,11 @@ func New(st *store.Store, m *metrics.Core, live *agents.Live, cfg Config) *Ledge
 	if cfg.Clock == nil {
 		cfg.Clock = time.Now
 	}
+	b := &Budget{st: st, capUSD: cfg.MonthlyUSD, warnRatio: cfg.WarnRatio, loc: cfg.Location, clock: cfg.Clock}
 	m.BudgetCapUSD.Set(cfg.MonthlyUSD)
+	m.BudgetSpentUSD.SetFunc(b.spentNow)
 	return &Ledger{
-		st: st, m: m, live: live, maxTurnUSD: cfg.MaxTurnCostUSD, clock: cfg.Clock,
-		budget: &Budget{st: st, m: m, capUSD: cfg.MonthlyUSD, warnRatio: cfg.WarnRatio,
-			loc: cfg.Location, clock: cfg.Clock},
+		st: st, m: m, live: live, budget: b, maxTurnUSD: cfg.MaxTurnCostUSD, clock: cfg.Clock,
 		evalLast: map[string]time.Time{},
 	}
 }
@@ -98,12 +99,18 @@ func (l *Ledger) Budget() *Budget { return l.budget }
 // over LUMA_MAX_TURN_COST_USD, is a usage_anomalies row instead, and nothing
 // is ledgered. A cost basis other than "list" and a model outside the
 // session's bound models (P29) are counted; the rows are still recorded.
+// The rows are written in one transaction, once per (turn, model): a turn
+// delivered again adds nothing and counts nothing (Task 14 review).
 func (l *Ledger) RecordTurn(ctx context.Context, sess store.Session, turnID string, u protocol.TurnUsage, costBasis *string) error {
 	if costBasis != nil && *costBasis != "list" {
 		l.m.CostBasisUnexpectedTotal.Inc()
 	}
 	if reason := l.anomaly(u); reason != "" {
 		return l.recordAnomaly(ctx, sess, turnID, u, costBasis, reason)
+	}
+	if sum := modelsCost(u); math.Abs(u.CostUSD-sum) > costTolerance {
+		slog.Warn("ledger: a turn's cost differs from the sum of its models'; the rows carry the models'",
+			"session", sess.ID, "turn", turnID, "cost_usd", u.CostUSD, "models_cost_usd", sum)
 	}
 	names := make([]string, 0, len(u.Models))
 	for name, mu := range u.Models {
@@ -116,24 +123,32 @@ func (l *Ledger) RecordTurn(ctx context.Context, sess store.Session, turnID stri
 		return nil
 	}
 	now := l.clock()
-	known := l.knownModels()
-	agent, tier, source := l.agentLabel(sess.AgentID), tierLabel(sess.Tier), sourceLabel(sess.Source)
-	for _, name := range names {
-		mu := u.Models[name]
-		model := modelLabel(name, known)
-		if !slices.Contains(sess.BoundModels, name) {
-			l.m.UnboundModelRequestsTotal.WithLabelValues(model).Inc()
-			slog.Warn("ledger: a model outside the session's bound models", "session", sess.ID, "turn", turnID, "model", model)
-		}
-		sid := sess.ID
-		if _, err := l.st.RecordLedger(ctx, store.LedgerRow{
+	rows := make([]store.LedgerRow, len(names))
+	for i, name := range names {
+		mu, sid := u.Models[name], sess.ID
+		rows[i] = store.LedgerRow{
 			SessionID: &sid, PersonID: sess.PersonID, AgentID: sess.AgentID, Tier: sess.Tier, Source: sess.Source,
 			APIWorkspace: sess.APIWorkspace, Model: name, TurnID: turnID,
 			InputTokens: mu.Input, OutputTokens: mu.Output, CacheReadTokens: mu.CacheRead,
 			CacheCreationTokens: mu.CacheCreation, WebSearchRequests: mu.WebSearchRequests,
 			CostUSD: mu.CostUSD, CreatedAt: now,
-		}); err != nil {
-			return err
+		}
+	}
+	inserted, err := l.st.RecordLedgerRows(ctx, rows)
+	if err != nil {
+		return err
+	}
+	known := l.knownModels()
+	agent, tier, source := l.agentLabel(sess.AgentID), tierLabel(sess.Tier), sourceLabel(sess.Source)
+	for i, name := range names {
+		if !inserted[i] {
+			slog.Info("ledger: a turn's row was already recorded; not counted again", "session", sess.ID, "turn", turnID, "model", name)
+			continue
+		}
+		mu, model := u.Models[name], modelLabel(name, known)
+		if !slices.Contains(sess.BoundModels, name) {
+			l.m.UnboundModelRequestsTotal.WithLabelValues(model).Inc()
+			slog.Warn("ledger: a model outside the session's bound models", "session", sess.ID, "turn", turnID, "model", name)
 		}
 		person := sess.PersonID
 		l.m.CostUSDTotal.WithLabelValues(person, agent, tier, source, model).Add(mu.CostUSD)
@@ -145,7 +160,7 @@ func (l *Ledger) RecordTurn(ctx context.Context, sess store.Session, turnID stri
 			l.m.WebSearchRequestsTotal.WithLabelValues(person, agent, tier, source).Add(float64(mu.WebSearchRequests))
 		}
 	}
-	l.budget.Status(ctx, now) // refreshes luma_budget_spent_usd
+	l.budget.Status(ctx, now) // the month's figure behind luma_budget_spent_usd
 	return nil
 }
 
@@ -154,22 +169,33 @@ func (l *Ledger) RecordTurn(ctx context.Context, sess store.Session, turnID stri
 // as the turn's total or as the sum of its models' (what the rows would
 // add up to), are oversized.
 func (l *Ledger) anomaly(u protocol.TurnUsage) string {
-	sum := 0.0
 	negative := !(u.CostUSD >= 0) // also NaN
 	for _, mu := range u.Models {
 		if mu.Input < 0 || mu.Output < 0 || mu.CacheRead < 0 || mu.CacheCreation < 0 ||
 			mu.WebSearchRequests < 0 || !(mu.CostUSD >= 0) {
 			negative = true
 		}
-		sum += mu.CostUSD
 	}
 	switch {
 	case negative:
 		return reasonNegative
-	case u.CostUSD > l.maxTurnUSD || sum > l.maxTurnUSD:
+	case u.CostUSD > l.maxTurnUSD || modelsCost(u) > l.maxTurnUSD:
 		return reasonOversized
 	}
 	return ""
+}
+
+// costTolerance is how far a turn's cost may sit from its models' sum (float
+// rounding of the SDK's totals) before Core warns.
+const costTolerance = 1e-6
+
+// modelsCost is the sum of a turn's per-model dollars: what its rows add up to.
+func modelsCost(u protocol.TurnUsage) float64 {
+	sum := 0.0
+	for _, mu := range u.Models {
+		sum += mu.CostUSD
+	}
+	return sum
 }
 
 // anomalyPayload is a usage_anomalies payload: numbers and model names only.

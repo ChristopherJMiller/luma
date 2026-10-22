@@ -4,7 +4,11 @@
 // outside a fixed set maps to "other" (Label). Task 14 adds the label audit.
 package metrics
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	"sync/atomic"
+
+	"github.com/prometheus/client_golang/prometheus"
+)
 
 // Core is the C7 Core metric set. Each field is named in CamelCase after its
 // metric, without the luma_ prefix.
@@ -20,7 +24,7 @@ type Core struct {
 	MainRequestsOver100kTotal  *prometheus.CounterVec // luma_main_requests_over_100k_total{tier}
 
 	// Budget and reconcile.
-	BudgetSpentUSD                            prometheus.Gauge     // luma_budget_spent_usd
+	BudgetSpentUSD                            *FuncGauge           // luma_budget_spent_usd, read at each scrape (the ledger sets its function)
 	BudgetCapUSD                              prometheus.Gauge     // luma_budget_cap_usd
 	UsageReconcileDriftRatio                  *prometheus.GaugeVec // luma_usage_reconcile_drift_ratio{workspace}
 	UsageReconcileDriftUSD                    *prometheus.GaugeVec // luma_usage_reconcile_drift_usd{workspace}
@@ -32,8 +36,9 @@ type Core struct {
 	CostBasisUnexpectedTotal  prometheus.Counter     // luma_cost_basis_unexpected_total
 
 	// Turns.
-	TurnsTotal          *prometheus.CounterVec   // luma_turns_total{agent,tier,source,outcome}
-	TurnDurationSeconds *prometheus.HistogramVec // luma_turn_duration_seconds{agent,tier}
+	TurnsTotal           *prometheus.CounterVec   // luma_turns_total{agent,tier,source,outcome}
+	TurnDurationSeconds  *prometheus.HistogramVec // luma_turn_duration_seconds{agent,tier}
+	LateTurnResultsTotal prometheus.Counter       // luma_late_turn_results_total (S63)
 
 	// Conductor link.
 	ConductorConnected prometheus.Gauge       // luma_conductor_connected
@@ -74,7 +79,7 @@ func NewCore(reg prometheus.Registerer) *Core {
 		MainRequestsOver100kTotal: f.counterVec("luma_main_requests_over_100k_total",
 			"Main-class requests with more than 100K input tokens.", "tier"),
 
-		BudgetSpentUSD: f.gauge("luma_budget_spent_usd", "Dollars spent this budget month."),
+		BudgetSpentUSD: f.funcGauge("luma_budget_spent_usd", "Dollars spent this budget month (UTC)."),
 		BudgetCapUSD:   f.gauge("luma_budget_cap_usd", "The monthly budget cap in dollars."),
 		UsageReconcileDriftRatio: f.gaugeVec("luma_usage_reconcile_drift_ratio",
 			"Relative drift between the Usage and Cost API and the ledger, by workspace.", "workspace"),
@@ -92,6 +97,8 @@ func NewCore(reg prometheus.Registerer) *Core {
 		TurnsTotal: f.counterVec("luma_turns_total", "Turns finished.", "agent", "tier", "source", "outcome"),
 		TurnDurationSeconds: f.histogramVec("luma_turn_duration_seconds", "Turn duration.",
 			[]float64{0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300}, "agent", "tier"),
+		LateTurnResultsTotal: f.counter("luma_late_turn_results_total",
+			"turn_results that arrived after Core ended their turn (a backstop or a lost link); their cost is ledgered (S63)."),
 
 		ConductorConnected: f.gauge("luma_conductor_connected", "1 while an authenticated conductor link is up."),
 		OpenHosts:          f.gauge("luma_open_hosts", "Session hosts currently open on the conductor."),
@@ -123,7 +130,32 @@ func Label(v string, allowed ...string) string {
 	return "other"
 }
 
+// FuncGauge is a gauge whose value its owner's function gives at each
+// scrape, so it is current without waiting for a write (the budget's month
+// starts at 00:00 UTC on the 1st whether or not anything is spent).
+type FuncGauge struct {
+	prometheus.GaugeFunc
+	fn atomic.Pointer[func() float64]
+}
+
+// SetFunc installs the function the gauge reads; until then it reads 0.
+func (g *FuncGauge) SetFunc(fn func() float64) { g.fn.Store(&fn) }
+
+func (g *FuncGauge) value() float64 {
+	if fn := g.fn.Load(); fn != nil {
+		return (*fn)()
+	}
+	return 0
+}
+
 type factory struct{ reg prometheus.Registerer }
+
+func (f factory) funcGauge(name, help string) *FuncGauge {
+	g := &FuncGauge{}
+	g.GaugeFunc = prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: name, Help: help}, g.value)
+	f.reg.MustRegister(g.GaugeFunc)
+	return g
+}
 
 func (f factory) counter(name, help string) prometheus.Counter {
 	c := prometheus.NewCounter(prometheus.CounterOpts{Name: name, Help: help})

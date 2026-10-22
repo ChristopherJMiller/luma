@@ -10,17 +10,23 @@ import (
 	"github.com/ChristopherJMiller/luma/core/internal/protocol"
 )
 
-// InsertEvalRun stores an eval run and returns its id.
+const evalRunInsert = `insert into eval_runs (suite, sdk_version, cli_version, image, started_at,
+	finished_at, passed, failed, cost_usd, results) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`
+
+func evalRunArgs(r protocol.EvalRun, results []byte) []any {
+	return []any{r.Suite, r.SDKVersion, r.CLIVersion, r.Image, r.StartedAt, r.FinishedAt, r.Passed, r.Failed,
+		r.CostUSD, results}
+}
+
+// InsertEvalRun stores an eval run and returns its id. Core's eval-runs
+// route uses InsertEvalRunWithCost, which ledgers the run's cost with it.
 func (s *Store) InsertEvalRun(ctx context.Context, r protocol.EvalRun) (int64, error) {
 	results, err := json.Marshal(r.Results)
 	if err != nil {
 		return 0, err
 	}
 	var id int64
-	err = s.pool.QueryRow(ctx, `insert into eval_runs (suite, sdk_version, cli_version, image, started_at,
-		finished_at, passed, failed, cost_usd, results) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) returning id`,
-		r.Suite, r.SDKVersion, r.CLIVersion, r.Image, r.StartedAt, r.FinishedAt, r.Passed, r.Failed,
-		r.CostUSD, results).Scan(&id)
+	err = s.pool.QueryRow(ctx, evalRunInsert+` returning id`, evalRunArgs(r, results)...).Scan(&id)
 	return id, err
 }
 

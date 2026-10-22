@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ChristopherJMiller/luma/core/internal/metrics"
 	"github.com/ChristopherJMiller/luma/core/internal/protocol"
 	"github.com/ChristopherJMiller/luma/core/internal/store"
 )
@@ -18,18 +17,41 @@ import (
 // (budget_exhausted).
 type Budget struct {
 	st        *store.Store
-	m         *metrics.Core
 	capUSD    float64
 	warnRatio float64
 	loc       *time.Location
 	clock     func() time.Time
 
-	// mu guards the month's last figure read from the store: the fallback
-	// while the store cannot answer, so an outage never reopens an
-	// exhausted budget within its month.
+	// mu guards the month's figure: the most read from the store for the
+	// month (a month's spend only grows, so a slower, older read never moves
+	// it back), luma_budget_spent_usd's value, and the fallback while the
+	// store cannot answer, so an outage never reopens an exhausted budget
+	// within its month.
 	mu    sync.Mutex
 	month time.Time // the first instant of the month spent is for; zero before the first read
 	spent float64
+}
+
+// gaugeReadTimeout bounds the store read a scrape makes when the process has
+// no figure for the current month yet.
+const gaugeReadTimeout = 2 * time.Second
+
+// spentNow is luma_budget_spent_usd at a scrape: the current UTC month's
+// figure, read from the store when this process has none for the month yet
+// (the first scrape after 00:00 UTC on the 1st), so the gauge never shows
+// last month's spend as this month's.
+func (b *Budget) spentNow() float64 {
+	now := b.clock()
+	start, _ := monthOf(now)
+	b.mu.Lock()
+	if b.month.Equal(start) {
+		defer b.mu.Unlock()
+		return b.spent
+	}
+	b.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), gaugeReadTimeout)
+	defer cancel()
+	return b.Status(ctx, now).SpentUSD
 }
 
 // monthOf returns the first instant of the UTC calendar month holding t and
@@ -41,9 +63,9 @@ func monthOf(t time.Time) (start, next time.Time) {
 }
 
 // Status is the month-to-date spend at now against the cap. resets_at is the
-// next month's 1st, 00:00 UTC. It also sets luma_budget_spent_usd. When the
-// store fails, the month's last figure stands (or nothing spent, if this
-// process has none for the month).
+// next month's 1st, 00:00 UTC. The figure is the most this process has read
+// for the month. When the store fails, the month's figure stands (or nothing
+// spent, if this process has none for the month: S62 fails open).
 func (b *Budget) Status(ctx context.Context, now time.Time) protocol.BudgetStatus {
 	s, err := b.status(ctx, now)
 	if err != nil {
@@ -56,11 +78,14 @@ func (b *Budget) status(ctx context.Context, now time.Time) (protocol.BudgetStat
 	start, next := monthOf(now)
 	spent, err := b.st.SpendBetween(ctx, start, next, "")
 	b.mu.Lock()
+	same := b.month.Equal(start)
 	switch {
+	case err == nil && same:
+		spent = max(spent, b.spent)
+		b.spent = spent
 	case err == nil:
 		b.month, b.spent = start, spent
-		b.m.BudgetSpentUSD.Set(spent)
-	case b.month.Equal(start):
+	case same:
 		spent = b.spent
 	default:
 		spent = 0

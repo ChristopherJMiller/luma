@@ -3,6 +3,7 @@ package ledger_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"sync"
 	"testing"
@@ -35,8 +36,9 @@ type harness struct {
 	m   *metrics.Core
 	l   *ledger.Ledger
 
-	mu  sync.Mutex
-	now time.Time
+	mu    sync.Mutex
+	now   time.Time
+	seeds int // spend's turn ids
 }
 
 // newHarness builds a Ledger over a fresh Postgres, the repo's agents/
@@ -92,10 +94,15 @@ func (h *harness) session(id, apiWorkspace string, bound ...string) store.Sessio
 }
 
 // spend stores a ledger row of usd at the given time, outside any session.
+// Each seed has its own turn id: (turn_id, model) is unique (migration 0003).
 func (h *harness) spend(at time.Time, usd float64, apiWorkspace string) {
 	h.t.Helper()
+	h.mu.Lock()
+	h.seeds++
+	turn := fmt.Sprintf("t_seed_%d", h.seeds)
+	h.mu.Unlock()
 	if _, err := h.st.RecordLedger(bg, store.LedgerRow{PersonID: "chris", AgentID: "luma", Tier: "fast",
-		Source: "web", APIWorkspace: apiWorkspace, Model: haiku, TurnID: "t_seed", CostUSD: usd, CreatedAt: at}); err != nil {
+		Source: "web", APIWorkspace: apiWorkspace, Model: haiku, TurnID: turn, CostUSD: usd, CreatedAt: at}); err != nil {
 		h.t.Fatal(err)
 	}
 }
@@ -114,7 +121,7 @@ func (h *harness) rows() []ledgerRow {
 	conn := storetest.ConnAs(h.t, h.st, storetest.Superuser)
 	rs, err := conn.Query(bg, `select session_id, person_id, agent_id, tier, source, api_workspace, model, turn_id,
 		input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, web_search_requests, cost_usd::float8
-		from cost_ledger where turn_id <> 't_seed' order by model, id`)
+		from cost_ledger where turn_id not like 't_seed_%' order by model, id`)
 	if err != nil {
 		h.t.Fatal(err)
 	}

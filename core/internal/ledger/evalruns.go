@@ -49,8 +49,14 @@ const (
 // so a missing or wider middleware lets nobody else in. A body that is not
 // an eval run is 400; one with cost_usd outside [0, maxCost], an empty
 // suite, a negative count or cost, or a finish before its start is 422. A
-// zero maxCost is LUMA_EVAL_MAX_COST_USD's default.
+// run posted again is answered 201 and adds nothing. A zero maxCost is
+// LUMA_EVAL_MAX_COST_USD's default. st must be the ledger's own store: the
+// run and its cost row are written in one of its transactions, so New's
+// store is the one used, and another one is a wiring bug (it panics).
 func EvalRunsHandler(l *Ledger, st *store.Store, maxCost float64) http.Handler {
+	if st != l.st {
+		panic("ledger: EvalRunsHandler's store is not the ledger's")
+	}
 	if maxCost <= 0 {
 		maxCost = DefaultMaxEvalCostUSD
 	}
@@ -86,13 +92,18 @@ func EvalRunsHandler(l *Ledger, st *store.Store, maxCost float64) http.Handler {
 			writeErrorInfo(w, http.StatusUnprocessableEntity, protocol.CodeInvalidRequest)
 			return
 		}
-		if err := l.recordEvalRun(r.Context(), st, run); err != nil {
+		recorded, err := l.recordEvalRun(r.Context(), run)
+		if err != nil {
 			slog.Error("ledger: storing an eval run failed", "suite", run.Suite, "err", err)
 			writeErrorInfo(w, http.StatusInternalServerError, protocol.CodeUpstreamError)
 			return
 		}
-		slog.Info("ledger: eval run recorded", "suite", run.Suite, "passed", run.Passed, "failed", run.Failed,
-			"cost_usd", run.CostUSD)
+		if recorded {
+			slog.Info("ledger: eval run recorded", "suite", run.Suite, "passed", run.Passed, "failed", run.Failed,
+				"cost_usd", run.CostUSD)
+		} else {
+			slog.Info("ledger: eval run already recorded; nothing added", "suite", run.Suite)
+		}
 		w.WriteHeader(http.StatusCreated)
 	})
 }
@@ -151,27 +162,25 @@ func invalidEvalRun(run protocol.EvalRun, maxCost float64) string {
 	return ""
 }
 
-// recordEvalRun ledgers the run's cost, then stores the run and moves its
-// gauges. The cost goes first: it is real spend, and a failed store of the
-// run must not leave it uncounted.
-func (l *Ledger) recordEvalRun(ctx context.Context, st *store.Store, run protocol.EvalRun) error {
+// recordEvalRun stores the run and the ledger row of its cost in one
+// transaction, then moves the run's metrics. The row is written even at $0:
+// its turn id, eval_<suite>_<finished_at>, identifies the run, so a run
+// posted again is stored and counted once (Task 14 review). recorded is
+// false for such a repeat.
+func (l *Ledger) recordEvalRun(ctx context.Context, run protocol.EvalRun) (recorded bool, err error) {
 	now := l.clock()
-	if run.CostUSD > 0 {
-		if _, err := l.st.RecordLedger(ctx, store.LedgerRow{
-			PersonID: evalPerson, AgentID: evalAgent, Tier: evalTier, Source: "ci", APIWorkspace: "ci",
-			Model: evalModel, TurnID: "eval_" + run.Suite + "_" + run.FinishedAt.UTC().Format("20060102T150405Z"),
-			CostUSD: run.CostUSD, CreatedAt: now,
-		}); err != nil {
-			return err
-		}
-		l.m.EvalCostUSDTotal.WithLabelValues(suiteLabel(run.Suite)).Add(run.CostUSD)
-		l.budget.Status(ctx, now) // refreshes luma_budget_spent_usd
+	recorded, err = l.st.InsertEvalRunWithCost(ctx, run, store.LedgerRow{
+		PersonID: evalPerson, AgentID: evalAgent, Tier: evalTier, Source: "ci", APIWorkspace: "ci",
+		Model: evalModel, TurnID: "eval_" + run.Suite + "_" + run.FinishedAt.UTC().Format("20060102T150405Z"),
+		CostUSD: run.CostUSD, CreatedAt: now,
+	})
+	if err != nil || !recorded {
+		return false, err
 	}
-	if _, err := st.InsertEvalRun(ctx, run); err != nil {
-		return err
-	}
+	l.m.EvalCostUSDTotal.WithLabelValues(suiteLabel(run.Suite)).Add(run.CostUSD)
+	l.budget.Status(ctx, now) // the month's figure behind luma_budget_spent_usd
 	l.setEvalGauges(run)
-	return nil
+	return true, nil
 }
 
 func writeErrorInfo(w http.ResponseWriter, status int, code protocol.ErrorCode) {

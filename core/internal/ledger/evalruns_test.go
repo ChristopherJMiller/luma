@@ -128,7 +128,7 @@ func TestEvalRunCostBounds(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t, ledger.Config{})
 	routed := evalsOnly(ledger.EvalRunsHandler(h.l, h.st, 25))
-	for _, c := range []struct {
+	for i, c := range []struct {
 		cost float64
 		want int
 	}{
@@ -137,8 +137,8 @@ func TestEvalRunCostBounds(t *testing.T) {
 		{0, http.StatusCreated},
 		{25, http.StatusCreated},
 	} {
-		run := evalRun("gate", c.cost, 3, 0, testNow)
-		run.Results[0].CostUSD = 0 // only the run's own cost_usd is out of bounds
+		run := evalRun("gate", c.cost, 3, 0, testNow.Add(time.Duration(i)*time.Minute)) // distinct runs
+		run.Results[0].CostUSD = 0                                                      // only the run's own cost_usd is out of bounds
 		rec := post(t, routed, "tok.evals.x", run)
 		if rec.Code != c.want {
 			t.Errorf("cost %v: status %d, want %d", c.cost, rec.Code, c.want)
@@ -242,15 +242,66 @@ func TestEvalRunAcceptsTheContractFixture(t *testing.T) {
 	}
 }
 
+// Task 14 review: an eval run posted again (the runner's retry after a lost
+// response) is stored and counted once.
+func TestEvalRunPostedTwiceCountsOnce(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, ledger.Config{})
+	routed := evalsOnly(ledger.EvalRunsHandler(h.l, h.st, 25))
+	run := evalRun("nightly", 2.5, 6, 0, testNow)
+	for i := range 2 {
+		if rec := post(t, routed, "tok.evals.x", run); rec.Code != http.StatusCreated {
+			t.Fatalf("post %d: status %d (%s)", i+1, rec.Code, rec.Body)
+		}
+	}
+	if n := h.evalRunCount(); n != 1 {
+		t.Errorf("%d eval runs stored, want 1", n)
+	}
+	if rows := h.rows(); len(rows) != 1 || !near(rows[0].CostUSD, 2.5) {
+		t.Errorf("rows = %+v, want one $2.50 row", rows)
+	}
+	if v := h.value("luma_eval_cost_usd_total", map[string]string{"suite": "nightly"}); !near(v, 2.5) {
+		t.Errorf("luma_eval_cost_usd_total{nightly} = %v, want 2.5", v)
+	}
+	if s := h.l.Budget().Status(bg, testNow); !near(s.SpentUSD, 2.5) {
+		t.Errorf("spent = %v, want 2.5", s.SpentUSD)
+	}
+	// A $0 run is stored once too: its row, at $0, is what identifies it.
+	free := evalRun("guard", 0, 9, 0, testNow)
+	free.Results[0].CostUSD = 0
+	for range 2 {
+		if rec := post(t, routed, "tok.evals.x", free); rec.Code != http.StatusCreated {
+			t.Fatalf("status %d (%s)", rec.Code, rec.Body)
+		}
+	}
+	if n := h.evalRunCount(); n != 2 {
+		t.Errorf("%d eval runs stored, want 2", n)
+	}
+}
+
+func TestEvalRunsHandlerNeedsTheLedgersStore(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, ledger.Config{})
+	defer func() {
+		if recover() == nil {
+			t.Error("EvalRunsHandler took a store that is not the ledger's")
+		}
+	}()
+	ledger.EvalRunsHandler(h.l, nil, 25)
+}
+
 func TestEvalRunCostCountsTowardBudget(t *testing.T) {
 	t.Parallel()
 	// The e2e budget (S6): one $17 run crosses 80 % of $20.
 	h := newHarness(t, ledger.Config{MonthlyUSD: 20})
 	routed := evalsOnly(ledger.EvalRunsHandler(h.l, h.st, 25))
+	if v := h.value("luma_budget_spent_usd", nil); v != 0 { // the month's figure is now $0
+		t.Fatalf("luma_budget_spent_usd = %v before the run", v)
+	}
 	if rec := post(t, routed, "tok.evals.x", evalRun("nightly", 17, 6, 0, testNow)); rec.Code != http.StatusCreated {
 		t.Fatalf("status %d (%s)", rec.Code, rec.Body)
 	}
-	// The post itself moves the gauge (read before anything calls Status).
+	// The post itself moves the month's figure behind the gauge.
 	if v := h.value("luma_budget_spent_usd", nil); !near(v, 17) {
 		t.Errorf("luma_budget_spent_usd = %v, want 17", v)
 	}

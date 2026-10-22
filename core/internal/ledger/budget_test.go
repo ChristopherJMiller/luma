@@ -6,6 +6,7 @@ import (
 
 	"github.com/ChristopherJMiller/luma/core/internal/ledger"
 	"github.com/ChristopherJMiller/luma/core/internal/protocol"
+	"github.com/ChristopherJMiller/luma/core/internal/store/storetest"
 )
 
 func TestMonthToDateUTCBoundary(t *testing.T) {
@@ -138,5 +139,49 @@ func TestBudgetKeepsItsLastFigureWhenTheStoreFails(t *testing.T) {
 	h.setNow(time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC))
 	if s := h.l.Budget().Status(bg, h.clock()); s.SpentUSD != 0 || s.Exhausted {
 		t.Errorf("a new month with the store down: %+v, want nothing spent", s)
+	}
+}
+
+// Task 14 review: within a month the figure only grows, so a slower, older
+// read can never move the gauge (or the gate) back.
+func TestBudgetFigureNeverFallsWithinAMonth(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, ledger.Config{MonthlyUSD: 10})
+	h.spend(testNow, 10, "interactive")
+	if s := h.l.Budget().Status(bg, testNow); !s.Exhausted {
+		t.Fatalf("at $10 of $10: %+v", s)
+	}
+	// A read that sees less (here the rows are gone; in life, a read that
+	// started before the last write and finished after it) keeps the figure.
+	if _, err := storetest.ConnAs(t, h.st, storetest.Superuser).Exec(bg, `delete from cost_ledger`); err != nil {
+		t.Fatal(err)
+	}
+	if s := h.l.Budget().Status(bg, testNow); !near(s.SpentUSD, 10) || !s.Exhausted {
+		t.Errorf("after a lower read: %+v, want the month's $10 to stand", s)
+	}
+	if v := h.value("luma_budget_spent_usd", nil); !near(v, 10) {
+		t.Errorf("luma_budget_spent_usd = %v, want 10", v)
+	}
+	// The next month starts from what the store says.
+	h.setNow(time.Date(2026, 11, 1, 0, 0, 1, 0, time.UTC))
+	if v := h.value("luma_budget_spent_usd", nil); v != 0 {
+		t.Errorf("luma_budget_spent_usd = %v just after the 1st, want 0", v)
+	}
+}
+
+// The gauge is read at each scrape, so at 00:00 UTC on the 1st it is the new
+// month's spend without anything having been written or asked.
+func TestBudgetGaugeIsFreshAtTheMonthsStart(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, ledger.Config{})
+	h.setNow(time.Date(2026, 10, 31, 23, 59, 0, 0, time.UTC))
+	h.spend(time.Date(2026, 10, 31, 23, 0, 0, 0, time.UTC), 42, "interactive")
+	if v := h.value("luma_budget_spent_usd", nil); !near(v, 42) {
+		t.Fatalf("luma_budget_spent_usd = %v on October 31, want 42", v)
+	}
+	h.spend(time.Date(2026, 11, 1, 0, 0, 30, 0, time.UTC), 1.5, "ci")
+	h.setNow(time.Date(2026, 11, 1, 0, 1, 0, 0, time.UTC))
+	if v := h.value("luma_budget_spent_usd", nil); !near(v, 1.5) {
+		t.Errorf("luma_budget_spent_usd = %v at 00:01 UTC on the 1st, want 1.5", v)
 	}
 }

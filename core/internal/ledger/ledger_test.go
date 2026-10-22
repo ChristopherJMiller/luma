@@ -1,13 +1,19 @@
 package ledger_test
 
 import (
+	"bytes"
+	"fmt"
+	"log/slog"
 	"reflect"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/ChristopherJMiller/luma/core/internal/ledger"
 	"github.com/ChristopherJMiller/luma/core/internal/protocol"
 	"github.com/ChristopherJMiller/luma/core/internal/sessions"
+	"github.com/ChristopherJMiller/luma/core/internal/store/storetest"
 )
 
 // The ledger is the session service's Ledger (S3) and the budget is a Gate (S1).
@@ -117,9 +123,137 @@ func TestRowsAreDatedByCoresClock(t *testing.T) {
 	if s := h.l.Budget().Status(bg, testNow); s.SpentUSD != 0 {
 		t.Errorf("October spent = %v, want 0", s.SpentUSD)
 	}
-	if v := h.value("luma_budget_spent_usd", nil); v != 0 {
-		t.Errorf("luma_budget_spent_usd = %v after reading October, want 0", v)
+	// The gauge is the clock's month, whatever month was read last.
+	if v := h.value("luma_budget_spent_usd", nil); !near(v, 0.5) {
+		t.Errorf("luma_budget_spent_usd = %v in January, want 0.5", v)
 	}
+}
+
+// Task 14 review: a turn's rows are written once, all or none.
+func TestRedeliveredTurnIsCountedOnce(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, ledger.Config{})
+	sess := h.session("ses_r", "interactive", haiku)
+	if v := h.value("luma_budget_spent_usd", nil); v != 0 {
+		t.Fatalf("luma_budget_spent_usd = %v before any spend", v)
+	}
+	u := protocol.TurnUsage{CostUSD: 0.03, Models: map[string]protocol.ModelUsage{
+		haiku: {Input: 10, CostUSD: 0.01}, opus: {Input: 5, CostUSD: 0.02}}} // opus is unbound
+	for range 2 {
+		if err := h.l.RecordTurn(bg, sess, "trn_r", u, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if rows := h.rows(); len(rows) != 2 {
+		t.Errorf("%d rows after delivering a turn twice, want 2 (one per model)", len(rows))
+	}
+	if v := h.value("luma_cost_usd_total", costLabels(haiku)); !near(v, 0.01) {
+		t.Errorf("haiku cost = %v, want 0.01 (counted once)", v)
+	}
+	if v := h.value("luma_tokens_total", tokenLabels(haiku, "input")); v != 10 {
+		t.Errorf("haiku input = %v, want 10", v)
+	}
+	if v := h.value("luma_unbound_model_requests_total", map[string]string{"model": opus}); v != 1 {
+		t.Errorf("unbound{%s} = %v, want 1", opus, v)
+	}
+	// The month's figure, read before the turn, moved with it.
+	if v := h.value("luma_budget_spent_usd", nil); !near(v, 0.03) {
+		t.Errorf("luma_budget_spent_usd = %v, want 0.03", v)
+	}
+}
+
+func TestTurnRowsAreAllOrNone(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, ledger.Config{})
+	sess := h.session("ses_f", "interactive", haiku, sonnet)
+	// The second row (sonnet, after haiku by name) fails inside the database.
+	conn := storetest.ConnAs(t, h.st, storetest.Superuser)
+	if _, err := conn.Exec(bg, `create function fail_sonnet() returns trigger language plpgsql as $$
+		begin if new.model = 'claude-sonnet-5-5' then raise exception 'injected'; end if; return new; end $$`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(bg, `create trigger fail_sonnet before insert on cost_ledger
+		for each row execute function fail_sonnet()`); err != nil {
+		t.Fatal(err)
+	}
+	u := protocol.TurnUsage{CostUSD: 0.03, Models: map[string]protocol.ModelUsage{
+		haiku: {Input: 10, CostUSD: 0.01}, sonnet: {Input: 5, CostUSD: 0.02}}}
+	if err := h.l.RecordTurn(bg, sess, "trn_f", u, nil); err == nil {
+		t.Fatal("RecordTurn succeeded with a row the database refused")
+	}
+	if rows := h.rows(); len(rows) != 0 {
+		t.Errorf("%d rows after a failure midway, want 0", len(rows))
+	}
+	if n := h.series("luma_cost_usd_total"); n != 0 {
+		t.Errorf("a failed turn made %d cost series", n)
+	}
+	// Once the database takes it, the same turn is ledgered whole.
+	if _, err := conn.Exec(bg, `drop trigger fail_sonnet on cost_ledger`); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.l.RecordTurn(bg, sess, "trn_f", u, nil); err != nil {
+		t.Fatal(err)
+	}
+	if rows := h.rows(); len(rows) != 2 {
+		t.Errorf("%d rows after the retry, want 2", len(rows))
+	}
+}
+
+// Not parallel: it replaces the default logger.
+func TestCostMismatchWarns(t *testing.T) {
+	h := newHarness(t, ledger.Config{})
+	sess := h.session("ses_w", "interactive", haiku)
+	var buf syncBuffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(old) })
+
+	matching := protocol.TurnUsage{CostUSD: 0.0300000001, Models: map[string]protocol.ModelUsage{
+		haiku: {Input: 10, CostUSD: 0.01}, sonnet: {Input: 1, CostUSD: 0.02}}}
+	if err := h.l.RecordTurn(bg, sess, "trn_w1", matching, nil); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buf.String(), "differs from the sum") {
+		t.Errorf("a cost within 1e-6 of its models' warned: %s", buf.String())
+	}
+	off := protocol.TurnUsage{CostUSD: 0.05, Models: map[string]protocol.ModelUsage{haiku: {Input: 10, CostUSD: 0.04}}}
+	if err := h.l.RecordTurn(bg, sess, "trn_w2", off, nil); err != nil {
+		t.Fatal(err)
+	}
+	line := buf.String()
+	for _, want := range []string{"level=WARN", "differs from the sum", "turn=trn_w2", "cost_usd=0.05", "models_cost_usd=0.04"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("warning %q lacks %q", line, want)
+		}
+	}
+	// The rows carry the models' figures.
+	var got float64
+	for _, r := range h.rows() {
+		if r.TurnID == "trn_w2" {
+			got += r.CostUSD
+		}
+	}
+	if !near(got, 0.04) {
+		t.Errorf("trn_w2 rows = $%v, want $0.04", got)
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe for the logger's concurrent writes.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
 }
 
 func TestNegativeDeltaGoesToAnomalies(t *testing.T) {
@@ -275,7 +409,7 @@ func TestCostBasisUnexpected(t *testing.T) {
 	}{
 		{nil, 0}, {ptr("list"), 0}, {ptr("managed"), 1}, {ptr("unknown"), 2}, {ptr(""), 3},
 	} {
-		if err := h.l.RecordTurn(bg, sess, "trn_c", u, tc.basis); err != nil {
+		if err := h.l.RecordTurn(bg, sess, fmt.Sprintf("trn_c%d", i), u, tc.basis); err != nil {
 			t.Fatal(err)
 		}
 		if v := h.value("luma_cost_basis_unexpected_total", nil); v != tc.want {
