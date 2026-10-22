@@ -265,7 +265,7 @@ func TestBindAttachmentsDuplicateIDs(t *testing.T) {
 		Filename: "f", SizeBytes: 1, SHA256: "00", Data: []byte("a")}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.BindAttachments(ctx, "chris", "ses_a", []string{"att_1", "att_1"}); err != nil {
+	if err := s.BindAttachments(ctx, "chris", "ses_a", []string{"att_1", "att_1"}, 1<<20); err != nil {
 		t.Fatalf("a repeated id failed the bind: %v", err)
 	}
 	if n, _ := s.TreeAttachmentBytes(ctx, "ses_a"); n != 1 {

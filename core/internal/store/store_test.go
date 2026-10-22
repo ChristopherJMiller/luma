@@ -490,10 +490,10 @@ func TestAttachmentsCascadeWithRoot(t *testing.T) {
 		}
 	}
 	// Binding: the person's unbound attachment binds; someone else's does not.
-	if err := s.BindAttachments(ctx, "chris", "ses_other", []string{"att_3"}); err != nil {
+	if err := s.BindAttachments(ctx, "chris", "ses_other", []string{"att_3"}, 1<<20); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.BindAttachments(ctx, "erin", "ses_other", []string{"att_2"}); !errors.Is(err, store.ErrNotFound) {
+	if err := s.BindAttachments(ctx, "erin", "ses_other", []string{"att_2"}, 1<<20); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("binding another person's attachment: %v, want ErrNotFound", err)
 	}
 	if n, _ := s.TreeAttachmentBytes(ctx, "ses_other"); n != 6 {

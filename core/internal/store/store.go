@@ -93,6 +93,9 @@ type Store struct {
 	// appendHook, set only by tests (export_test.go), runs inside
 	// AppendEvent's transaction after the insert.
 	appendHook func(ctx context.Context, tx pgx.Tx)
+	// bindHook, set only by tests (export_test.go), runs inside
+	// BindAttachments' transaction after the update.
+	bindHook func(ctx context.Context, tx pgx.Tx)
 }
 
 // Open connects a pool. It does not migrate; call Migrate.
