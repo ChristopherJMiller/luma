@@ -2,8 +2,10 @@ package metrics_test
 
 import (
 	"reflect"
+	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -152,5 +154,111 @@ func TestLabelMapsUnknownToOther(t *testing.T) {
 	}
 	if got := metrics.Label("x"); got != "other" {
 		t.Errorf("Label with no allowed values = %q", got)
+	}
+}
+
+// recordingRegisterer keeps every collector registered through it, so a test
+// can walk their descriptors.
+type recordingRegisterer struct {
+	prometheus.Registerer
+	collectors []prometheus.Collector
+}
+
+func (r *recordingRegisterer) Register(c prometheus.Collector) error {
+	r.collectors = append(r.collectors, c)
+	return r.Registerer.Register(c)
+}
+
+func (r *recordingRegisterer) MustRegister(cs ...prometheus.Collector) {
+	for _, c := range cs {
+		if err := r.Register(c); err != nil {
+			panic(err)
+		}
+	}
+}
+
+// descRE reads a descriptor's name and its constant and variable label lists
+// from Desc.String(), the only public view of them.
+var descRE = regexp.MustCompile(`^Desc\{fqName: "([^"]*)", .*constLabels: \{(.*)\}, variableLabels: \{([^{}]*)\}\}$`)
+
+// constLabelRE finds each constant label's name in constLabels' name="value"
+// list.
+var constLabelRE = regexp.MustCompile(`(?:^|,)([a-zA-Z_][a-zA-Z0-9_]*)="`)
+
+// descLabels returns a descriptor's metric name and every label name it
+// carries, constant then variable. A descriptor it cannot read fails the
+// test, so a change in client_golang's format cannot pass the audit
+// vacuously.
+func descLabels(t *testing.T, d *prometheus.Desc) (string, []string) {
+	t.Helper()
+	m := descRE.FindStringSubmatch(d.String())
+	if m == nil {
+		t.Fatalf("cannot read the labels of %s", d)
+	}
+	var labels []string
+	for _, c := range constLabelRE.FindAllStringSubmatch(m[2], -1) {
+		labels = append(labels, c[1])
+	}
+	if m[3] != "" {
+		for _, v := range strings.Split(m[3], ",") {
+			labels = append(labels, strings.TrimSuffix(strings.TrimPrefix(v, "c("), ")"))
+		}
+	}
+	return m[1], labels
+}
+
+// sessionLabel is the C7 ban: a label that names a session (session,
+// session_id, or any other spelling of one).
+func sessionLabel(l string) bool { return strings.Contains(l, "session") }
+
+// TestNoSessionLabels walks every descriptor NewCore registers and fails on
+// a label naming a session: session ids never become labels (C7, Task 14).
+func TestNoSessionLabels(t *testing.T) {
+	rec := &recordingRegisterer{Registerer: prometheus.NewPedanticRegistry()}
+	metrics.NewCore(rec)
+
+	ch := make(chan *prometheus.Desc)
+	go func() {
+		for _, c := range rec.collectors {
+			c.Describe(ch)
+		}
+		close(ch)
+	}()
+	var descs []*prometheus.Desc
+	for d := range ch {
+		descs = append(descs, d)
+	}
+	if len(descs) != len(c7Core) {
+		t.Errorf("walked %d descriptors, C7 lists %d metrics", len(descs), len(c7Core))
+	}
+	for _, d := range descs {
+		name, labels := descLabels(t, d)
+		for _, l := range labels {
+			if sessionLabel(l) {
+				t.Errorf("%s has label %q: session ids never become labels (C7)", name, l)
+			}
+		}
+	}
+
+	// The audit catches what it bans, as a variable or a constant label.
+	for _, d := range []*prometheus.Desc{
+		prometheus.NewDesc("x_total", "x", []string{"tier", "session"}, nil),
+		prometheus.NewDesc("x_total", "x", []string{"session_id"}, nil),
+		prometheus.NewDesc("x_total", "x", nil, prometheus.Labels{"session_id": "ses_1", "tier": "fast"}),
+		prometheus.NewDesc("x_total", "x", []string{"tier"}, prometheus.Labels{"sdk_session": "s"}),
+	} {
+		_, labels := descLabels(t, d)
+		caught := false
+		for _, l := range labels {
+			caught = caught || sessionLabel(l)
+		}
+		if !caught {
+			t.Errorf("the audit missed the session label of %s (read %v)", d, labels)
+		}
+	}
+	// And reads an innocent descriptor's labels exactly.
+	_, labels := descLabels(t, prometheus.NewDesc("y_total", "y", []string{"agent", "tier"}, prometheus.Labels{"k": "v"}))
+	if want := []string{"k", "agent", "tier"}; !reflect.DeepEqual(labels, want) {
+		t.Errorf("descLabels read %v, want %v", labels, want)
 	}
 }
